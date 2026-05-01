@@ -39,6 +39,22 @@ pub fn info(label: impl AsRef<str>, message: impl AsRef<str>) {
     );
 }
 
+pub fn section(label: impl AsRef<str>) {
+    println!("{}", style(label.as_ref()).bold());
+}
+
+pub fn command(command: impl AsRef<str>) {
+    println!("  {}", style(command.as_ref()).cyan());
+}
+
+pub fn bullet(message: impl AsRef<str>) {
+    println!("{} {}", style("-").dim(), message.as_ref());
+}
+
+pub fn blank() {
+    println!();
+}
+
 pub fn change(label: impl AsRef<str>, path: impl AsRef<str>) {
     println!(
         "{} {} {}",

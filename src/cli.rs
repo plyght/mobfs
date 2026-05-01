@@ -48,6 +48,12 @@ pub enum Command {
     #[command(about = "Open the workspace in Finder  [alias: o]")]
     #[command(visible_alias = "o")]
     Open,
+    #[command(about = "Unmount a mobfs FUSE mount and clean up the mountpoint")]
+    Unmount(UnmountArgs),
+    #[command(about = "Print macOS/FUSE dogfooding checks for a mount")]
+    MountDoctor(MountDoctorArgs),
+    #[command(about = "Print security hardening guidance")]
+    Security,
     #[command(about = "Run mobfs remote daemon")]
     Daemon(DaemonArgs),
     #[command(about = "Generate a strong mobfs daemon token")]
@@ -119,6 +125,12 @@ pub struct MountArgs {
     pub token: Option<String>,
     #[arg(long, help = "Connect to mobfsd through ssh -L using the remote host")]
     pub ssh_tunnel: bool,
+    #[arg(
+        long,
+        default_value_t = 1,
+        help = "Kernel attribute/entry cache TTL in seconds"
+    )]
+    pub cache_ttl_secs: u64,
     #[arg(long, help = "Do not open Finder after mounting")]
     pub no_open: bool,
 }
@@ -197,6 +209,30 @@ pub struct BenchArgs {
     pub iterations: u32,
     #[arg(long, default_value_t = 8, help = "Transfer test size in MiB")]
     pub mib: u64,
+    #[arg(
+        long,
+        default_value_t = 0,
+        help = "Create and scan a synthetic many-file fixture before transfer benchmarking"
+    )]
+    pub scale_files: u32,
+    #[arg(
+        long,
+        default_value_t = 1000,
+        help = "Files per directory for synthetic scale fixtures"
+    )]
+    pub files_per_dir: u32,
+}
+
+#[derive(Args)]
+pub struct UnmountArgs {
+    #[arg(help = "Mountpoint to unmount; omitted inside a configured workspace")]
+    pub mountpoint: Option<PathBuf>,
+}
+
+#[derive(Args)]
+pub struct MountDoctorArgs {
+    #[arg(help = "Mountpoint to inspect")]
+    pub mountpoint: PathBuf,
 }
 
 #[derive(Args)]

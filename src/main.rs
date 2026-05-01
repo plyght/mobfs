@@ -35,6 +35,9 @@ fn main() -> Result<()> {
         Command::Watch(args) => sync::watch(args),
         Command::Serve(args) => sync::serve(args),
         Command::Open => sync::open(),
+        Command::Unmount(args) => sync::unmount(args),
+        Command::MountDoctor(args) => sync::mount_doctor(args),
+        Command::Security => sync::security(),
         Command::Daemon(args) => {
             let token = args.token.ok_or_else(|| {
                 error::MobfsError::Config(

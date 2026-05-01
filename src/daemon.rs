@@ -641,3 +641,17 @@ pub fn set_mtime(path: &Path, modified: i64) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_join_rejects_path_traversal() {
+        let root = Path::new("/tmp/mobfs-root");
+        assert!(safe_join(root, "src/lib.rs").is_ok());
+        assert!(safe_join(root, "../secret").is_err());
+        assert!(safe_join(root, "/tmp/secret").is_err());
+        assert!(safe_join(root, "a/../../secret").is_err());
+    }
+}

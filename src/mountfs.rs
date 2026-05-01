@@ -16,18 +16,54 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const TTL: Duration = Duration::from_secs(1);
-
 pub fn mount(config: AppConfig, mountpoint: PathBuf) -> Result<()> {
-    std::fs::create_dir_all(&mountpoint)?;
-    let fs = MobfsFuse::new(config)?;
+    prepare_mountpoint(&mountpoint)?;
+    let ttl = Duration::from_secs(config.sync.cache_ttl_secs.min(60));
+    let fs = MobfsFuse::new(config, ttl)?;
     let mut config = Config::default();
     config.mount_options = vec![
         MountOption::RW,
         MountOption::FSName("mobfs".to_string()),
+        MountOption::Subtype("mobfs".to_string()),
         MountOption::DefaultPermissions,
     ];
-    fuser::mount2(fs, mountpoint, &config)?;
+    fuser::mount2(fs, mountpoint, &config).map_err(|error| {
+        crate::error::MobfsError::Remote(format!(
+            "failed to mount FUSE filesystem: {error}. On macOS, install macFUSE and allow its system extension in System Settings if prompted"
+        ))
+    })?;
+    Ok(())
+}
+
+pub fn prepare_mountpoint(mountpoint: &Path) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    if !Path::new("/Library/Filesystems/macfuse.fs").exists() {
+        return Err(crate::error::MobfsError::Config(
+            "macFUSE is not installed; install macFUSE, approve its system extension, then retry `mobfs mount`".to_string(),
+        ));
+    }
+    if mountpoint.exists() && !mountpoint.is_dir() {
+        return Err(crate::error::MobfsError::Config(format!(
+            "mountpoint {} exists but is not a directory",
+            mountpoint.display()
+        )));
+    }
+    std::fs::create_dir_all(mountpoint)?;
+    let mut unexpected = Vec::new();
+    for item in std::fs::read_dir(mountpoint)? {
+        let item = item?;
+        let name = item.file_name();
+        if name != ".DS_Store" && name != ".localized" {
+            unexpected.push(name.to_string_lossy().to_string());
+        }
+    }
+    if !unexpected.is_empty() {
+        return Err(crate::error::MobfsError::Config(format!(
+            "mountpoint {} is not empty; unmount or choose a clean directory. Unexpected entries: {}",
+            mountpoint.display(),
+            unexpected.join(", ")
+        )));
+    }
     Ok(())
 }
 
@@ -68,6 +104,7 @@ pub fn config_from_remote(
             ],
             connect_retries: crate::config::DEFAULT_CONNECT_RETRIES,
             operation_retries: crate::config::DEFAULT_OP_RETRIES,
+            cache_ttl_secs: 1,
         },
     })
 }
@@ -80,6 +117,7 @@ struct MobfsFuse {
     read_cache: Mutex<BTreeMap<(String, u64, u32), Vec<u8>>>,
     handle_to_path: Mutex<BTreeMap<u64, String>>,
     journal: PathBuf,
+    ttl: Duration,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,7 +149,7 @@ enum JournalOp {
 }
 
 impl MobfsFuse {
-    fn new(config: AppConfig) -> Result<Self> {
+    fn new(config: AppConfig, ttl: Duration) -> Result<Self> {
         let journal = mountfs_journal_path(&config);
         let mut client = RemoteClient::connect(config)?;
         replay_journal(&journal, &mut client)?;
@@ -133,6 +171,7 @@ impl MobfsFuse {
             read_cache: Mutex::new(BTreeMap::new()),
             handle_to_path: Mutex::new(BTreeMap::new()),
             journal,
+            ttl,
         })
     }
 
@@ -272,7 +311,7 @@ impl Filesystem for MobfsFuse {
             Ok(Some(meta)) => {
                 self.update_entry(&path, meta.clone());
                 reply.entry(
-                    &TTL,
+                    &self.ttl,
                     &self.attr_for(&path, Some(&meta)),
                     fuser::Generation(0),
                 );
@@ -293,7 +332,7 @@ impl Filesystem for MobfsFuse {
         reply: ReplyAttr,
     ) {
         if u64::from(ino) == 1 {
-            reply.attr(&TTL, &self.attr_for("", None));
+            reply.attr(&self.ttl, &self.attr_for("", None));
             return;
         }
         let path = match self.path_for(ino) {
@@ -306,7 +345,7 @@ impl Filesystem for MobfsFuse {
         match self.client.lock().unwrap().stat(&path) {
             Ok(Some(meta)) => {
                 self.update_entry(&path, meta.clone());
-                reply.attr(&TTL, &self.attr_for(&path, Some(&meta)));
+                reply.attr(&self.ttl, &self.attr_for(&path, Some(&meta)));
             }
             Ok(None) => {
                 self.remove_entry(&path);
@@ -596,7 +635,7 @@ impl Filesystem for MobfsFuse {
         let path = match self.path_for(ino) {
             Some(path) if !path.is_empty() => path,
             Some(_) => {
-                reply.attr(&TTL, &self.attr_for("", None));
+                reply.attr(&self.ttl, &self.attr_for("", None));
                 return;
             }
             None => {
@@ -665,7 +704,7 @@ impl Filesystem for MobfsFuse {
         }
         let snapshot = self.snapshot.lock().unwrap();
         match snapshot.entries.get(&path) {
-            Some(meta) => reply.attr(&TTL, &self.attr_for(&path, Some(meta))),
+            Some(meta) => reply.attr(&self.ttl, &self.attr_for(&path, Some(meta))),
             None => reply.error(Errno::ENOENT),
         }
     }
@@ -729,7 +768,7 @@ impl Filesystem for MobfsFuse {
                     .unwrap()
                     .insert(handle, path.clone());
                 reply.created(
-                    &TTL,
+                    &self.ttl,
                     &self.attr_for(&path, Some(meta)),
                     fuser::Generation(0),
                     fuser::FileHandle(handle),
@@ -788,7 +827,7 @@ impl Filesystem for MobfsFuse {
         let snapshot = self.snapshot.lock().unwrap();
         match snapshot.entries.get(&path) {
             Some(meta) => reply.entry(
-                &TTL,
+                &self.ttl,
                 &self.attr_for(&path, Some(meta)),
                 fuser::Generation(0),
             ),
@@ -843,7 +882,7 @@ impl Filesystem for MobfsFuse {
         let snapshot = self.snapshot.lock().unwrap();
         match snapshot.entries.get(&path) {
             Some(meta) => reply.entry(
-                &TTL,
+                &self.ttl,
                 &self.attr_for(&path, Some(meta)),
                 fuser::Generation(0),
             ),

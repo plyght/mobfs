@@ -56,6 +56,12 @@ pub struct SyncConfig {
     pub ignore: Vec<String>,
     pub connect_retries: u32,
     pub operation_retries: u32,
+    #[serde(default = "default_cache_ttl_secs")]
+    pub cache_ttl_secs: u64,
+}
+
+fn default_cache_ttl_secs() -> u64 {
+    1
 }
 
 pub struct RemoteTarget {

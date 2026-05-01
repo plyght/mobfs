@@ -174,6 +174,7 @@ mod tests {
                 ignore: vec![".git".to_string(), "target".to_string()],
                 connect_retries: 1,
                 operation_retries: 1,
+                cache_ttl_secs: 1,
             },
         }
     }

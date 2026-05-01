@@ -1,6 +1,6 @@
 use crate::cli::{
-    BenchArgs, GitArgs, InitArgs, MountArgs, MountFsArgs, PullArgs, PushArgs, RunArgs, ServeArgs,
-    SetupArgs, StartArgs, SyncArgs, WatchArgs,
+    BenchArgs, GitArgs, InitArgs, MountArgs, MountDoctorArgs, MountFsArgs, PullArgs, PushArgs,
+    RunArgs, ServeArgs, SetupArgs, StartArgs, SyncArgs, UnmountArgs, WatchArgs,
 };
 use crate::config::{
     AppConfig, DEFAULT_CONNECT_RETRIES, DEFAULT_OP_RETRIES, LocalConfig, RemoteConfig, STATE_DIR,
@@ -37,6 +37,7 @@ pub fn start(args: StartArgs) -> Result<()> {
             port: args.port,
             token: args.token,
             ssh_tunnel: args.ssh_tunnel,
+            cache_ttl_secs: 1,
             no_open: args.no_open,
         })?;
     }
@@ -69,6 +70,7 @@ pub fn mountfs(args: MountFsArgs) -> Result<()> {
             )?,
             None => AppConfig::load()?,
         };
+        crate::mountfs::prepare_mountpoint(&mountpoint)?;
         crate::mountfs::mount(config, mountpoint)
     }
     #[cfg(not(feature = "fuse"))]
@@ -90,11 +92,14 @@ pub fn mount(args: MountArgs) -> Result<()> {
                 default_no_local_code_mountpoint(args.name.as_deref(), &target.host, &target.path)?
             }
         };
-        let config = new_config(target, root.clone(), args.port, args.token, args.ssh_tunnel);
+        let mut config = new_config(target, root.clone(), args.port, args.token, args.ssh_tunnel);
+        config.sync.cache_ttl_secs = args.cache_ttl_secs;
+        crate::mountfs::prepare_mountpoint(&root)?;
         ui::added(
             "mounting no-local-code filesystem",
             root.display().to_string(),
         );
+        ui::info("cache ttl", format!("{}s", config.sync.cache_ttl_secs));
         crate::mountfs::mount(config, root)
     }
     #[cfg(not(feature = "fuse"))]
@@ -165,6 +170,7 @@ fn new_config(
             ],
             connect_retries: DEFAULT_CONNECT_RETRIES,
             operation_retries: DEFAULT_OP_RETRIES,
+            cache_ttl_secs: 1,
         },
     }
 }
@@ -327,33 +333,134 @@ pub fn token() -> Result<()> {
     Ok(())
 }
 
+pub fn unmount(args: UnmountArgs) -> Result<()> {
+    let mountpoint = match args.mountpoint {
+        Some(path) => path,
+        None => AppConfig::load()?.local.root,
+    };
+    let status = if cfg!(target_os = "macos") {
+        Command::new("diskutil")
+            .arg("unmount")
+            .arg(&mountpoint)
+            .status()
+    } else {
+        Command::new("umount").arg(&mountpoint).status()
+    }?;
+    if !status.success() {
+        return Err(MobfsError::Remote(format!(
+            "failed to unmount {}",
+            mountpoint.display()
+        )));
+    }
+    match fs::remove_dir(&mountpoint) {
+        Ok(()) => ui::ok(format!("unmounted and removed {}", mountpoint.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            ui::ok(format!("unmounted {}", mountpoint.display()))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => ui::warn(format!(
+            "unmounted but left non-empty mountpoint {}",
+            mountpoint.display()
+        )),
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+pub fn mount_doctor(args: MountDoctorArgs) -> Result<()> {
+    ui::info("mountpoint", args.mountpoint.display().to_string());
+    if args.mountpoint.exists() {
+        if args.mountpoint.is_dir() {
+            ui::ok("mountpoint directory exists");
+        } else {
+            ui::warn("mountpoint exists but is not a directory");
+        }
+    } else {
+        ui::warn("mountpoint does not exist yet");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if std::path::Path::new("/Library/Filesystems/macfuse.fs").exists() {
+            ui::ok("macFUSE installed");
+        } else {
+            ui::warn(
+                "macFUSE missing; install it and approve the system extension before mounting",
+            );
+        }
+        if Command::new("mount")
+            .output()
+            .map(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .contains(args.mountpoint.to_string_lossy().as_ref())
+            })
+            .unwrap_or(false)
+        {
+            ui::ok("mountpoint appears in mount output");
+        } else {
+            ui::warn("mountpoint is not currently mounted");
+        }
+        check_tool("diskutil");
+        check_tool("open");
+    }
+    #[cfg(not(target_os = "macos"))]
+    ui::info("platform", "macOS-specific Finder checks skipped");
+    Ok(())
+}
+
+pub fn security() -> Result<()> {
+    ui::section("Security hardening");
+    ui::bullet(
+        "Bind mobfsd to 127.0.0.1 and use --ssh-tunnel unless you are on a trusted private network.",
+    );
+    ui::bullet(
+        "Rotate tokens with `mobfs token`, restart mobfsd with the new value, and update clients via MOBFS_TOKEN or the workspace token file.",
+    );
+    ui::bullet("Prefer one token and one --allow-root per workspace or team boundary.");
+    ui::bullet("Never run mobfsd with --allow-any-root outside local tests.");
+    ui::bullet(
+        "Audit daemon logs for rejected roots and invalid paths after onboarding new workspaces.",
+    );
+    Ok(())
+}
+
 pub fn setup(args: SetupArgs) -> Result<()> {
     let token = args.token.unwrap_or_else(crate::config::generate_token);
-    println!("export MOBFS_TOKEN='{token}'");
-    println!(
-        "mobfs daemon --bind 127.0.0.1:{} --allow-root '{}' --token \"$MOBFS_TOKEN\"",
-        args.port,
-        args.remote_root.display()
-    );
     let name = args
         .name
         .map(|value| format!(" --name {value}"))
         .unwrap_or_default();
-    println!(
+    ui::section("Remote");
+    ui::command(format!("export MOBFS_TOKEN='{token}'"));
+    ui::command(format!(
+        "mobfs daemon --bind 127.0.0.1:{} --allow-root '{}' --token \"$MOBFS_TOKEN\"",
+        args.port,
+        args.remote_root.display()
+    ));
+    ui::blank();
+    ui::section("Local mount");
+    ui::command(format!(
         "mobfs mount {}:{} --ssh-tunnel{name} --token \"$MOBFS_TOKEN\"",
         args.host,
         args.remote_root.display()
-    );
-    println!(
+    ));
+    ui::blank();
+    ui::section("Mirror fallback");
+    ui::command(format!(
         "mobfs mirror {}:{} --ssh-tunnel{name} --token \"$MOBFS_TOKEN\"",
         args.host,
         args.remote_root.display()
-    );
+    ));
+    ui::blank();
+    ui::section("Validate");
+    ui::command("mobfs doctor");
+    ui::command("mobfs security");
     Ok(())
 }
 
 pub fn bench(args: BenchArgs) -> Result<()> {
     let config = AppConfig::load()?;
+    if args.scale_files > 0 {
+        create_scale_fixture(&config, args.scale_files, args.files_per_dir.max(1))?;
+    }
     let iterations = args.iterations.max(1);
     let started = Instant::now();
     let mut entries = 0_usize;
@@ -386,6 +493,29 @@ pub fn bench(args: BenchArgs) -> Result<()> {
             let _ = client.remove(".mobfs-bench.bin", meta);
         }
     }
+    Ok(())
+}
+
+fn create_scale_fixture(config: &AppConfig, files: u32, files_per_dir: u32) -> Result<()> {
+    let root = config.local.root.join(".mobfs-scale-fixture");
+    if root.exists() {
+        fs::remove_dir_all(&root)?;
+    }
+    fs::create_dir_all(&root)?;
+    let started = Instant::now();
+    for index in 0..files {
+        let dir = root.join(format!("d{:05}", index / files_per_dir));
+        fs::create_dir_all(&dir)?;
+        fs::write(
+            dir.join(format!("f{:05}.txt", index)),
+            format!("mobfs scale fixture {index}\n"),
+        )?;
+    }
+    ui::info("scale fixture files", files.to_string());
+    ui::info(
+        "scale fixture create ms",
+        started.elapsed().as_millis().to_string(),
+    );
     Ok(())
 }
 

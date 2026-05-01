@@ -32,11 +32,19 @@ cargo build --release
 sudo cp target/release/mobfs /usr/local/bin/
 ```
 
-The default build enables FUSE support. On macOS, install macFUSE before using `mobfs mount`. If your system does not have FUSE libraries available, build mirror-only mode:
+The default build enables FUSE support. On macOS, install macFUSE before using `mobfs mount`. If macFUSE was just installed, approve the system extension in System Settings and reboot if macOS asks. If your system does not have FUSE libraries available, build mirror-only mode:
 
 ```bash
 cargo build --release --no-default-features
 ```
+
+Before dogfooding the mount path on macOS, run:
+
+```bash
+mobfs mount-doctor /Volumes/app
+```
+
+Use `mobfs unmount /Volumes/app` to unmount and remove a clean mountpoint after testing.
 
 ## Quick Start
 
@@ -144,12 +152,16 @@ mobfs watch
 mobfs run <command> [args...]
 mobfs git <args...>
 
-# Daemon and setup
+# Daemon, setup, security, and FUSE UX
 mobfs token
 mobfs setup /srv/projects --host example.com
 mobfs daemon --bind 127.0.0.1:7727 --allow-root /srv/projects --token "$MOBFS_TOKEN"
 mobfs doctor
+mobfs mount-doctor /Volumes/app
+mobfs unmount /Volumes/app
+mobfs security
 mobfs bench --iterations 5 --mib 64
+mobfs bench --scale-files 50000 --iterations 3
 ```
 
 Useful aliases in mirror mode: `start` as `up`, `pull` as `get`, `push` as `put`, `sync` as `s`, `status` as `st`, `run` as `r`, `git` as `g`, and `open` as `o`.
@@ -157,6 +169,8 @@ Useful aliases in mirror mode: `start` as `up`, `pull` as `get`, `push` as `put`
 ## No-Local-Code Semantics
 
 `mobfs mount` does not create `.mobfs.toml`, `.mobfs/token`, snapshots, or a project mirror under the mountpoint. Reads are fetched from the daemon on demand. Writes are sent to the daemon immediately. The only local persistence used by FUSE mode is a small operation journal in the system temp directory so interrupted metadata and namespace operations can be replayed after reconnect.
+
+Metadata lookups and directory entries use a short kernel cache TTL. The default is 1 second and can be changed with `mobfs mount --cache-ttl-secs <seconds>`. Use `0` while dogfooding remote-side edits from another shell, and use a small nonzero value when testing IDE indexing performance. Direct reads go to the daemon first and only fall back to the last successful chunk if the daemon is temporarily unavailable.
 
 This means local tools may still create their own caches outside the mount, and operating systems may keep normal kernel/page-cache data while the mount is active. MobFS does not intentionally mirror project source into a durable local workspace in mount mode.
 
@@ -171,11 +185,14 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 Recommended benchmark fixtures:
 
+- `mobfs bench --scale-files 50000 --iterations 3`
+- `mobfs bench --scale-files 300000 --files-per-dir 1000 --iterations 3`
 - a Linux-kernel-sized many-file tree
 - a medium JavaScript app with `node_modules` ignored in mirror mode
 - a Rust repo with `target` ignored in mirror mode
 - editor atomic-save workloads
 - git status/add/diff/commit workloads over FUSE
+- IDE indexing, `rg`, language server startup, and `git status` over FUSE
 
 ## Architecture
 
@@ -192,6 +209,20 @@ Recommended benchmark fixtures:
 - `sync.rs`: User-facing workflows for mount, mirror, pull, push, sync, watch, run, and doctor
 - `mountfs.rs`: No-local-code FUSE filesystem implementation
 - `ui.rs`: Minimal terminal status output
+
+## Security Hardening
+
+Run `mobfs security` for the short operational checklist.
+
+- Bind `mobfsd` to `127.0.0.1` and connect with `--ssh-tunnel` unless the daemon is on a trusted private network.
+- Rotate tokens with `mobfs token`, restart the daemon with the new token, and update clients through `MOBFS_TOKEN` or the workspace token file.
+- Prefer one token and one `--allow-root` per workspace or team boundary.
+- Do not use `--allow-any-root` outside local tests.
+- The daemon rejects absolute paths, `..`, and other non-normal relative path components before joining client paths to allowed roots.
+
+## Crash Recovery Dogfooding
+
+Abuse-test the FUSE path before release by killing the client and daemon during large writes, atomic editor saves, renames, `git add`, and `git status`. After restart, remount with `--cache-ttl-secs 0`, verify checksums for large files, verify no `.mobfs-upload-*` temp file replaced a final path, and run the project test suite remotely with `mobfs run`.
 
 ## License
 
