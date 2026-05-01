@@ -95,6 +95,7 @@ pub fn mount(args: MountArgs) -> Result<()> {
         };
         let mut config = new_config(target, root.clone(), args.port, args.token, args.ssh_tunnel);
         config.sync.cache_ttl_secs = args.cache_ttl_secs;
+        config.sync.operation_retries = 0;
         crate::mountfs::prepare_mountpoint(&root)?;
         ui::added(
             "mounting no-local-code filesystem",

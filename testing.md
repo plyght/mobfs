@@ -133,6 +133,8 @@ Observed wall time was `1.11s`.
 
 A 20-file agent-style bulk write exposed macOS AppleDouble `._*` sidecar creation on the first pass. MobFS now treats ignore entries ending in `*` as path-segment prefixes and includes `._*` in the default ignore list. A follow-up mount validation confirmed that writing `/tmp/mobfs-polish-mount/._mobfs-polish-sidecar` is blocked with `Permission denied`, does not create a remote sidecar file, and normal file create/delete still works through the mount.
 
+A mid-write daemon kill was tested with a 128 MiB `dd` write through the mount. With mount-mode retries disabled and 1s socket timeouts, the writer failed in about `8s` instead of hanging for over a minute. The partial file stayed remote-side, remount replay completed, and a normal post-remount create/delete succeeded. Existing mounted handles can still return `EIO` after the hard daemon kill; the reliable recovery path is unmount/remount, which is acceptable for this local chaos pass but still below true mosh-style seamlessness.
+
 ### Remote command workflows
 
 From an explicit mirror workspace, these worked:
@@ -202,5 +204,5 @@ The remaining focus should be:
 - keep narrowing `git status` and other metadata-heavy FUSE workloads against native on larger repositories
 - improve arbitrary filesystem scans such as `find` and `du`
 - test over real remote network conditions
-- improve the user experience for writes attempted while the daemon is fully unavailable
+- improve same-mount recovery after a hard mid-write daemon kill so users do not need to unmount/remount
 - define honest performance guidance: fast for remote coding workflows, not yet native-like for arbitrary filesystem scans

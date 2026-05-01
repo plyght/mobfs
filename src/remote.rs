@@ -52,8 +52,8 @@ impl RemoteClient {
             (config.remote.host.clone(), port, None)
         };
         let stream = TcpStream::connect((host.as_str(), port))?;
-        stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+        stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(1)))?;
         let token = config
             .remote
             .token

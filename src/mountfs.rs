@@ -104,7 +104,7 @@ pub fn config_from_remote(
                 ".mobfs-mountfs-journal.jsonl".to_string(),
             ],
             connect_retries: crate::config::DEFAULT_CONNECT_RETRIES,
-            operation_retries: crate::config::DEFAULT_OP_RETRIES,
+            operation_retries: 0,
             cache_ttl_secs: 1,
         },
     })
@@ -152,6 +152,11 @@ enum JournalOp {
     Remove {
         path: String,
         dir: bool,
+    },
+    WriteAt {
+        path: String,
+        offset: u64,
+        data: Vec<u8>,
     },
 }
 
@@ -709,17 +714,32 @@ impl Filesystem for MobfsFuse {
             reply.error(Errno::EACCES);
             return;
         }
+        let data = data.to_vec();
+        if self
+            .record(&JournalOp::WriteAt {
+                path: path.clone(),
+                offset,
+                data: data.clone(),
+            })
+            .is_err()
+        {
+            reply.error(Errno::EIO);
+            return;
+        }
         let write_result = {
             self.client
                 .lock()
                 .unwrap()
-                .write_file_at(&path, offset, data.to_vec())
+                .write_file_at(&path, offset, data.clone())
         };
         match write_result {
             Ok(()) => {
                 self.invalidate_path_cache(&path);
                 self.update_file_write(&path, offset, data.len());
-                reply.written(data.len() as u32);
+                match self.clear_record() {
+                    Ok(()) => reply.written(data.len() as u32),
+                    Err(errno) => reply.error(errno),
+                }
             }
             Err(_) => reply.error(Errno::EIO),
         }
@@ -1338,6 +1358,9 @@ fn apply_journal_op(client: &mut RemoteClient, op: &JournalOp) -> Result<()> {
                 link_target: None,
             };
             client.remove(path, &meta)
+        }
+        JournalOp::WriteAt { path, offset, data } => {
+            client.write_file_at(path, *offset, data.clone())
         }
     }
 }

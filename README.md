@@ -13,7 +13,7 @@ A durable local mirror still exists as `mobfs mirror` for explicit offline/cache
 
 - **No-local-code Mount**: `mobfs mount` creates a read-write FUSE filesystem without pulling the project into a local mirror
 - **Remote-Owned Workspaces**: Remote source stays under the daemon root; local paths are mountpoints only
-- **Resilient Operations**: Reconnects with retry/backoff, journals mutating FUSE operations, and replays them after drops
+- **Resilient Operations**: Reconnects with retry/backoff, journals mutating FUSE metadata operations and write chunks, and replays them after remounts
 - **Developer Tool Support**: Handles reads, writes, creates, truncates, renames, deletes, symlinks, chmod/mtime, flush, and fsync
 - **macOS Noise Filtering**: Mount and mirror workflows ignore `.DS_Store` and AppleDouble `._*` sidecar files by default
 - **Git and Agent Friendly**: Supports editor temp-file save patterns, agent-style temp writes, and git operations through mounted filesystems or `mobfs git`
@@ -241,6 +241,8 @@ Run `mobfs security` for the short operational checklist.
 ## Crash Recovery Dogfooding
 
 Abuse-test the FUSE path before release by killing the client and daemon during large writes, atomic editor saves, renames, `git add`, and `git status`. After restart, remount with `--cache-ttl-secs 0`, verify checksums for large files, verify no `.mobfs-upload-*` temp file replaced a final path, and run the project test suite remotely with `mobfs run`.
+
+Current local chaos testing confirms mid-write daemon death now fails the writer quickly instead of hanging for over a minute, and remount recovery succeeds. Same-mount seamless recovery after a hard mid-write daemon kill is still future work.
 
 ## License
 
