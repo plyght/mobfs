@@ -492,7 +492,7 @@ fn snapshot(root: &Path, ignore: &[String]) -> Result<Snapshot> {
         let rel = relative_path(&root, path)?;
         if rel
             .split('/')
-            .any(|part| ignore.iter().any(|ignore| ignore == part))
+            .any(|part| crate::local::should_ignore_part(part, ignore))
         {
             continue;
         }

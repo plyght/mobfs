@@ -36,6 +36,9 @@ Fixture: `/Users/nicojaffer/wax`
 | `mobfs git status --short` from mirror workspace | showed `M README.md` | 0.72s |
 | `mobfs run pwd` directly from no-local-code mount root | `/Users/nicojaffer/wax` | 0.31s |
 | `mobfs git status --short` directly from no-local-code mount root | showed `M README.md` | 0.13s |
+| Temporary branch checkout cycle through raw FUSE | success | 1.11s |
+| `mobfs run cargo check` directly from no-local-code mount root | success | 8.51s including crate downloads |
+| AppleDouble `._*` sidecar write through mount | blocked, no remote sidecar created | immediate |
 
 ## Results after snapshot metadata fast path and journal sync optimization
 
@@ -93,4 +96,5 @@ Remaining performance work:
 
 - keep narrowing raw FUSE `git status` against native on larger repositories
 - improve broad traversal performance for `find`, `du`, and similar arbitrary filesystem scans
+- improve write UX when the daemon is fully unavailable instead of merely restarting
 - test over a real remote network link, not just local TCP

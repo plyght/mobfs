@@ -168,6 +168,7 @@ fn new_config(
                 "node_modules".to_string(),
                 ".mobfs.toml".to_string(),
                 ".DS_Store".to_string(),
+                "._*".to_string(),
                 ".mobfs-mountfs-journal.jsonl".to_string(),
             ],
             connect_retries: DEFAULT_CONNECT_RETRIES,

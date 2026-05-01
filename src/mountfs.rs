@@ -100,6 +100,7 @@ pub fn config_from_remote(
                 "node_modules".to_string(),
                 ".mobfs.toml".to_string(),
                 ".DS_Store".to_string(),
+                "._*".to_string(),
                 ".mobfs-mountfs-journal.jsonl".to_string(),
             ],
             connect_retries: crate::config::DEFAULT_CONNECT_RETRIES,
@@ -123,6 +124,7 @@ struct MobfsFuse {
     handle_to_path: Mutex<BTreeMap<u64, String>>,
     journal: PathBuf,
     ttl: Duration,
+    ignore: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -156,6 +158,7 @@ enum JournalOp {
 impl MobfsFuse {
     fn new(config: AppConfig, ttl: Duration) -> Result<Self> {
         let journal = mountfs_journal_path(&config);
+        let ignore = config.sync.ignore.clone();
         let mut client = RemoteClient::connect(config)?;
         replay_journal(&journal, &mut client)?;
         let snapshot = client.snapshot()?;
@@ -170,6 +173,7 @@ impl MobfsFuse {
         }
         let dir_cache = dir_cache_from_snapshot(&snapshot);
         Ok(Self {
+            ignore,
             client: Mutex::new(client),
             snapshot: Mutex::new(snapshot),
             path_to_ino: Mutex::new(path_to_ino),
@@ -226,6 +230,11 @@ impl MobfsFuse {
 
     fn fresh_meta(&self, path: &str) -> Option<EntryMeta> {
         self.snapshot.lock().unwrap().entries.get(path).cloned()
+    }
+
+    fn ignored_rel(&self, path: &str) -> bool {
+        path.split('/')
+            .any(|part| crate::local::should_ignore_part(part, &self.ignore))
     }
 
     fn update_file_write(&self, path: &str, offset: u64, len: usize) {
@@ -455,6 +464,10 @@ impl Filesystem for MobfsFuse {
             }
         };
         let path = join_rel(&parent_path, name);
+        if self.ignored_rel(&path) {
+            reply.error(Errno::ENOENT);
+            return;
+        }
         if let Some(meta) = self.fresh_meta(&path) {
             reply.entry(
                 &self.ttl,
@@ -635,7 +648,12 @@ impl Filesystem for MobfsFuse {
                 reply.data(slice_read(&data, offset, size));
                 return;
             }
-            match self.client.lock().unwrap().read_file_chunk(&path, 0, meta.size) {
+            match self
+                .client
+                .lock()
+                .unwrap()
+                .read_file_chunk(&path, 0, meta.size)
+            {
                 Ok((data, _)) => {
                     let chunk = slice_read(&data, offset, size).to_vec();
                     self.file_cache.lock().unwrap().insert(path.clone(), data);
@@ -687,6 +705,10 @@ impl Filesystem for MobfsFuse {
                 return;
             }
         };
+        if self.ignored_rel(&path) {
+            reply.error(Errno::EACCES);
+            return;
+        }
         let write_result = {
             self.client
                 .lock()
@@ -923,6 +945,10 @@ impl Filesystem for MobfsFuse {
             }
         };
         let path = join_rel(&parent_path, name);
+        if self.ignored_rel(&path) {
+            reply.error(Errno::EACCES);
+            return;
+        }
         if self
             .record(&JournalOp::Truncate {
                 path: path.clone(),
@@ -994,6 +1020,10 @@ impl Filesystem for MobfsFuse {
             }
         };
         let path = join_rel(&parent_path, name);
+        if self.ignored_rel(&path) {
+            reply.error(Errno::EACCES);
+            return;
+        }
         if self
             .record(&JournalOp::Mkdir { path: path.clone() })
             .is_err()
@@ -1052,6 +1082,10 @@ impl Filesystem for MobfsFuse {
             return;
         };
         let path = join_rel(&parent_path, name);
+        if self.ignored_rel(&path) {
+            reply.error(Errno::EACCES);
+            return;
+        }
         if self
             .record(&JournalOp::Symlink {
                 path: path.clone(),
@@ -1126,6 +1160,10 @@ impl Filesystem for MobfsFuse {
         };
         let from = join_rel(&from_parent, name);
         let to = join_rel(&to_parent, newname);
+        if self.ignored_rel(&to) {
+            reply.error(Errno::EACCES);
+            return;
+        }
         if self
             .record(&JournalOp::Rename {
                 from: from.clone(),
@@ -1169,6 +1207,10 @@ impl MobfsFuse {
             }
         };
         let path = join_rel(&parent_path, name);
+        if self.ignored_rel(&path) {
+            reply.ok();
+            return;
+        }
         let meta = EntryMeta {
             kind: if dir { EntryKind::Dir } else { EntryKind::File },
             size: 0,

@@ -105,7 +105,16 @@ pub fn relative_path(root: &Path, path: &Path) -> Result<String> {
 
 pub fn should_ignore_rel(config: &AppConfig, rel: &str) -> bool {
     rel.split('/')
-        .any(|part| config.sync.ignore.iter().any(|ignore| ignore == part))
+        .any(|part| should_ignore_part(part, &config.sync.ignore))
+}
+
+pub fn should_ignore_part(part: &str, ignore: &[String]) -> bool {
+    ignore.iter().any(|pattern| {
+        pattern == part
+            || pattern
+                .strip_suffix('*')
+                .is_some_and(|prefix| part.starts_with(prefix))
+    })
 }
 
 pub fn should_ignore_path(config: &AppConfig, path: &Path) -> bool {
@@ -171,7 +180,7 @@ mod tests {
                 root: PathBuf::from("."),
             },
             sync: SyncConfig {
-                ignore: vec![".git".to_string(), "target".to_string()],
+                ignore: vec![".git".to_string(), "target".to_string(), "._*".to_string()],
                 connect_retries: 1,
                 operation_retries: 1,
                 cache_ttl_secs: 1,
@@ -184,6 +193,7 @@ mod tests {
         let config = config();
         assert!(should_ignore_rel(&config, ".git/config"));
         assert!(should_ignore_rel(&config, "app/target/debug"));
+        assert!(should_ignore_rel(&config, "._scratch"));
         assert!(!should_ignore_rel(&config, "src/main.rs"));
     }
 }

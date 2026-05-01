@@ -32,7 +32,7 @@ MOBFS_TOKEN=local-proof-token target/release/mobfs mount \
   --cache-ttl-secs 0
 ```
 
-The latest performance passes tested both `--cache-ttl-secs 1` and `--cache-ttl-secs 0`. MobFS now serves known lookup/getattr metadata from the mounted snapshot even in TTL 0 mode, so common metadata-heavy tools no longer remote-stat every known path. Directory listings are seeded from the initial snapshot even in TTL 0 mode and refreshed after remote listings. Daemon `stat` and `list_dir` use metadata-only responses instead of hashing file contents. Small files are cached as whole-file reads, which helps Git/editor workloads that repeatedly read many small files.
+The latest performance passes tested both `--cache-ttl-secs 1` and `--cache-ttl-secs 0`. MobFS now serves known lookup/getattr metadata from the mounted snapshot even in TTL 0 mode, so common metadata-heavy tools no longer remote-stat every known path. Directory listings are seeded from the initial snapshot even in TTL 0 mode and refreshed after remote listings. Daemon `stat` and `list_dir` use metadata-only responses instead of hashing file contents. Small files are cached as whole-file reads, which helps Git/editor workloads that repeatedly read many small files. The default ignore list now blocks macOS AppleDouble `._*` sidecar files as well as `.DS_Store`.
 
 Additional manual probes:
 
@@ -119,6 +119,20 @@ A full `find` over the mounted repo completed in `0.21-0.25s` with a 1s cache TT
 
 This fixes the prior failure where both commands timed out after 180s. The improvement depends on mount directory listings respecting configured heavy-directory ignores such as `target` and `node_modules`.
 
+### Git checkout and remote command workflows
+
+A temporary branch checkout cycle through the raw FUSE mount passed on `~/wax`:
+
+```sh
+git checkout -b mobfs-proof-branch
+git checkout master
+git branch -D mobfs-proof-branch
+```
+
+Observed wall time was `1.11s`.
+
+A 20-file agent-style bulk write exposed macOS AppleDouble `._*` sidecar creation on the first pass. MobFS now treats ignore entries ending in `*` as path-segment prefixes and includes `._*` in the default ignore list. A follow-up mount validation confirmed that writing `/tmp/mobfs-polish-mount/._mobfs-polish-sidecar` is blocked with `Permission denied`, does not create a remote sidecar file, and normal file create/delete still works through the mount.
+
 ### Remote command workflows
 
 From an explicit mirror workspace, these worked:
@@ -188,4 +202,5 @@ The remaining focus should be:
 - keep narrowing `git status` and other metadata-heavy FUSE workloads against native on larger repositories
 - improve arbitrary filesystem scans such as `find` and `du`
 - test over real remote network conditions
+- improve the user experience for writes attempted while the daemon is fully unavailable
 - define honest performance guidance: fast for remote coding workflows, not yet native-like for arbitrary filesystem scans

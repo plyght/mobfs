@@ -15,6 +15,7 @@ A durable local mirror still exists as `mobfs mirror` for explicit offline/cache
 - **Remote-Owned Workspaces**: Remote source stays under the daemon root; local paths are mountpoints only
 - **Resilient Operations**: Reconnects with retry/backoff, journals mutating FUSE operations, and replays them after drops
 - **Developer Tool Support**: Handles reads, writes, creates, truncates, renames, deletes, symlinks, chmod/mtime, flush, and fsync
+- **macOS Noise Filtering**: Mount and mirror workflows ignore `.DS_Store` and AppleDouble `._*` sidecar files by default
 - **Git and Agent Friendly**: Supports editor temp-file save patterns, agent-style temp writes, and git operations through mounted filesystems or `mobfs git`
 - **Remote Command Execution**: `mobfs run` and `mobfs git` run on the remote workspace after syncing explicit mirror edits when used from mirror mode
 - **Daemon Backend**: Uses an authenticated encrypted TCP protocol between `mobfs` and `mobfsd`
@@ -110,7 +111,7 @@ ssh_tunnel = true
 root = "/Users/alex/MobFS/app"
 
 [sync]
-ignore = [".mobfs", "target", "node_modules", ".mobfs.toml"]
+ignore = [".mobfs", "target", "node_modules", ".mobfs.toml", ".DS_Store", "._*", ".mobfs-mountfs-journal.jsonl"]
 connect_retries = 8
 operation_retries = 5
 ```
@@ -174,11 +175,13 @@ Useful aliases: `start` as `up`, `pull` as `get`, `push` as `put`, `sync` as `s`
 
 Metadata lookups and directory entries use a short kernel cache TTL. The default is 1 second and can be changed with `mobfs mount --cache-ttl-secs <seconds>`. Use `0` while dogfooding remote-side edits from another shell, and use a small nonzero value for normal editor, agent, git, search, and traversal workflows. With a nonzero TTL, MobFS serves known metadata and directory entries from the initial snapshot and local mutation cache where safe. Direct reads go to the daemon first and only fall back to the last successful chunk if the daemon is temporarily unavailable.
 
+Ignore entries match full path segments by default. Entries ending in `*` are treated as segment prefixes, so the default `._*` blocks macOS AppleDouble sidecar files from being created or listed through the mount.
+
 This means local tools may still create their own caches outside the mount, and operating systems may keep normal kernel/page-cache data while the mount is active. MobFS does not intentionally mirror project source into a durable local workspace in mount mode.
 
 ## Performance Guidance
 
-Current local proof testing on a real Rust repo shows the mount path is ready for controlled dogfooding: targeted source reads, `rg`, editor atomic-save patterns, symlinks, deletes, daemon restart recovery, 32 MiB writes, ignored-directory `find`, and `du` all complete quickly. It is still not a native local filesystem replacement for arbitrary metadata-heavy scans.
+Current local proof testing on a real Rust repo shows the mount path is ready for controlled dogfooding: targeted source reads, `rg`, editor atomic-save patterns, symlinks, deletes, daemon restart recovery, 32 MiB writes, ignored-directory `find`, `du`, temporary branch checkout, and remote `cargo check` all complete successfully. It is still not a native local filesystem replacement for arbitrary metadata-heavy scans.
 
 Use these rules of thumb:
 
