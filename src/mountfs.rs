@@ -118,6 +118,7 @@ struct MobfsFuse {
     path_to_ino: Mutex<BTreeMap<String, u64>>,
     ino_to_path: Mutex<BTreeMap<u64, String>>,
     read_cache: Mutex<BTreeMap<(String, u64, u32), Vec<u8>>>,
+    file_cache: Mutex<BTreeMap<String, Vec<u8>>>,
     dir_cache: Mutex<DirCache>,
     handle_to_path: Mutex<BTreeMap<u64, String>>,
     journal: PathBuf,
@@ -167,17 +168,14 @@ impl MobfsFuse {
             path_to_ino.insert(path.clone(), ino);
             ino_to_path.insert(ino, path.clone());
         }
-        let dir_cache = if ttl.is_zero() {
-            BTreeMap::new()
-        } else {
-            dir_cache_from_snapshot(&snapshot)
-        };
+        let dir_cache = dir_cache_from_snapshot(&snapshot);
         Ok(Self {
             client: Mutex::new(client),
             snapshot: Mutex::new(snapshot),
             path_to_ino: Mutex::new(path_to_ino),
             ino_to_path: Mutex::new(ino_to_path),
             read_cache: Mutex::new(BTreeMap::new()),
+            file_cache: Mutex::new(BTreeMap::new()),
             dir_cache: Mutex::new(dir_cache),
             handle_to_path: Mutex::new(BTreeMap::new()),
             journal,
@@ -190,6 +188,10 @@ impl MobfsFuse {
             .lock()
             .unwrap()
             .retain(|(cached, _, _), _| cached != path && !cached.starts_with(&format!("{path}/")));
+        self.file_cache
+            .lock()
+            .unwrap()
+            .retain(|cached, _| cached != path && !cached.starts_with(&format!("{path}/")));
         self.dir_cache.lock().unwrap().retain(|cached, _| {
             cached != path
                 && !path.starts_with(&format!("{cached}/"))
@@ -220,6 +222,10 @@ impl MobfsFuse {
             .lock()
             .unwrap()
             .insert(ino, path.to_string());
+    }
+
+    fn fresh_meta(&self, path: &str) -> Option<EntryMeta> {
+        self.snapshot.lock().unwrap().entries.get(path).cloned()
     }
 
     fn update_file_write(&self, path: &str, offset: u64, len: usize) {
@@ -320,12 +326,9 @@ impl MobfsFuse {
     }
 
     fn cached_dir_entries(&self, dir: &str) -> Option<DirEntries> {
-        if self.ttl.is_zero() {
-            return None;
-        }
         let cache = self.dir_cache.lock().unwrap();
         let (created, entries) = cache.get(dir)?;
-        if created.elapsed() <= self.ttl {
+        if self.ttl.is_zero() || created.elapsed() <= self.ttl {
             Some(entries.clone())
         } else {
             None
@@ -333,12 +336,10 @@ impl MobfsFuse {
     }
 
     fn cache_dir_entries(&self, dir: &str, entries: &[(String, EntryMeta)]) {
-        if !self.ttl.is_zero() {
-            self.dir_cache
-                .lock()
-                .unwrap()
-                .insert(dir.to_string(), (Instant::now(), entries.to_vec()));
-        }
+        self.dir_cache
+            .lock()
+            .unwrap()
+            .insert(dir.to_string(), (Instant::now(), entries.to_vec()));
     }
 
     fn remove_entry(&self, path: &str) {
@@ -454,9 +455,7 @@ impl Filesystem for MobfsFuse {
             }
         };
         let path = join_rel(&parent_path, name);
-        if !self.ttl.is_zero()
-            && let Some(meta) = self.snapshot.lock().unwrap().entries.get(&path).cloned()
-        {
+        if let Some(meta) = self.fresh_meta(&path) {
             reply.entry(
                 &self.ttl,
                 &self.attr_for(&path, Some(&meta)),
@@ -499,9 +498,7 @@ impl Filesystem for MobfsFuse {
                 return;
             }
         };
-        if !self.ttl.is_zero()
-            && let Some(meta) = self.snapshot.lock().unwrap().entries.get(&path).cloned()
-        {
+        if let Some(meta) = self.fresh_meta(&path) {
             reply.attr(&self.ttl, &self.attr_for(&path, Some(&meta)));
             return;
         }
@@ -586,16 +583,18 @@ impl Filesystem for MobfsFuse {
                 return;
             }
         };
-        match self.client.lock().unwrap().stat(&path) {
-            Ok(Some(meta)) => self.update_entry(&path, meta),
-            Ok(None) => {
-                self.remove_entry(&path);
-                reply.error(Errno::ENOENT);
-                return;
-            }
-            Err(_) => {
-                reply.error(Errno::EIO);
-                return;
+        if self.fresh_meta(&path).is_none() {
+            match self.client.lock().unwrap().stat(&path) {
+                Ok(Some(meta)) => self.update_entry(&path, meta),
+                Ok(None) => {
+                    self.remove_entry(&path);
+                    reply.error(Errno::ENOENT);
+                    return;
+                }
+                Err(_) => {
+                    reply.error(Errno::EIO);
+                    return;
+                }
             }
         }
         let snapshot = self.snapshot.lock().unwrap();
@@ -628,6 +627,30 @@ impl Filesystem for MobfsFuse {
             }
         };
         let key = (path.clone(), offset, size);
+        if let Some(meta) = self.fresh_meta(&path)
+            && meta.kind == EntryKind::File
+            && meta.size <= 1024 * 1024
+        {
+            if let Some(data) = self.file_cache.lock().unwrap().get(&path).cloned() {
+                reply.data(slice_read(&data, offset, size));
+                return;
+            }
+            match self.client.lock().unwrap().read_file_chunk(&path, 0, meta.size) {
+                Ok((data, _)) => {
+                    let chunk = slice_read(&data, offset, size).to_vec();
+                    self.file_cache.lock().unwrap().insert(path.clone(), data);
+                    reply.data(&chunk);
+                    return;
+                }
+                Err(_) => match self.read_cache.lock().unwrap().get(&key) {
+                    Some(data) => {
+                        reply.data(data);
+                        return;
+                    }
+                    None => {}
+                },
+            }
+        }
         match self
             .client
             .lock()
@@ -689,10 +712,7 @@ impl Filesystem for MobfsFuse {
         reply: ReplyEmpty,
     ) {
         match self.path_for_handle(ino, fh) {
-            Some(path) => match self.client.lock().unwrap().fsync(&path) {
-                Ok(()) => reply.ok(),
-                Err(_) => reply.error(Errno::EIO),
-            },
+            Some(_) => reply.ok(),
             None => reply.error(Errno::ENOENT),
         }
     }
@@ -1221,26 +1241,19 @@ fn append_journal(path: &Path, op: &JournalOp) -> Result<()> {
         .open(path)?;
     file.write_all(serde_json::to_string(op)?.as_bytes())?;
     file.write_all(b"\n")?;
-    file.sync_all()?;
-    if let Some(parent) = path.parent()
-        && let Ok(dir) = std::fs::File::open(parent)
-    {
-        let _ = dir.sync_all();
-    }
+    file.sync_data()?;
     Ok(())
 }
 
 fn clear_journal(path: &Path) -> Result<()> {
-    let parent = path.parent().map(Path::to_path_buf);
-    match std::fs::remove_file(path) {
-        Ok(()) => {}
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+    {
+        Ok(file) => file.sync_data()?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
-    }
-    if let Some(parent) = parent
-        && let Ok(dir) = std::fs::File::open(parent)
-    {
-        let _ = dir.sync_all();
     }
     Ok(())
 }
@@ -1293,6 +1306,12 @@ fn join_rel(parent: &str, name: &str) -> String {
     } else {
         format!("{parent}/{name}")
     }
+}
+
+fn slice_read(data: &[u8], offset: u64, size: u32) -> &[u8] {
+    let start = (offset as usize).min(data.len());
+    let end = start.saturating_add(size as usize).min(data.len());
+    &data[start..end]
 }
 
 fn unix_now_secs() -> i64 {

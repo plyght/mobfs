@@ -32,7 +32,7 @@ MOBFS_TOKEN=local-proof-token target/release/mobfs mount \
   --cache-ttl-secs 0
 ```
 
-The latest performance pass also tested `--cache-ttl-secs 1`, which lets MobFS serve known lookup/getattr metadata from its local snapshot and cache repeated directory listings inside the TTL window instead of round-tripping to the daemon for every stat-like operation. Daemon `stat` and `list_dir` now use metadata-only responses instead of hashing file contents.
+The latest performance passes tested both `--cache-ttl-secs 1` and `--cache-ttl-secs 0`. MobFS now serves known lookup/getattr metadata from the mounted snapshot even in TTL 0 mode, so common metadata-heavy tools no longer remote-stat every known path. Directory listings are seeded from the initial snapshot even in TTL 0 mode and refreshed after remote listings. Daemon `stat` and `list_dir` use metadata-only responses instead of hashing file contents. Small files are cached as whole-file reads, which helps Git/editor workloads that repeatedly read many small files.
 
 Additional manual probes:
 
@@ -78,13 +78,13 @@ Reading `README.md` through the mount worked immediately in `0.00s`.
 
 ### Git through FUSE
 
-`git status --short` worked through the mount in `0.24-0.25s` warm with a 1s cache TTL and directory-entry caching, after a `1.49s` cold run, and reported the existing modified `README.md`.
+`git status --short` worked through the mount in `0.24-0.25s` warm with a 1s cache TTL and directory-entry caching, after a `1.49s` cold run, and reported the existing modified `README.md`. After the snapshot metadata fast path, repeated raw FUSE `git status --short` runs with `--cache-ttl-secs 0` measured `0.14s`, `0.13s`, and `0.12s`. After the TTL 0 directory reuse and small-file read-cache pass, raw FUSE `git status --short` measured `0.11s` cold and `0.09s` warm on the same fixture.
 
-`git diff -- README.md` worked in `0.08s` and returned the expected 248-byte diff output.
+`git diff -- README.md` worked in `0.02-0.08s` and returned the expected 248-byte diff output.
 
 ### Agent/editor write pattern
 
-This passed through the FUSE mount. The latest measured flow, including symlink creation and cleanup, took `0.25s`:
+This passed through the FUSE mount. The latest measured flow, including symlink creation and cleanup, was stable around `0.25-0.27s`:
 
 1. Create a proof directory.
 2. Write `.agent.tmp`.
@@ -103,19 +103,19 @@ The following worked through the mount and were reflected in the remote tree:
 
 ### Daemon restart recovery
 
-After intentionally killing the daemon and starting it again on the same port, the existing mount recovered on the next write. Writing `mobfs-recovery-proof.txt` through the mount succeeded in `0.58s` and appeared in `/Users/nicojaffer/wax`.
+After intentionally killing the daemon and starting it again on the same port, the existing mount recovered on the next write. Writing `mobfs-recovery-proof.txt` through the mount succeeded in `0.58s` in the earlier pass and `0.06s` in the latest pass, and appeared in `/Users/nicojaffer/wax`.
 
 ### Large writes over FUSE
 
-A 32 MiB zero-filled write through the mount completed in `1.37s`. The file appeared as 32 MiB from both the mounted path and the remote source path.
+A 32 MiB zero-filled write through the mount completed in `1.37s` in the first optimized pass, `0.84s` after the later metadata/journal work, and `0.92s` in the latest verification pass. The file appeared as 32 MiB from both the mounted path and the remote source path.
 
 This fixes the prior failure where a 32 MiB write timed out after 120s at roughly 8 MiB.
 
 ### Full tree traversal
 
-A full `find` over the mounted repo completed in `0.21-0.25s` with a 1s cache TTL, initial snapshot seeding, and directory-entry caching and counted 1057 files.
+A full `find` over the mounted repo completed in `0.21-0.25s` with a 1s cache TTL, initial snapshot seeding, and directory-entry caching and counted 1057 files. A later clean TTL 0 run after the metadata fast path completed in `0.30s` and counted 1057 files. After TTL 0 directory reuse, a latest TTL 0 verification pass counted 1057 files in `0.36s`.
 
-`du -sh` over the mounted repo completed in `0.11s` and reported 61M.
+`du -sh` over the mounted repo completed in `0.11s` with TTL 1 and reported 61M. A later clean TTL 0 run completed in `0.23s` and reported 61M. The latest TTL 0 verification pass reported 61M in `0.15s`.
 
 This fixes the prior failure where both commands timed out after 180s. The improvement depends on mount directory listings respecting configured heavy-directory ignores such as `target` and `node_modules`.
 
@@ -136,12 +136,12 @@ mobfs git status --short
 
 ### Near-native filesystem performance
 
-MobFS is much faster after the latest changes, but it is not near-native for metadata-heavy workloads. Native local baselines on the same fixture were roughly:
+MobFS is much faster after the latest changes, but it is not fully native-like for all metadata-heavy workloads. Native local baselines on the same fixture were roughly:
 
-- `rg` over `src`: `0.02s` native vs `0.06s` through FUSE
-- `git status --short`: `0.04s` native vs `0.24-0.25s` warm through FUSE
-- `find` with `target` pruned: `0.04s` native vs `0.21-0.25s` through FUSE
-- `du` with `target` ignored: effectively instant native vs `0.11s` through FUSE
+- `rg` over `src`: `0.01-0.02s` native vs `0.04-0.06s` through FUSE
+- `git status --short`: `0.02-0.04s` native vs `0.11s` cold and `0.09s` warm through raw FUSE after the small-file cache pass
+- `find` with `target` pruned: `0.01-0.04s` native vs `0.30-0.36s` through raw FUSE TTL 0, or `0.21-0.25s` with TTL 1
+- `du` with `target` ignored: effectively instant native vs `0.15-0.23s` through raw FUSE TTL 0, or `0.11s` with TTL 1
 
 The current state is good enough for dogfooding and targeted coding workflows, but not yet good enough to claim native-like general filesystem performance.
 
@@ -157,9 +157,9 @@ mobfs run pwd
 mobfs git status --short
 ```
 
-`mobfs run pwd` executed in `/Users/nicojaffer/wax` in `0.31s`.
+`mobfs run pwd` executed in `/Users/nicojaffer/wax` in `0.02-0.31s`.
 
-`mobfs git status --short` reported the existing modified `README.md` in `0.13s`.
+`mobfs git status --short` reported the existing modified `README.md` in `0.12-0.13s`.
 
 The mount root still did not contain `.mobfs`, `.mobfs.toml`, or similar project config files.
 
@@ -185,7 +185,7 @@ The previous blockers are fixed:
 
 The remaining focus should be:
 
-- bring `git status` and other metadata-heavy FUSE workloads closer to native
-- improve cold raw-FUSE `git status`
+- keep narrowing `git status` and other metadata-heavy FUSE workloads against native on larger repositories
+- improve arbitrary filesystem scans such as `find` and `du`
 - test over real remote network conditions
 - define honest performance guidance: fast for remote coding workflows, not yet native-like for arbitrary filesystem scans
