@@ -10,7 +10,7 @@ clap = { version = "4.5.51", features = ["derive", "env"] }
 console = "0.16.1"
 dirs = "6.0.0"
 filetime = "0.2.26"
-fuser = { version = "0.17.0", optional = true, features = ["macos-no-mount"] }
+fuser = { version = "0.17.0", optional = true }
 hex = "0.4.3"
 hkdf = "0.12.4"
 hmac = "0.12.1"
@@ -27,7 +27,7 @@ walkdir = "2.5.0"
 x25519-dalek = "2.0.1"
 
 [features]
-default = []
+default = ["fuse"]
 fuse = ["dep:fuser", "dep:libc"]
 
 [dev-dependencies]

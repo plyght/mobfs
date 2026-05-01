@@ -74,7 +74,7 @@ MOBFS_TOKEN=secret mobfs start host:/absolute/path --name app
 # Create a workspace without entering the long-running sync loop
 mobfs mount host:/absolute/path --name app --token secret
 
-# Mount a real on-demand read-write FUSE filesystem when built with --features fuse
+# Mount a real on-demand read-write FUSE filesystem
 mobfs mountfs host:/absolute/path /Volumes/app --token secret
 
 # Reconcile manually
@@ -135,10 +135,10 @@ mobfs start host:/absolute/path --name app
 
 mobfsd is safe-by-default: it refuses to start unless you pass one or more `--allow-root` values or explicitly opt into `--allow-any-root` for unsafe local testing. An allowed root also permits canonical descendants, so `--allow-root /srv` can serve `/srv/project`.
 
-For true filesystem semantics, build with optional FUSE support:
+For true filesystem semantics, use the built-in FUSE mount:
 
 ```bash
-cargo build --release --features fuse
+cargo build --release
 mobfs mountfs host:/absolute/path /Volumes/project --token secret
 ```
 
