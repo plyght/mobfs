@@ -10,7 +10,7 @@ use std::net::TcpStream;
 use std::thread;
 use std::time::Duration;
 
-const TRANSFER_CHUNK_SIZE: usize = 1024 * 1024;
+pub const TRANSFER_CHUNK_SIZE: usize = 1024 * 1024;
 
 pub struct RemoteClient {
     config: AppConfig,
@@ -74,42 +74,98 @@ impl RemoteClient {
         }
     }
 
+    pub fn read_file_chunk(&mut self, rel: &str, offset: u64, len: u64) -> Result<(Vec<u8>, bool)> {
+        let root = self.config.remote.path.clone();
+        let rel = rel.to_string();
+        match self.op(|stream, _| {
+            protocol::send(
+                stream,
+                &Request::ReadFileChunk {
+                    root: root.clone(),
+                    rel: rel.clone(),
+                    offset,
+                    len,
+                },
+            )
+        })? {
+            Response::FileChunk { data, eof } => Ok((data, eof)),
+            _ => Err(MobfsError::Remote("invalid read response".to_string())),
+        }
+    }
+
     pub fn download_file(&mut self, rel: &str, meta: &EntryMeta) -> Result<()> {
         let local = self.config.local.root.join(rel);
         if let Some(parent) = local.parent() {
             fs::create_dir_all(parent)?;
         }
-        let root = self.config.remote.path.clone();
         let rel = rel.to_string();
         let temp = atomic_temp_path(&local);
         let mut file = File::create(&temp)?;
         let mut offset = 0_u64;
         loop {
-            let response = self.op(|stream, _| {
-                protocol::send(
-                    stream,
-                    &Request::ReadFileChunk {
-                        root: root.clone(),
-                        rel: rel.clone(),
-                        offset,
-                        len: TRANSFER_CHUNK_SIZE as u64,
-                    },
-                )
-            })?;
-            match response {
-                Response::FileChunk { data, eof } => {
-                    file.write_all(&data)?;
-                    offset = offset.saturating_add(data.len() as u64);
-                    if eof {
-                        break;
-                    }
-                }
-                _ => return Err(MobfsError::Remote("invalid read response".to_string())),
+            let (data, eof) = self.read_file_chunk(&rel, offset, TRANSFER_CHUNK_SIZE as u64)?;
+            file.write_all(&data)?;
+            offset = offset.saturating_add(data.len() as u64);
+            if eof {
+                break;
             }
         }
         drop(file);
         fs::rename(&temp, &local)?;
         daemon::set_mtime(&local, meta.modified)?;
+        Ok(())
+    }
+
+    #[cfg_attr(not(feature = "fuse"), allow(dead_code))]
+    pub fn write_file_at(&mut self, rel: &str, offset: u64, data: Vec<u8>) -> Result<()> {
+        let root = self.config.remote.path.clone();
+        let rel = rel.to_string();
+        self.op(|stream, _| {
+            protocol::send(
+                stream,
+                &Request::WriteFileAt {
+                    root: root.clone(),
+                    rel: rel.clone(),
+                    offset,
+                    data: data.clone(),
+                },
+            )
+        })?;
+        Ok(())
+    }
+
+    #[cfg_attr(not(feature = "fuse"), allow(dead_code))]
+    pub fn truncate(&mut self, rel: &str, size: u64) -> Result<()> {
+        let root = self.config.remote.path.clone();
+        let rel = rel.to_string();
+        self.op(|stream, _| {
+            protocol::send(
+                stream,
+                &Request::Truncate {
+                    root: root.clone(),
+                    rel: rel.clone(),
+                    size,
+                },
+            )
+        })?;
+        Ok(())
+    }
+
+    #[cfg_attr(not(feature = "fuse"), allow(dead_code))]
+    pub fn rename(&mut self, from: &str, to: &str) -> Result<()> {
+        let root = self.config.remote.path.clone();
+        let from = from.to_string();
+        let to = to.to_string();
+        self.op(|stream, _| {
+            protocol::send(
+                stream,
+                &Request::Rename {
+                    root: root.clone(),
+                    from: from.clone(),
+                    to: to.clone(),
+                },
+            )
+        })?;
         Ok(())
     }
 

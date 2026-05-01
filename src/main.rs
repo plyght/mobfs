@@ -4,6 +4,8 @@ mod crypto;
 mod daemon;
 mod error;
 mod local;
+#[cfg(feature = "fuse")]
+mod mountfs;
 mod protocol;
 mod remote;
 mod snapshot;
@@ -21,6 +23,7 @@ fn main() -> Result<()> {
         Command::Init(args) => sync::init(args),
         Command::Start(args) => sync::start(args),
         Command::Mount(args) => sync::mount(args),
+        Command::Mountfs(args) => sync::mountfs(args),
         Command::Pull(args) => sync::pull(args),
         Command::Push(args) => sync::push(args),
         Command::Sync(args) => sync::sync(args),

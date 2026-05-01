@@ -165,6 +165,50 @@ fn handle_request(request: Request, policy: &RootPolicy) -> Result<Response> {
             file.write_all(&data)?;
             Ok(Response::Ok)
         }
+        Request::WriteFileAt {
+            root,
+            rel,
+            offset,
+            data,
+        } => {
+            let root = policy.check(&root)?;
+            let path = safe_join(&root, &rel)?;
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(path)?;
+            file.seek(SeekFrom::Start(offset))?;
+            file.write_all(&data)?;
+            Ok(Response::Ok)
+        }
+        Request::Truncate { root, rel, size } => {
+            let root = policy.check(&root)?;
+            let path = safe_join(&root, &rel)?;
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let file = fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(path)?;
+            file.set_len(size)?;
+            Ok(Response::Ok)
+        }
+        Request::Rename { root, from, to } => {
+            let root = policy.check(&root)?;
+            let from = safe_join(&root, &from)?;
+            let to = safe_join(&root, &to)?;
+            if let Some(parent) = to.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::rename(from, to)?;
+            Ok(Response::Ok)
+        }
         Request::WriteFileFinish { root, rel } => {
             let root = policy.check(&root)?;
             let path = safe_join(&root, &rel)?;

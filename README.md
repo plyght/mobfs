@@ -74,6 +74,9 @@ MOBFS_TOKEN=secret mobfs start host:/absolute/path --name app
 # Create a workspace without entering the long-running sync loop
 mobfs mount host:/absolute/path --name app --token secret
 
+# Mount a real on-demand read-write FUSE filesystem when built with --features fuse
+mobfs mountfs host:/absolute/path /Volumes/app --token secret
+
 # Reconcile manually
 mobfs pull
 mobfs push
@@ -132,6 +135,15 @@ mobfs start host:/absolute/path --name app
 
 mobfsd is safe-by-default: it refuses to start unless you pass one or more `--allow-root` values or explicitly opt into `--allow-any-root` for unsafe local testing. An allowed root also permits canonical descendants, so `--allow-root /srv` can serve `/srv/project`.
 
+For true filesystem semantics, build with optional FUSE support:
+
+```bash
+cargo build --release --features fuse
+mobfs mountfs host:/absolute/path /Volumes/project --token secret
+```
+
+`mountfs` exposes remote files on demand through FUSE without performing an initial full pull. It supports remote reads, writes, create, truncate, mkdir, unlink, rmdir, and rename against the daemon-backed tree. Use `mobfs mount`/`mobfs start` when you prefer an offline-capable local mirror with conflict reconciliation.
+
 iCloud and Google Drive can be used as folder-backed canonical storage roots. They do not provide remote compute, so `mobfs run` requires the daemon backend.
 
 ```bash
@@ -154,7 +166,8 @@ The config schema also reserves `r2` and `s3` backend names for future object-st
 - `snapshot.rs`: File metadata snapshots, diff planning, status output, and conflict decisions
 - `local.rs`: Local tree scanning, ignore handling, hashing, and snapshot persistence
 - `storage.rs`: Unified storage abstraction for daemon and provider-folder backends
-- `sync.rs`: Mount, start, pull, push, sync, watch, serve, run, doctor, and open workflows
+- `mountfs.rs`: Optional FUSE filesystem for real on-demand remote tree mounting
+- `sync.rs`: Mount, mountfs, start, pull, push, sync, watch, serve, run, doctor, and open workflows
 - `ui.rs`: Minimal command-line status, summaries, and spinners
 - `main.rs`: CLI entrypoint and command dispatch
 

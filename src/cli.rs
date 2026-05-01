@@ -19,6 +19,8 @@ pub enum Command {
     Start(StartArgs),
     #[command(about = "Create/open a visible local workspace backed by mobfsd")]
     Mount(MountArgs),
+    #[command(about = "Mount a real on-demand read-only FUSE filesystem")]
+    Mountfs(MountFsArgs),
     #[command(about = "Pull remote files into the local workspace  [alias: get]")]
     #[command(visible_alias = "get")]
     Pull(PullArgs),
@@ -102,6 +104,18 @@ pub struct MountArgs {
     pub token: Option<String>,
     #[arg(long, help = "Do not open Finder after mounting")]
     pub no_open: bool,
+}
+
+#[derive(Args)]
+pub struct MountFsArgs {
+    #[arg(help = "Remote root like host:/absolute/path; omitted inside an existing workspace")]
+    pub remote: Option<String>,
+    #[arg(help = "Local mountpoint path")]
+    pub mountpoint: PathBuf,
+    #[arg(long, default_value_t = 7727, help = "mobfsd port")]
+    pub port: u16,
+    #[arg(long, env = "MOBFS_TOKEN", help = "Shared mobfsd token")]
+    pub token: Option<String>,
 }
 
 #[derive(Args)]

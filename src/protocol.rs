@@ -37,6 +37,22 @@ pub enum Request {
         offset: u64,
         data: Vec<u8>,
     },
+    WriteFileAt {
+        root: String,
+        rel: String,
+        offset: u64,
+        data: Vec<u8>,
+    },
+    Truncate {
+        root: String,
+        rel: String,
+        size: u64,
+    },
+    Rename {
+        root: String,
+        from: String,
+        to: String,
+    },
     WriteFileFinish {
         root: String,
         rel: String,

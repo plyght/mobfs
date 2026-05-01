@@ -1,6 +1,6 @@
 use crate::cli::{
-    GitArgs, InitArgs, MountArgs, PullArgs, PushArgs, RunArgs, ServeArgs, StartArgs, SyncArgs,
-    WatchArgs,
+    GitArgs, InitArgs, MountArgs, MountFsArgs, PullArgs, PushArgs, RunArgs, ServeArgs, StartArgs,
+    SyncArgs, WatchArgs,
 };
 use crate::config::{
     AppConfig, DEFAULT_CONNECT_RETRIES, DEFAULT_OP_RETRIES, LocalConfig, RemoteConfig, STATE_DIR,
@@ -44,6 +44,26 @@ pub fn start(args: StartArgs) -> Result<()> {
         remote_interval: args.remote_interval,
         delete: args.delete,
     })
+}
+
+pub fn mountfs(args: MountFsArgs) -> Result<()> {
+    #[cfg(feature = "fuse")]
+    {
+        let config = match args.remote {
+            Some(remote) => {
+                crate::mountfs::config_from_remote(remote, &args.mountpoint, args.port, args.token)?
+            }
+            None => AppConfig::load()?,
+        };
+        crate::mountfs::mount(config, args.mountpoint)
+    }
+    #[cfg(not(feature = "fuse"))]
+    {
+        let _ = args;
+        Err(MobfsError::Config(
+            "mobfs mountfs requires building with --features fuse".to_string(),
+        ))
+    }
 }
 
 pub fn mount(args: MountArgs) -> Result<()> {
