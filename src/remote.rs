@@ -1,4 +1,5 @@
 use crate::config::{AppConfig, StorageBackend};
+use crate::crypto::SecureStream;
 use crate::daemon;
 use crate::error::{MobfsError, Result};
 use crate::protocol::{self, PROTOCOL_VERSION, Request, Response};
@@ -11,7 +12,7 @@ use std::time::Duration;
 
 pub struct RemoteClient {
     config: AppConfig,
-    stream: TcpStream,
+    stream: SecureStream,
 }
 
 impl RemoteClient {
@@ -29,7 +30,7 @@ impl RemoteClient {
             )));
         }
         let port = config.remote.port;
-        let mut stream = TcpStream::connect((config.remote.host.as_str(), port))?;
+        let stream = TcpStream::connect((config.remote.host.as_str(), port))?;
         stream.set_read_timeout(Some(Duration::from_secs(30)))?;
         stream.set_write_timeout(Some(Duration::from_secs(30)))?;
         let token = config
@@ -42,7 +43,8 @@ impl RemoteClient {
                     "remote token missing; pass --token or set MOBFS_TOKEN".to_string(),
                 )
             })?;
-        match protocol::send(&mut stream, &Request::Hello { token })? {
+        let mut stream = SecureStream::client(stream, &token)?;
+        match protocol::send(&mut stream, &Request::Hello)? {
             Response::Hello { version } if version == PROTOCOL_VERSION => {
                 Ok(Self { config, stream })
             }
@@ -178,7 +180,7 @@ impl RemoteClient {
 
     fn op<T>(
         &mut self,
-        mut action: impl FnMut(&mut TcpStream, &AppConfig) -> Result<T>,
+        mut action: impl FnMut(&mut SecureStream, &AppConfig) -> Result<T>,
     ) -> Result<T> {
         let mut attempt = 0;
         loop {

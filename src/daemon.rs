@@ -1,3 +1,4 @@
+use crate::crypto::SecureStream;
 use crate::error::{MobfsError, Result};
 use crate::local;
 use crate::protocol::{self, PROTOCOL_VERSION, Request, Response};
@@ -31,7 +32,8 @@ pub fn serve(bind: &str, token: &str) -> Result<()> {
     Ok(())
 }
 
-fn handle_client(mut stream: TcpStream, token: &str) -> Result<()> {
+fn handle_client(stream: TcpStream, token: &str) -> Result<()> {
+    let mut stream = SecureStream::server(stream, token)?;
     loop {
         let request = match protocol::read_frame::<Request>(&mut stream) {
             Ok(request) => request,
@@ -40,23 +42,18 @@ fn handle_client(mut stream: TcpStream, token: &str) -> Result<()> {
             }
             Err(error) => return Err(error),
         };
-        let response = handle_request(request, token).unwrap_or_else(|error| Response::Error {
+        let response = handle_request(request).unwrap_or_else(|error| Response::Error {
             message: error.to_string(),
         });
         protocol::write_frame(&mut stream, &response)?;
     }
 }
 
-fn handle_request(request: Request, token: &str) -> Result<Response> {
+fn handle_request(request: Request) -> Result<Response> {
     match request {
-        Request::Hello { token: given } => {
-            if given != token {
-                return Err(MobfsError::Remote("authentication failed".to_string()));
-            }
-            Ok(Response::Hello {
-                version: PROTOCOL_VERSION,
-            })
-        }
+        Request::Hello => Ok(Response::Hello {
+            version: PROTOCOL_VERSION,
+        }),
         Request::Snapshot { root, ignore } => Ok(Response::Snapshot(snapshot(&root, &ignore)?)),
         Request::ReadFile { root, rel } => Ok(Response::File {
             data: fs::read(safe_join(&root, &rel)?)?,
