@@ -1,5 +1,6 @@
 use crate::cli::{
-    InitArgs, MountArgs, PullArgs, PushArgs, RunArgs, ServeArgs, StartArgs, SyncArgs, WatchArgs,
+    GitArgs, InitArgs, MountArgs, PullArgs, PushArgs, RunArgs, ServeArgs, StartArgs, SyncArgs,
+    WatchArgs,
 };
 use crate::config::{
     AppConfig, DEFAULT_CONNECT_RETRIES, DEFAULT_OP_RETRIES, LocalConfig, RemoteConfig, STATE_DIR,
@@ -209,11 +210,25 @@ pub fn status() -> Result<()> {
 }
 
 pub fn run(args: RunArgs) -> Result<()> {
+    run_remote(args.command, !args.no_sync)
+}
+
+pub fn git(args: GitArgs) -> Result<()> {
+    let mut command = Vec::with_capacity(args.args.len() + 1);
+    command.push("git".to_string());
+    command.extend(args.args);
+    run_remote(command, !args.no_sync)
+}
+
+fn run_remote(command: Vec<String>, sync_first: bool) -> Result<()> {
+    if sync_first {
+        sync(SyncArgs { delete: false })?;
+    }
     let config = AppConfig::load()?;
     let mut client = StorageClient::connect(config)?;
-    let command = args.command.join(" ");
-    ui::info("run", command);
-    let (code, stdout, stderr) = client.run(args.command)?;
+    let label = command.join(" ");
+    ui::info("run", label);
+    let (code, stdout, stderr) = client.run(command)?;
     print!("{}", String::from_utf8_lossy(&stdout));
     eprint!("{}", String::from_utf8_lossy(&stderr));
     if code.unwrap_or(1) == 0 {

@@ -122,13 +122,18 @@ fn daemon_mount_push_pull_and_run_roundtrip() {
         "new remote"
     );
 
-    let output = mobfs(&local, &["run", "cat", "c.txt"]);
+    fs::write(local.join("local-run.txt"), "synced before run").unwrap();
+    let output = mobfs(&local, &["run", "cat", "local-run.txt"]);
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("new remote"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("synced before run"));
+    assert_eq!(
+        fs::read_to_string(remote.join("local-run.txt")).unwrap(),
+        "synced before run"
+    );
 }
 
 #[test]
@@ -159,6 +164,51 @@ fn daemon_rejects_roots_outside_allowlist() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("not allowed"), "{stderr}");
+}
+
+#[test]
+fn git_command_runs_on_remote_after_syncing() {
+    let temp = TempDir::new().unwrap();
+    let remote = temp.path().join("remote");
+    let local = temp.path().join("local");
+    fs::create_dir_all(&remote).unwrap();
+    let daemon = start_daemon(&remote);
+    let remote_arg = format!("127.0.0.1:{}", remote.display());
+
+    let output = mobfs(
+        temp.path(),
+        &[
+            "mount",
+            &remote_arg,
+            "--local",
+            local.to_str().unwrap(),
+            "--token",
+            TOKEN,
+            "--port",
+            &daemon.port.to_string(),
+            "--no-open",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = mobfs(&local, &["git", "init"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::write(local.join("tracked.txt"), "git sees this").unwrap();
+    let output = mobfs(&local, &["git", "status", "--short"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("tracked.txt"));
 }
 
 #[test]

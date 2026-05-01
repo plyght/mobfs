@@ -34,6 +34,9 @@ pub enum Command {
     #[command(about = "Run a command on the remote in the workspace root  [alias: r]")]
     #[command(visible_alias = "r")]
     Run(RunArgs),
+    #[command(about = "Run git on the remote after syncing local edits  [alias: g]")]
+    #[command(visible_alias = "g")]
+    Git(GitArgs),
     #[command(about = "Watch the local workspace and push changes")]
     Watch(WatchArgs),
     #[command(about = "Run resilient bidirectional sync loop")]
@@ -121,12 +124,26 @@ pub struct SyncArgs {
 
 #[derive(Args)]
 pub struct RunArgs {
+    #[arg(long, help = "Run without syncing local edits first")]
+    pub no_sync: bool,
     #[arg(
         required = true,
         trailing_var_arg = true,
         help = "Command and arguments to run remotely"
     )]
     pub command: Vec<String>,
+}
+
+#[derive(Args)]
+pub struct GitArgs {
+    #[arg(long, help = "Run without syncing local edits first")]
+    pub no_sync: bool,
+    #[arg(
+        required = true,
+        trailing_var_arg = true,
+        help = "Git arguments to run remotely"
+    )]
+    pub args: Vec<String>,
 }
 
 #[derive(Args)]

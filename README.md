@@ -12,8 +12,9 @@ The mosh-inspired filesystem layer for remote development. mobfs gives Finder, e
 - **Visible Local Workspace**: Creates normal directories under `~/MobFS` or a custom path for editors, agents, shells, and desktop tools
 - **Resilient Sync Loop**: Watches local changes, scans remote changes, reconnects after drops, and keeps both sides converged
 - **Remote Authority**: Stores the canonical project tree on a remote machine through `mobfsd`
-- **Remote Compute**: Runs commands such as builds, tests, and git operations on the machine that owns the code
-- **Encrypted Protocol**: Authenticates with a shared token, performs an X25519 handshake, derives session keys with HKDF-SHA256, and encrypts frames with ChaCha20-Poly1305
+- **Remote Compute**: Syncs local edits, then runs commands such as builds, tests, and git operations on the machine that owns the code
+- **Encrypted Protocol**: Authenticates with a shared token, performs an X25519 handshake, derives session keys with HKDF-SHA256, and encrypts chunked file-transfer frames with ChaCha20-Poly1305
+- **Daemon Root Policy**: Restricts mobfsd to explicitly allowed canonical workspace roots with repeatable `--allow-root` flags
 - **Conflict Safety**: Uses a saved snapshot as the sync base and writes conflict copies instead of clobbering divergent edits
 - **Provider Backends**: Supports iCloud and Google Drive folder-backed workspaces through the provider's local sync client
 - **Simple Configuration**: Stores workspace state in `.mobfs.toml` and `.mobfs/` beside the visible local tree
@@ -38,7 +39,7 @@ cargo install --path .
 Run the daemon on the machine that stores the canonical project tree:
 
 ```bash
-MOBFS_TOKEN='change-me' mobfs daemon --bind 0.0.0.0:7727
+MOBFS_TOKEN='change-me' mobfs daemon --bind 0.0.0.0:7727 --allow-root /srv/project
 ```
 
 Create and serve a local workspace from your client machine:
@@ -79,9 +80,10 @@ mobfs push
 mobfs sync
 mobfs status
 
-# Run remote commands from the workspace root
+# Sync local edits, then run remote commands from the workspace root
 mobfs run cargo test
-mobfs run git status
+mobfs run --no-sync cargo test
+mobfs git status
 
 # Watch local changes and push them
 mobfs watch
@@ -93,7 +95,7 @@ mobfs doctor
 mobfs open
 ```
 
-Common aliases are available: `up` for `start`, `get` for `pull`, `put` for `push`, `s` for `sync`, `st` for `status`, `r` for `run`, and `o` for `open`.
+Common aliases are available: `up` for `start`, `get` for `pull`, `put` for `push`, `s` for `sync`, `st` for `status`, `r` for `run`, `g` for `git`, and `o` for `open`.
 
 ## Configuration
 
@@ -124,8 +126,11 @@ Configuration is discovered by walking upward from the current directory until `
 The daemon backend is the primary path for live filesystem work and remote compute:
 
 ```bash
+mobfs daemon --bind 0.0.0.0:7727 --allow-root /absolute/path
 mobfs start host:/absolute/path --name app
 ```
+
+Daemon roots are open when no `--allow-root` is provided, which is useful for quick local tests. For real use, pass one or more `--allow-root` values so clients cannot request arbitrary filesystem roots.
 
 iCloud and Google Drive can be used as folder-backed canonical storage roots. They do not provide remote compute, so `mobfs run` requires the daemon backend.
 
@@ -145,7 +150,7 @@ The config schema also reserves `r2` and `s3` backend names for future object-st
 - `daemon.rs`: Remote daemon, filesystem operations, command execution, and metadata handling
 - `remote.rs`: Client connection, protocol calls, retries, and remote operation wrappers
 - `crypto.rs`: Token-authenticated handshake and encrypted stream framing
-- `protocol.rs`: Versioned request and response messages over the encrypted transport
+- `protocol.rs`: Versioned request and response messages over the encrypted chunked transport
 - `snapshot.rs`: File metadata snapshots, diff planning, status output, and conflict decisions
 - `local.rs`: Local tree scanning, ignore handling, hashing, and snapshot persistence
 - `storage.rs`: Unified storage abstraction for daemon and provider-folder backends
@@ -162,7 +167,7 @@ cargo fmt --check
 cargo clippy --all-targets --all-features
 ```
 
-Requires Rust with edition 2024 support. Key dependencies include clap, notify, serde/toml, walkdir, indicatif, x25519-dalek, hkdf, sha2, and chacha20poly1305.
+Requires Rust with edition 2024 support. Key dependencies include clap, notify, serde/toml, walkdir, indicatif, x25519-dalek, hkdf, sha2, and chacha20poly1305. Integration tests use tempfile.
 
 ## License
 
