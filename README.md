@@ -5,7 +5,7 @@
     <br/>
 </div>
 
-MobFS gives remote workspaces a local, Finder-visible working tree with explicit sync, watch mode, remote command execution, and an optional FUSE mount. It is built for unstable links and mobile workflows where a full SSH session or network filesystem is too brittle, while still keeping file changes inspectable and recoverable.
+MobFS is local mirror-first. The primary product path is a durable local, Finder-visible working tree with explicit sync, watch mode, and remote command execution. The optional FUSE mount is for direct on-demand access and macFUSE validation, not a promise that source code never lands on local disk. True no-local-code FUSE-first mode is out of scope until cache, conflict, credential, and offline semantics are redesigned around that constraint.
 
 ## Features
 
@@ -168,8 +168,13 @@ mobfs daemon --bind 127.0.0.1:7727 --allow-root /srv/projects --token "$MOBFS_TO
 # Check workspace and daemon connectivity
 mobfs doctor
 
-# Benchmark snapshot and transfer performance
+# Benchmark snapshot and transfer performance on the current workspace
 mobfs bench --iterations 5 --mib 64
+
+# Recommended benchmark fixtures:
+# - a Linux-kernel-sized many-file tree
+# - a medium JavaScript app with node_modules ignored
+# - a Rust repo with target ignored
 ```
 
 Useful aliases: `start` as `up`, `pull` as `get`, `push` as `put`, `sync` as `s`, `status` as `st`, `run` as `r`, `git` as `g`, and `open` as `o`.

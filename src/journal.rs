@@ -1,7 +1,8 @@
 use crate::config::{AppConfig, STATE_DIR};
 use crate::error::Result;
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::PathBuf;
 
 const JOURNAL_FILE: &str = "journal.toml";
@@ -41,7 +42,18 @@ pub fn complete(config: &AppConfig, op: &JournalOp) -> Result<()> {
 fn save(config: &AppConfig, journal: &Journal) -> Result<()> {
     let dir = config.local.root.join(STATE_DIR);
     fs::create_dir_all(&dir)?;
-    fs::write(path(config), toml::to_string_pretty(journal)?)?;
+    let path = path(config);
+    let tmp = path.with_extension("toml.tmp");
+    let mut file = File::create(&tmp)?;
+    file.write_all(toml::to_string_pretty(journal)?.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&tmp, &path)?;
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
     Ok(())
 }
 

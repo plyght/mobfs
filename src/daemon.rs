@@ -8,11 +8,12 @@ use sha2::Digest;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 #[cfg(unix)]
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -85,6 +86,7 @@ impl RootPolicy {
 }
 
 fn handle_client(stream: TcpStream, token: &str, policy: &RootPolicy) -> Result<()> {
+    let raw_stream = stream.try_clone()?;
     let mut stream = SecureStream::server(stream, token)?;
     loop {
         let request = match protocol::read_frame::<Request>(&mut stream) {
@@ -94,6 +96,10 @@ fn handle_client(stream: TcpStream, token: &str, policy: &RootPolicy) -> Result<
             }
             Err(error) => return Err(error),
         };
+        if should_drop_request(&request) {
+            let _ = raw_stream.shutdown(Shutdown::Both);
+            return Ok(());
+        }
         if let Request::Run { root, command } = request {
             if let Err(error) = handle_run(root, command, policy, &mut stream) {
                 protocol::write_frame(
@@ -109,6 +115,41 @@ fn handle_client(stream: TcpStream, token: &str, policy: &RootPolicy) -> Result<
             message: error.to_string(),
         });
         protocol::write_frame(&mut stream, &response)?;
+    }
+}
+
+fn should_drop_request(request: &Request) -> bool {
+    static DROPPED: AtomicBool = AtomicBool::new(false);
+    let Ok(target) = std::env::var("MOBFS_TEST_DROP_ONCE") else {
+        return false;
+    };
+    if DROPPED.load(Ordering::SeqCst) || request_label(request) != target {
+        return false;
+    }
+    !DROPPED.swap(true, Ordering::SeqCst)
+}
+
+fn request_label(request: &Request) -> &'static str {
+    match request {
+        Request::Hello => "Hello",
+        Request::Snapshot { .. } => "Snapshot",
+        Request::Stat { .. } => "Stat",
+        Request::ListDir { .. } => "ListDir",
+        Request::ReadFile { .. } => "ReadFile",
+        Request::ReadFileChunk { .. } => "ReadFileChunk",
+        Request::WriteFile { .. } => "WriteFile",
+        Request::WriteFileStart { .. } => "WriteFileStart",
+        Request::WriteFileChunk { .. } => "WriteFileChunk",
+        Request::WriteFileOffset { .. } => "WriteFileOffset",
+        Request::WriteFileAt { .. } => "WriteFileAt",
+        Request::Truncate { .. } => "Truncate",
+        Request::Rename { .. } => "Rename",
+        Request::WriteFileFinish { .. } => "WriteFileFinish",
+        Request::Symlink { .. } => "Symlink",
+        Request::SetMetadata { .. } => "SetMetadata",
+        Request::Mkdir { .. } => "Mkdir",
+        Request::Remove { .. } => "Remove",
+        Request::Run { .. } => "Run",
     }
 }
 

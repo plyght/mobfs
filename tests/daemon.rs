@@ -45,7 +45,15 @@ fn start_daemon(allowed: &Path) -> Daemon {
 }
 
 fn start_daemon_on_port(allowed: &Path, port: u16) -> Daemon {
-    start_daemon_with_args_on_port(&["--allow-root", allowed.to_str().unwrap()], port)
+    start_daemon_with_env_on_port(&["--allow-root", allowed.to_str().unwrap()], &[], port)
+}
+
+fn start_daemon_with_drop_on_port(allowed: &Path, port: u16, request: &str) -> Daemon {
+    start_daemon_with_env_on_port(
+        &["--allow-root", allowed.to_str().unwrap()],
+        &[("MOBFS_TEST_DROP_ONCE", request)],
+        port,
+    )
 }
 
 fn start_daemon_with_args(args: &[&str]) -> Daemon {
@@ -55,7 +63,12 @@ fn start_daemon_with_args(args: &[&str]) -> Daemon {
 }
 
 fn start_daemon_with_args_on_port(args: &[&str], port: u16) -> Daemon {
-    let child = Command::new(bin())
+    start_daemon_with_env_on_port(args, &[], port)
+}
+
+fn start_daemon_with_env_on_port(args: &[&str], envs: &[(&str, &str)], port: u16) -> Daemon {
+    let mut command = Command::new(bin());
+    command
         .arg("daemon")
         .arg("--bind")
         .arg(format!("127.0.0.1:{port}"))
@@ -63,9 +76,11 @@ fn start_daemon_with_args_on_port(args: &[&str], port: u16) -> Daemon {
         .arg(TOKEN)
         .args(args)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::null());
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let child = command.spawn().unwrap();
     wait_for_daemon(port);
     Daemon { child, port }
 }
@@ -430,7 +445,14 @@ fn sync_preserves_symlinks_and_executable_bits() {
 
 #[test]
 fn mountfs_smoke_test_when_enabled() {
-    if std::env::var("MOBFS_RUN_FUSE_TESTS").ok().as_deref() != Some("1") {
+    let explicitly_enabled = std::env::var("MOBFS_RUN_FUSE_TESTS").ok().as_deref() == Some("1");
+    let auto_macos_enabled = cfg!(target_os = "macos")
+        && std::env::var("MOBFS_AUTO_RUN_MACFUSE_TESTS")
+            .ok()
+            .as_deref()
+            == Some("1")
+        && Path::new("/Library/Filesystems/macfuse.fs").exists();
+    if !explicitly_enabled && !auto_macos_enabled {
         return;
     }
     let temp = TempDir::new().unwrap();
@@ -510,6 +532,68 @@ fn mountfs_smoke_test_when_enabled() {
 }
 
 #[test]
+fn mountfs_network_drop_during_rename_recovers() {
+    let explicitly_enabled = std::env::var("MOBFS_RUN_FUSE_TESTS").ok().as_deref() == Some("1");
+    let auto_macos_enabled = cfg!(target_os = "macos")
+        && std::env::var("MOBFS_AUTO_RUN_MACFUSE_TESTS")
+            .ok()
+            .as_deref()
+            == Some("1")
+        && Path::new("/Library/Filesystems/macfuse.fs").exists();
+    if !explicitly_enabled && !auto_macos_enabled {
+        return;
+    }
+    let temp = TempDir::new().unwrap();
+    let remote = temp.path().join("remote");
+    let mountpoint = temp.path().join("mnt");
+    fs::create_dir_all(&remote).unwrap();
+    fs::write(remote.join("before.txt"), "rename me").unwrap();
+    let _guard = port_lock().lock().unwrap();
+    let port = free_port();
+    let daemon = start_daemon_with_drop_on_port(&remote, port, "Rename");
+    let remote_arg = format!("127.0.0.1:{}", remote.display());
+    let mut child = Command::new(bin())
+        .arg("mountfs")
+        .arg(&remote_arg)
+        .arg(&mountpoint)
+        .arg("--token")
+        .arg(TOKEN)
+        .arg("--port")
+        .arg(daemon.port.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !mountpoint.join("before.txt").exists() {
+        thread::sleep(Duration::from_millis(50));
+    }
+    fs::rename(mountpoint.join("before.txt"), mountpoint.join("after.txt")).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !remote.join("after.txt").exists() {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        fs::read_to_string(remote.join("after.txt")).unwrap(),
+        "rename me"
+    );
+    assert!(!remote.join("before.txt").exists());
+    let _ = if cfg!(target_os = "macos") {
+        Command::new("diskutil")
+            .arg("unmount")
+            .arg(&mountpoint)
+            .status()
+    } else {
+        Command::new("fusermount")
+            .arg("-u")
+            .arg(&mountpoint)
+            .status()
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
 fn sync_stops_on_same_path_conflict() {
     let temp = TempDir::new().unwrap();
     let remote = temp.path().join("remote");
@@ -553,6 +637,228 @@ fn sync_stops_on_same_path_conflict() {
         fs::read_to_string(local.join("a.txt.mobfs-conflict-remote")).unwrap(),
         "remote"
     );
+}
+
+#[test]
+fn resilient_sync_conflict_returns_failure() {
+    let temp = TempDir::new().unwrap();
+    let remote = temp.path().join("remote");
+    let local = temp.path().join("local");
+    fs::create_dir_all(&remote).unwrap();
+    fs::write(remote.join("a.txt"), "base").unwrap();
+    let daemon = start_daemon(&remote);
+    let remote_arg = format!("127.0.0.1:{}", remote.display());
+
+    let output = mobfs(
+        temp.path(),
+        &[
+            "mount",
+            &remote_arg,
+            "--local",
+            local.to_str().unwrap(),
+            "--token",
+            TOKEN,
+            "--port",
+            &daemon.port.to_string(),
+            "--no-open",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::write(local.join("a.txt"), "local").unwrap();
+    fs::write(remote.join("a.txt"), "remote").unwrap();
+    let output = mobfs(&local, &["serve", "--remote-interval", "1"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("both sides changed"), "{stderr}");
+}
+
+#[test]
+fn network_drop_during_upload_recovers() {
+    let temp = TempDir::new().unwrap();
+    let remote = temp.path().join("remote");
+    let local = temp.path().join("local");
+    fs::create_dir_all(&remote).unwrap();
+    let _guard = port_lock().lock().unwrap();
+    let port = free_port();
+    let mut daemon = start_daemon_on_port(&remote, port);
+    let remote_arg = format!("127.0.0.1:{}", remote.display());
+    let output = mobfs(
+        temp.path(),
+        &[
+            "mount",
+            &remote_arg,
+            "--local",
+            local.to_str().unwrap(),
+            "--token",
+            TOKEN,
+            "--port",
+            &daemon.port.to_string(),
+            "--no-open",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    daemon.child.kill().unwrap();
+    daemon.child.wait().unwrap();
+    daemon = start_daemon_with_drop_on_port(&remote, port, "WriteFileChunk");
+    let data = vec![b'u'; 2 * 1024 * 1024 + 11];
+    fs::write(local.join("upload.bin"), &data).unwrap();
+    let output = mobfs(&local, &["push"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read(remote.join("upload.bin")).unwrap(), data);
+    drop(daemon);
+}
+
+#[test]
+fn network_drop_during_download_recovers() {
+    let temp = TempDir::new().unwrap();
+    let remote = temp.path().join("remote");
+    let local = temp.path().join("local");
+    fs::create_dir_all(&remote).unwrap();
+    let data = vec![b'd'; 2 * 1024 * 1024 + 13];
+    fs::write(remote.join("download.bin"), &data).unwrap();
+    let _guard = port_lock().lock().unwrap();
+    let port = free_port();
+    let mut daemon = start_daemon_on_port(&remote, port);
+    let remote_arg = format!("127.0.0.1:{}", remote.display());
+    let output = mobfs(
+        temp.path(),
+        &[
+            "mount",
+            &remote_arg,
+            "--local",
+            local.to_str().unwrap(),
+            "--token",
+            TOKEN,
+            "--port",
+            &daemon.port.to_string(),
+            "--no-open",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::remove_file(local.join("download.bin")).unwrap();
+    daemon.child.kill().unwrap();
+    daemon.child.wait().unwrap();
+    daemon = start_daemon_with_drop_on_port(&remote, port, "ReadFileChunk");
+    let output = mobfs(&local, &["pull"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read(local.join("download.bin")).unwrap(), data);
+    drop(daemon);
+}
+
+#[test]
+fn network_drop_during_git_index_write_recovers() {
+    let temp = TempDir::new().unwrap();
+    let remote = temp.path().join("remote");
+    let local = temp.path().join("local");
+    fs::create_dir_all(&remote).unwrap();
+    let _guard = port_lock().lock().unwrap();
+    let port = free_port();
+    let mut daemon = start_daemon_on_port(&remote, port);
+    let remote_arg = format!("127.0.0.1:{}", remote.display());
+    let output = mobfs(
+        temp.path(),
+        &[
+            "mount",
+            &remote_arg,
+            "--local",
+            local.to_str().unwrap(),
+            "--token",
+            TOKEN,
+            "--port",
+            &daemon.port.to_string(),
+            "--no-open",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = mobfs(&local, &["git", "init"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    daemon.child.kill().unwrap();
+    daemon.child.wait().unwrap();
+    daemon = start_daemon_with_drop_on_port(&remote, port, "WriteFileChunk");
+    fs::write(local.join("tracked.txt"), "git sees this after reconnect").unwrap();
+    let output = mobfs(&local, &["git", "status", "--short"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("tracked.txt"));
+    drop(daemon);
+}
+
+#[test]
+fn network_drop_during_agent_style_temp_file_write_recovers() {
+    let temp = TempDir::new().unwrap();
+    let remote = temp.path().join("remote");
+    let local = temp.path().join("local");
+    fs::create_dir_all(&remote).unwrap();
+    let _guard = port_lock().lock().unwrap();
+    let port = free_port();
+    let mut daemon = start_daemon_on_port(&remote, port);
+    let remote_arg = format!("127.0.0.1:{}", remote.display());
+    let output = mobfs(
+        temp.path(),
+        &[
+            "mount",
+            &remote_arg,
+            "--local",
+            local.to_str().unwrap(),
+            "--token",
+            TOKEN,
+            "--port",
+            &daemon.port.to_string(),
+            "--no-open",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    daemon.child.kill().unwrap();
+    daemon.child.wait().unwrap();
+    daemon = start_daemon_with_drop_on_port(&remote, port, "WriteFileChunk");
+    let temp_path = local.join(".agent-output.tmp");
+    let final_path = local.join("agent-output.txt");
+    fs::write(&temp_path, "agent generated draft").unwrap();
+    fs::rename(&temp_path, &final_path).unwrap();
+    let output = mobfs(&local, &["run", "cat", "agent-output.txt"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("agent generated draft"));
+    drop(daemon);
 }
 
 #[test]

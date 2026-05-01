@@ -12,7 +12,7 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Child, Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const TRANSFER_CHUNK_SIZE: usize = 1024 * 1024;
 
@@ -487,7 +487,7 @@ fn start_ssh_tunnel(host: &str, remote_port: u16) -> Result<(String, u16, Option
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let local_port = listener.local_addr()?.port();
     drop(listener);
-    let child = Command::new("ssh")
+    let mut child = Command::new("ssh")
         .arg("-N")
         .arg("-L")
         .arg(format!("127.0.0.1:{local_port}:127.0.0.1:{remote_port}"))
@@ -496,8 +496,27 @@ fn start_ssh_tunnel(host: &str, remote_port: u16) -> Result<(String, u16, Option
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
-    thread::sleep(Duration::from_millis(150));
-    Ok(("127.0.0.1".to_string(), local_port, Some(child)))
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match child.try_wait()? {
+            Some(status) => {
+                return Err(MobfsError::Remote(format!(
+                    "ssh tunnel exited before local port was reachable: {status}"
+                )));
+            }
+            None => match TcpStream::connect(("127.0.0.1", local_port)) {
+                Ok(_) => return Ok(("127.0.0.1".to_string(), local_port, Some(child))),
+                Err(error) if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(MobfsError::Remote(format!(
+                        "ssh tunnel local port 127.0.0.1:{local_port} was not reachable: {error}"
+                    )));
+                }
+                Err(_) => thread::sleep(Duration::from_millis(25)),
+            },
+        }
+    }
 }
 
 fn mode(metadata: &fs::Metadata) -> u32 {

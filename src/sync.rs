@@ -50,17 +50,26 @@ pub fn start(args: StartArgs) -> Result<()> {
 pub fn mountfs(args: MountFsArgs) -> Result<()> {
     #[cfg(feature = "fuse")]
     {
-        let config = match args.remote {
+        let (remote, mountpoint) = match args.paths.as_slice() {
+            [mountpoint] => (None, std::path::PathBuf::from(mountpoint)),
+            [remote, mountpoint] => (Some(remote.clone()), std::path::PathBuf::from(mountpoint)),
+            _ => {
+                return Err(MobfsError::Config(
+                    "usage: mobfs mountfs [remote] <mountpoint>".to_string(),
+                ));
+            }
+        };
+        let config = match remote {
             Some(remote) => crate::mountfs::config_from_remote(
                 remote,
-                &args.mountpoint,
+                &mountpoint,
                 args.port,
                 args.token,
                 args.ssh_tunnel,
             )?,
             None => AppConfig::load()?,
         };
-        crate::mountfs::mount(config, args.mountpoint)
+        crate::mountfs::mount(config, mountpoint)
     }
     #[cfg(not(feature = "fuse"))]
     {
@@ -516,7 +525,9 @@ fn resilient_sync_once(config: &AppConfig, delete: bool) -> Result<()> {
                 ui::change("conflict", path);
             }
         }
-        return Ok(());
+        return Err(MobfsError::Remote(
+            "resilient sync stopped because both sides changed the same path; local and remote conflict copies were written next to conflicted files".to_string(),
+        ));
     }
     apply_plan(&mut client, config, &remote, &plan)?;
     let remote = client.snapshot()?;

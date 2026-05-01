@@ -8,8 +8,10 @@ use fuser::{
     TimeOrNow,
 };
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -76,6 +78,7 @@ struct MobfsFuse {
     path_to_ino: Mutex<BTreeMap<String, u64>>,
     ino_to_path: Mutex<BTreeMap<u64, String>>,
     read_cache: Mutex<BTreeMap<(String, u64, u32), Vec<u8>>>,
+    handle_to_path: Mutex<BTreeMap<u64, String>>,
     journal: PathBuf,
 }
 
@@ -109,7 +112,7 @@ enum JournalOp {
 
 impl MobfsFuse {
     fn new(config: AppConfig) -> Result<Self> {
-        let journal = config.local.root.join(".mobfs-mountfs-journal.jsonl");
+        let journal = mountfs_journal_path(&config);
         let mut client = RemoteClient::connect(config)?;
         replay_journal(&journal, &mut client)?;
         let snapshot = client.snapshot()?;
@@ -128,6 +131,7 @@ impl MobfsFuse {
             path_to_ino: Mutex::new(path_to_ino),
             ino_to_path: Mutex::new(ino_to_path),
             read_cache: Mutex::new(BTreeMap::new()),
+            handle_to_path: Mutex::new(BTreeMap::new()),
             journal,
         })
     }
@@ -198,6 +202,16 @@ impl MobfsFuse {
             .unwrap()
             .get(&u64::from(ino))
             .cloned()
+    }
+
+    fn path_for_handle(&self, ino: INodeNo, fh: fuser::FileHandle) -> Option<String> {
+        self.path_for(ino).or_else(|| {
+            self.handle_to_path
+                .lock()
+                .unwrap()
+                .get(&u64::from(fh))
+                .cloned()
+        })
     }
 
     fn attr_for(&self, path: &str, meta: Option<&EntryMeta>) -> FileAttr {
@@ -345,7 +359,11 @@ impl Filesystem for MobfsFuse {
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, _flags: fuser::OpenFlags, reply: ReplyOpen) {
-        if self.path_for(ino).is_some() {
+        if let Some(path) = self.path_for(ino) {
+            self.handle_to_path
+                .lock()
+                .unwrap()
+                .insert(u64::from(ino), path);
             reply.opened(fuser::FileHandle(u64::from(ino)), FopenFlags::empty());
         } else {
             reply.error(Errno::ENOENT);
@@ -423,7 +441,7 @@ impl Filesystem for MobfsFuse {
         &self,
         _req: &Request,
         ino: INodeNo,
-        _fh: fuser::FileHandle,
+        fh: fuser::FileHandle,
         offset: u64,
         data: &[u8],
         _write_flags: fuser::WriteFlags,
@@ -431,19 +449,20 @@ impl Filesystem for MobfsFuse {
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyWrite,
     ) {
-        let path = match self.path_for(ino) {
+        let path = match self.path_for_handle(ino, fh) {
             Some(path) if !path.is_empty() => path,
             _ => {
                 reply.error(Errno::ENOENT);
                 return;
             }
         };
-        match self
-            .client
-            .lock()
-            .unwrap()
-            .write_file_at(&path, offset, data.to_vec())
-        {
+        let write_result = {
+            self.client
+                .lock()
+                .unwrap()
+                .write_file_at(&path, offset, data.to_vec())
+        };
+        match write_result {
             Ok(()) => {
                 self.invalidate_path_cache(&path);
                 match self.refresh_or_eio() {
@@ -459,11 +478,11 @@ impl Filesystem for MobfsFuse {
         &self,
         _req: &Request,
         ino: INodeNo,
-        _fh: fuser::FileHandle,
+        fh: fuser::FileHandle,
         _lock_owner: fuser::LockOwner,
         reply: ReplyEmpty,
     ) {
-        if self.path_for(ino).is_some() {
+        if self.path_for_handle(ino, fh).is_some() {
             reply.ok();
         } else {
             reply.error(Errno::ENOENT);
@@ -474,11 +493,11 @@ impl Filesystem for MobfsFuse {
         &self,
         _req: &Request,
         ino: INodeNo,
-        _fh: fuser::FileHandle,
+        fh: fuser::FileHandle,
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        if self.path_for(ino).is_some() {
+        if self.path_for_handle(ino, fh).is_some() {
             reply.ok();
         } else {
             reply.error(Errno::ENOENT);
@@ -525,7 +544,8 @@ impl Filesystem for MobfsFuse {
                 reply.error(Errno::EIO);
                 return;
             }
-            if self.client.lock().unwrap().truncate(&path, size).is_err() {
+            let truncate_result = { self.client.lock().unwrap().truncate(&path, size) };
+            if truncate_result.is_err() {
                 reply.error(Errno::EIO);
                 return;
             }
@@ -548,13 +568,20 @@ impl Filesystem for MobfsFuse {
             reply.error(Errno::EIO);
             return;
         }
-        if (mode.is_some() || modified.is_some())
-            && (self
-                .client
-                .lock()
-                .unwrap()
-                .set_metadata(&path, mode, modified)
-                .is_err())
+        let metadata_result = if mode.is_some() || modified.is_some() {
+            Some(
+                self.client
+                    .lock()
+                    .unwrap()
+                    .set_metadata(&path, mode, modified),
+            )
+        } else {
+            None
+        };
+        if metadata_result
+            .as_ref()
+            .map(Result::is_err)
+            .unwrap_or(false)
         {
             reply.error(Errno::EIO);
             return;
@@ -607,14 +634,13 @@ impl Filesystem for MobfsFuse {
             reply.error(Errno::EIO);
             return;
         }
-        if self.client.lock().unwrap().truncate(&path, 0).is_err()
-            || self
-                .client
-                .lock()
-                .unwrap()
-                .set_metadata(&path, Some(mode), None)
-                .is_err()
-        {
+        let create_result = {
+            let mut client = self.client.lock().unwrap();
+            client
+                .truncate(&path, 0)
+                .and_then(|_| client.set_metadata(&path, Some(mode), None))
+        };
+        if create_result.is_err() {
             reply.error(Errno::EIO);
             return;
         }
@@ -625,13 +651,20 @@ impl Filesystem for MobfsFuse {
         }
         let snapshot = self.snapshot.lock().unwrap();
         match snapshot.entries.get(&path) {
-            Some(meta) => reply.created(
-                &TTL,
-                &self.attr_for(&path, Some(meta)),
-                fuser::Generation(0),
-                fuser::FileHandle(inode_for(&path)),
-                FopenFlags::empty(),
-            ),
+            Some(meta) => {
+                let handle = inode_for(&path);
+                self.handle_to_path
+                    .lock()
+                    .unwrap()
+                    .insert(handle, path.clone());
+                reply.created(
+                    &TTL,
+                    &self.attr_for(&path, Some(meta)),
+                    fuser::Generation(0),
+                    fuser::FileHandle(handle),
+                    FopenFlags::empty(),
+                );
+            }
             None => reply.error(Errno::EIO),
         }
     }
@@ -667,14 +700,13 @@ impl Filesystem for MobfsFuse {
             reply.error(Errno::EIO);
             return;
         }
-        if self.client.lock().unwrap().mkdir_p(&path).is_err()
-            || self
-                .client
-                .lock()
-                .unwrap()
-                .set_metadata(&path, Some(mode), None)
-                .is_err()
-        {
+        let mkdir_result = {
+            let mut client = self.client.lock().unwrap();
+            client
+                .mkdir_p(&path)
+                .and_then(|_| client.set_metadata(&path, Some(mode), None))
+        };
+        if mkdir_result.is_err() {
             reply.error(Errno::EIO);
             return;
         }
@@ -727,13 +759,8 @@ impl Filesystem for MobfsFuse {
             reply.error(Errno::EIO);
             return;
         }
-        if self
-            .client
-            .lock()
-            .unwrap()
-            .create_symlink(&path, target)
-            .is_err()
-        {
+        let symlink_result = { self.client.lock().unwrap().create_symlink(&path, target) };
+        if symlink_result.is_err() {
             reply.error(Errno::EIO);
             return;
         }
@@ -805,7 +832,8 @@ impl Filesystem for MobfsFuse {
             reply.error(Errno::EIO);
             return;
         }
-        match self.client.lock().unwrap().rename(&from, &to) {
+        let rename_result = { self.client.lock().unwrap().rename(&from, &to) };
+        match rename_result {
             Ok(()) => {
                 self.invalidate_path_cache(&from);
                 self.invalidate_path_cache(&to);
@@ -854,7 +882,8 @@ impl MobfsFuse {
             reply.error(Errno::EIO);
             return;
         }
-        match self.client.lock().unwrap().remove(&path, &meta) {
+        let remove_result = { self.client.lock().unwrap().remove(&path, &meta) };
+        match remove_result {
             Ok(()) => {
                 self.invalidate_path_cache(&path);
                 match self.clear_record().and_then(|_| self.refresh_or_eio()) {
@@ -867,20 +896,52 @@ impl MobfsFuse {
     }
 }
 
+fn mountfs_journal_path(config: &AppConfig) -> PathBuf {
+    let input = format!(
+        "{}:{}:{}",
+        config.remote.host,
+        config.remote.path,
+        config.local.root.display()
+    );
+    let name = hex::encode(sha2::Sha256::digest(input.as_bytes()));
+    std::env::temp_dir()
+        .join("mobfs")
+        .join("mountfs-journals")
+        .join(format!("{name}.jsonl"))
+}
+
 fn append_journal(path: &Path, op: &JournalOp) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, format!("{}\n", serde_json::to_string(op)?))?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    file.write_all(serde_json::to_string(op)?.as_bytes())?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
     Ok(())
 }
 
 fn clear_journal(path: &Path) -> Result<()> {
+    let parent = path.parent().map(Path::to_path_buf);
     match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
+    if let Some(parent) = parent
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+    Ok(())
 }
 
 fn replay_journal(path: &Path, client: &mut RemoteClient) -> Result<()> {

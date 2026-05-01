@@ -120,10 +120,8 @@ pub struct MountArgs {
 
 #[derive(Args)]
 pub struct MountFsArgs {
-    #[arg(help = "Remote root like host:/absolute/path; omitted inside an existing workspace")]
-    pub remote: Option<String>,
-    #[arg(help = "Local mountpoint path")]
-    pub mountpoint: PathBuf,
+    #[arg(help = "Either <mountpoint> inside a workspace or <remote> <mountpoint>", num_args = 1..=2)]
+    pub paths: Vec<String>,
     #[arg(long, default_value_t = 7727, help = "mobfsd port")]
     pub port: u16,
     #[arg(long, env = "MOBFS_TOKEN", help = "Shared mobfsd token")]
