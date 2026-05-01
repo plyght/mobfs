@@ -42,8 +42,8 @@ cargo build --release --no-default-features
 Start a daemon on the machine that owns the remote workspace:
 
 ```bash
-export MOBFS_TOKEN='shared-secret'
-mobfs daemon --bind 0.0.0.0:7727 --allow-root /srv/projects --token "$MOBFS_TOKEN"
+export MOBFS_TOKEN="$(mobfs token)"
+mobfs daemon --bind 127.0.0.1:7727 --allow-root /srv/projects --token "$MOBFS_TOKEN"
 ```
 
 Mount a remote workspace locally:
@@ -83,6 +83,12 @@ mobfs mountfs example.com:/srv/projects/app /Volumes/app --token "$MOBFS_TOKEN"
 ```
 
 ## Configuration
+
+For a setup template, run:
+
+```bash
+mobfs setup /srv/projects
+```
 
 MobFS stores workspace configuration in `.mobfs.toml`:
 
@@ -150,8 +156,14 @@ mobfs git <args...>
 # Watch local edits and push changes
 mobfs watch
 
+# Generate a strong shared token
+mobfs token
+
+# Print setup commands
+mobfs setup /srv/projects
+
 # Run the remote daemon
-mobfs daemon --bind 0.0.0.0:7727 --allow-root /srv/projects --token "$MOBFS_TOKEN"
+mobfs daemon --bind 127.0.0.1:7727 --allow-root /srv/projects --token "$MOBFS_TOKEN"
 
 # Check workspace and daemon connectivity
 mobfs doctor

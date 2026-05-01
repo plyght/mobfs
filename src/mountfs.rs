@@ -46,7 +46,11 @@ pub fn config_from_remote(
             port,
             identity: None,
             ssh_tunnel,
-            token: token.or_else(|| std::env::var("MOBFS_TOKEN").ok()),
+            token: Some(
+                token
+                    .or_else(|| std::env::var("MOBFS_TOKEN").ok())
+                    .unwrap_or_else(crate::config::generate_token),
+            ),
         },
         local: LocalConfig {
             root: mountpoint.to_path_buf(),
@@ -57,6 +61,8 @@ pub fn config_from_remote(
                 "target".to_string(),
                 "node_modules".to_string(),
                 ".mobfs.toml".to_string(),
+                ".DS_Store".to_string(),
+                ".mobfs-mountfs-journal.jsonl".to_string(),
             ],
             connect_retries: crate::config::DEFAULT_CONNECT_RETRIES,
             operation_retries: crate::config::DEFAULT_OP_RETRIES,

@@ -133,7 +133,7 @@ pub enum Response {
     },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RunStream {
     Stdout,
     Stderr,

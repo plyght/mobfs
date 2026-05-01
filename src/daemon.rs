@@ -13,7 +13,9 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 use walkdir::WalkDir;
 
 pub fn serve(
@@ -353,55 +355,79 @@ fn handle_run(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    let mut stdout = child
+    let stdout = child
         .stdout
         .take()
         .ok_or_else(|| MobfsError::Remote("failed to capture stdout".to_string()))?;
-    let mut stderr = child
+    let stderr = child
         .stderr
         .take()
         .ok_or_else(|| MobfsError::Remote("failed to capture stderr".to_string()))?;
-    let stdout_handle = thread::spawn(move || read_all(&mut stdout));
-    let stderr_handle = thread::spawn(move || read_all(&mut stderr));
-    let status = child.wait()?;
-    let stdout = stdout_handle
-        .join()
-        .map_err(|_| MobfsError::Remote("stdout reader panicked".to_string()))??;
-    let stderr = stderr_handle
-        .join()
-        .map_err(|_| MobfsError::Remote("stderr reader panicked".to_string()))??;
-    if !stdout.is_empty() {
-        protocol::write_frame(
-            stream,
-            &Response::RunOutput {
-                stream: RunStream::Stdout,
-                data: stdout.clone(),
-            },
-        )?;
-    }
-    if !stderr.is_empty() {
-        protocol::write_frame(
-            stream,
-            &Response::RunOutput {
-                stream: RunStream::Stderr,
-                data: stderr.clone(),
-            },
-        )?;
-    }
+    let (tx, rx) = mpsc::channel();
+    spawn_output_reader(stdout, RunStream::Stdout, tx.clone());
+    spawn_output_reader(stderr, RunStream::Stderr, tx);
+    let mut all_stdout = Vec::new();
+    let mut all_stderr = Vec::new();
+    let status = loop {
+        while let Ok((run_stream, data)) = rx.try_recv() {
+            match run_stream {
+                RunStream::Stdout => all_stdout.extend_from_slice(&data),
+                RunStream::Stderr => all_stderr.extend_from_slice(&data),
+            }
+            protocol::write_frame(
+                stream,
+                &Response::RunOutput {
+                    stream: run_stream,
+                    data,
+                },
+            )?;
+        }
+        if let Some(status) = child.try_wait()? {
+            while let Ok((run_stream, data)) = rx.recv_timeout(Duration::from_millis(10)) {
+                match run_stream {
+                    RunStream::Stdout => all_stdout.extend_from_slice(&data),
+                    RunStream::Stderr => all_stderr.extend_from_slice(&data),
+                }
+                protocol::write_frame(
+                    stream,
+                    &Response::RunOutput {
+                        stream: run_stream,
+                        data,
+                    },
+                )?;
+            }
+            break status;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
     protocol::write_frame(
         stream,
         &Response::RunResult {
             code: status.code(),
-            stdout,
-            stderr,
+            stdout: all_stdout,
+            stderr: all_stderr,
         },
     )
 }
 
-fn read_all(reader: &mut impl Read) -> Result<Vec<u8>> {
-    let mut data = Vec::new();
-    reader.read_to_end(&mut data)?;
-    Ok(data)
+fn spawn_output_reader(
+    mut reader: impl Read + Send + 'static,
+    stream: RunStream,
+    tx: mpsc::Sender<(RunStream, Vec<u8>)>,
+) {
+    thread::spawn(move || {
+        let mut buffer = [0_u8; 16 * 1024];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    if tx.send((stream.clone(), buffer[..read].to_vec())).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
 }
 
 fn snapshot(root: &Path, ignore: &[String]) -> Result<Snapshot> {

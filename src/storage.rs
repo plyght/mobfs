@@ -7,7 +7,7 @@ use crate::snapshot::{EntryKind, EntryMeta, Snapshot};
 use sha2::Digest;
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -243,8 +243,17 @@ fn copy_file_atomic(src: &Path, dst: &Path) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     let temp = atomic_temp_path(dst);
-    let data = fs::read(src)?;
-    fs::File::create(&temp)?.write_all(&data)?;
+    let mut input = fs::File::open(src)?;
+    let mut output = fs::File::create(&temp)?;
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        output.write_all(&buffer[..read])?;
+    }
+    drop(output);
     fs::rename(temp, dst)?;
     Ok(())
 }

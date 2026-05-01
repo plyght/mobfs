@@ -34,12 +34,16 @@ fn main() -> Result<()> {
         Command::Watch(args) => sync::watch(args),
         Command::Serve(args) => sync::serve(args),
         Command::Open => sync::open(),
-        Command::Daemon(args) => daemon::serve(
-            &args.bind,
-            &args.token,
-            args.allow_roots,
-            args.allow_any_root,
-        ),
+        Command::Daemon(args) => {
+            let token = args.token.ok_or_else(|| {
+                error::MobfsError::Config(
+                    "daemon token missing; pass --token or set MOBFS_TOKEN".to_string(),
+                )
+            })?;
+            daemon::serve(&args.bind, &token, args.allow_roots, args.allow_any_root)
+        }
+        Command::Token => sync::token(),
+        Command::Setup(args) => sync::setup(args),
         Command::Doctor => sync::doctor(),
         Command::Bench(args) => sync::bench(args),
     }

@@ -1,6 +1,6 @@
 use crate::cli::{
     BenchArgs, GitArgs, InitArgs, MountArgs, MountFsArgs, PullArgs, PushArgs, RunArgs, ServeArgs,
-    StartArgs, SyncArgs, WatchArgs,
+    SetupArgs, StartArgs, SyncArgs, WatchArgs,
 };
 use crate::config::{
     AppConfig, DEFAULT_CONNECT_RETRIES, DEFAULT_OP_RETRIES, LocalConfig, RemoteConfig, STATE_DIR,
@@ -112,7 +112,11 @@ fn new_config(
             port,
             identity: None,
             ssh_tunnel,
-            token: token.or_else(|| std::env::var("MOBFS_TOKEN").ok()),
+            token: Some(
+                token
+                    .or_else(|| std::env::var("MOBFS_TOKEN").ok())
+                    .unwrap_or_else(crate::config::generate_token),
+            ),
         },
         local: LocalConfig { root },
         sync: SyncConfig {
@@ -121,6 +125,8 @@ fn new_config(
                 "target".to_string(),
                 "node_modules".to_string(),
                 ".mobfs.toml".to_string(),
+                ".DS_Store".to_string(),
+                ".mobfs-mountfs-journal.jsonl".to_string(),
             ],
             connect_retries: DEFAULT_CONNECT_RETRIES,
             operation_retries: DEFAULT_OP_RETRIES,
@@ -279,6 +285,26 @@ fn run_remote(command: Vec<String>, sync_first: bool) -> Result<()> {
                 .unwrap_or_else(|| "signal".to_string())
         )))
     }
+}
+
+pub fn token() -> Result<()> {
+    println!("{}", crate::config::generate_token());
+    Ok(())
+}
+
+pub fn setup(args: SetupArgs) -> Result<()> {
+    let token = args.token.unwrap_or_else(crate::config::generate_token);
+    println!("export MOBFS_TOKEN='{token}'");
+    println!(
+        "mobfs daemon --bind 127.0.0.1:{} --allow-root '{}' --token \"$MOBFS_TOKEN\"",
+        args.port,
+        args.remote_root.display()
+    );
+    println!(
+        "mobfs start host:{} --ssh-tunnel --token \"$MOBFS_TOKEN\"",
+        args.remote_root.display()
+    );
+    Ok(())
 }
 
 pub fn bench(args: BenchArgs) -> Result<()> {

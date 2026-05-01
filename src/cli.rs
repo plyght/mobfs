@@ -48,6 +48,10 @@ pub enum Command {
     Open,
     #[command(about = "Run mobfs remote daemon")]
     Daemon(DaemonArgs),
+    #[command(about = "Generate a strong mobfs daemon token")]
+    Token,
+    #[command(about = "Print remote daemon setup commands")]
+    Setup(SetupArgs),
     #[command(about = "Check workspace and daemon connectivity")]
     Doctor,
     #[command(about = "Benchmark snapshot and daemon transfer performance")]
@@ -194,10 +198,10 @@ pub struct BenchArgs {
 
 #[derive(Args)]
 pub struct DaemonArgs {
-    #[arg(long, default_value = "0.0.0.0:7727", help = "Address to listen on")]
+    #[arg(long, default_value = "127.0.0.1:7727", help = "Address to listen on")]
     pub bind: String,
     #[arg(long, env = "MOBFS_TOKEN", help = "Shared client token")]
-    pub token: String,
+    pub token: Option<String>,
     #[arg(
         long = "allow-root",
         help = "Allowed canonical workspace root or parent; repeatable"
@@ -208,6 +212,16 @@ pub struct DaemonArgs {
         help = "Allow clients to request any root the daemon process can access"
     )]
     pub allow_any_root: bool,
+}
+
+#[derive(Args)]
+pub struct SetupArgs {
+    #[arg(help = "Remote workspace root to allow")]
+    pub remote_root: PathBuf,
+    #[arg(long, default_value_t = 7727, help = "mobfsd port")]
+    pub port: u16,
+    #[arg(long, env = "MOBFS_TOKEN", help = "Shared mobfsd token")]
+    pub token: Option<String>,
 }
 
 #[derive(Args)]

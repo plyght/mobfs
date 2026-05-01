@@ -261,11 +261,7 @@ impl RemoteClient {
             })?;
             return Ok(());
         }
-        let upload_id = format!(
-            "{}-{}",
-            std::process::id(),
-            hex::encode(sha2::Sha256::digest(rel.as_bytes()))
-        );
+        let upload_id = upload_id_for(&rel, &metadata);
         let journal_op = crate::journal::JournalOp::Upload {
             rel: rel.clone(),
             upload_id: upload_id.clone(),
@@ -514,6 +510,17 @@ fn mode(metadata: &fs::Metadata) -> u32 {
         let _ = metadata;
         0
     }
+}
+
+fn upload_id_for(rel: &str, metadata: &fs::Metadata) -> String {
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let input = format!("{rel}:{}:{modified}", metadata.len());
+    hex::encode(sha2::Sha256::digest(input.as_bytes()))
 }
 
 fn atomic_temp_path(path: &std::path::Path) -> std::path::PathBuf {

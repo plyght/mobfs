@@ -1,4 +1,5 @@
 use crate::error::{MobfsError, Result};
+use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -8,7 +9,7 @@ pub const STATE_DIR: &str = ".mobfs";
 pub const SNAPSHOT_FILE: &str = "snapshot.toml";
 pub const TOKEN_FILE: &str = "token";
 pub const DEFAULT_CONNECT_RETRIES: u32 = 8;
-pub const DEFAULT_OP_RETRIES: u32 = 5;
+pub const DEFAULT_OP_RETRIES: u32 = 12;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -109,6 +110,12 @@ pub fn save_workspace_token(root: &std::path::Path, token: &str) -> Result<()> {
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     }
     Ok(())
+}
+
+pub fn generate_token() -> String {
+    let mut bytes = [0_u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
 }
 
 pub fn parse_remote(input: &str) -> Result<RemoteTarget> {
