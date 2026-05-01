@@ -14,6 +14,9 @@ pub struct Cli {
 pub enum Command {
     #[command(about = "Create a mobfs workspace")]
     Init(InitArgs),
+    #[command(about = "Mount if needed, then run the resilient sync loop  [alias: up]")]
+    #[command(visible_alias = "up")]
+    Start(StartArgs),
     #[command(about = "Create/open a visible local workspace backed by mobfsd")]
     Mount(MountArgs),
     #[command(about = "Pull remote files into the local workspace  [alias: get]")]
@@ -52,8 +55,34 @@ pub struct InitArgs {
     pub local: Option<PathBuf>,
     #[arg(long, default_value_t = 7727, help = "mobfsd port")]
     pub port: u16,
-    #[arg(long, help = "Shared mobfsd token")]
+    #[arg(long, env = "MOBFS_TOKEN", help = "Shared mobfsd token")]
     pub token: Option<String>,
+}
+
+#[derive(Args)]
+pub struct StartArgs {
+    #[arg(help = "Remote root like host:/absolute/path; omitted inside an existing workspace")]
+    pub remote: Option<String>,
+    #[arg(long, help = "Workspace name under ~/MobFS")]
+    pub name: Option<String>,
+    #[arg(long, help = "Local visible workspace root")]
+    pub local: Option<PathBuf>,
+    #[arg(long, default_value_t = 7727, help = "mobfsd port")]
+    pub port: u16,
+    #[arg(long, env = "MOBFS_TOKEN", help = "Shared mobfsd token")]
+    pub token: Option<String>,
+    #[arg(
+        long,
+        default_value_t = 500,
+        help = "Local change debounce in milliseconds"
+    )]
+    pub debounce_ms: u64,
+    #[arg(long, default_value_t = 2, help = "Remote scan interval in seconds")]
+    pub remote_interval: u64,
+    #[arg(long, help = "Propagate deletions on the side that did not change")]
+    pub delete: bool,
+    #[arg(long, help = "Do not open Finder after mounting")]
+    pub no_open: bool,
 }
 
 #[derive(Args)]
@@ -66,7 +95,7 @@ pub struct MountArgs {
     pub local: Option<PathBuf>,
     #[arg(long, default_value_t = 7727, help = "mobfsd port")]
     pub port: u16,
-    #[arg(long, help = "Shared mobfsd token")]
+    #[arg(long, env = "MOBFS_TOKEN", help = "Shared mobfsd token")]
     pub token: Option<String>,
     #[arg(long, help = "Do not open Finder after mounting")]
     pub no_open: bool,

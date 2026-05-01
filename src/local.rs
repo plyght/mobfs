@@ -123,6 +123,7 @@ mod tests {
     fn config() -> AppConfig {
         AppConfig {
             remote: RemoteConfig {
+                backend: crate::config::StorageBackend::Daemon,
                 host: "h".to_string(),
                 user: "u".to_string(),
                 path: "/r".to_string(),

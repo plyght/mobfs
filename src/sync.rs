@@ -1,5 +1,5 @@
 use crate::cli::{
-    InitArgs, MountArgs, PullArgs, PushArgs, RunArgs, ServeArgs, SyncArgs, WatchArgs,
+    InitArgs, MountArgs, PullArgs, PushArgs, RunArgs, ServeArgs, StartArgs, SyncArgs, WatchArgs,
 };
 use crate::config::{
     AppConfig, DEFAULT_CONNECT_RETRIES, DEFAULT_OP_RETRIES, LocalConfig, RemoteConfig, STATE_DIR,
@@ -7,10 +7,10 @@ use crate::config::{
 };
 use crate::error::{MobfsError, Result};
 use crate::local;
-use crate::remote::RemoteClient;
 use crate::snapshot::{
     EntryKind, PlanItem, Snapshot, StatusItem, pull_items, push_items, status_plan, sync_items,
 };
+use crate::storage::StorageClient;
 use crate::ui;
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::fs;
@@ -27,6 +27,24 @@ pub fn init(args: InitArgs) -> Result<()> {
     Ok(())
 }
 
+pub fn start(args: StartArgs) -> Result<()> {
+    if let Some(remote) = args.remote {
+        mount(MountArgs {
+            remote,
+            name: args.name,
+            local: args.local,
+            port: args.port,
+            token: args.token,
+            no_open: args.no_open,
+        })?;
+    }
+    serve(ServeArgs {
+        debounce_ms: args.debounce_ms,
+        remote_interval: args.remote_interval,
+        delete: args.delete,
+    })
+}
+
 pub fn mount(args: MountArgs) -> Result<()> {
     let target = parse_remote(&args.remote)?;
     let root = match args.local {
@@ -37,7 +55,7 @@ pub fn mount(args: MountArgs) -> Result<()> {
     write_config(&config)?;
     ui::added("mounted", root.display().to_string());
     let spinner = ui::spinner("initial pull");
-    let mut client = RemoteClient::connect(config.clone())?;
+    let mut client = StorageClient::connect(config.clone())?;
     let remote = client.snapshot()?;
     let local_snapshot = local::snapshot(&config)?;
     let plan = pull_items(&local_snapshot, &remote, false);
@@ -59,12 +77,13 @@ fn new_config(
 ) -> AppConfig {
     AppConfig {
         remote: RemoteConfig {
+            backend: target.backend,
             host: target.host,
             user: String::new(),
             path: target.path,
             port,
             identity: None,
-            token,
+            token: token.or_else(|| std::env::var("MOBFS_TOKEN").ok()),
         },
         local: LocalConfig { root },
         sync: SyncConfig {
@@ -94,7 +113,7 @@ fn write_config(config: &AppConfig) -> Result<()> {
 pub fn pull(args: PullArgs) -> Result<()> {
     let config = AppConfig::load()?;
     let spinner = ui::spinner("connecting");
-    let mut client = RemoteClient::connect(config.clone())?;
+    let mut client = StorageClient::connect(config.clone())?;
     spinner.set_message("scanning remote");
     let remote = client.snapshot()?;
     let local_snapshot = local::snapshot(&config)?;
@@ -117,9 +136,9 @@ pub fn push(args: PushArgs) -> Result<()> {
     let spinner = ui::spinner("scanning local");
     let local_snapshot = local::snapshot(&config)?;
     spinner.set_message("connecting");
-    let mut client = RemoteClient::connect(config.clone())?;
+    let mut client = StorageClient::connect(config.clone())?;
     spinner.set_message("pushing changes");
-    let count = push_plan(&mut client, &config, &local_snapshot, args.delete)?;
+    let count = push_plan(&mut client, &local_snapshot, args.delete)?;
     let remote = client.snapshot()?;
     local::save_snapshot(&config, &remote)?;
     spinner.finish_and_clear();
@@ -136,7 +155,7 @@ pub fn sync(args: SyncArgs) -> Result<()> {
     let spinner = ui::spinner("scanning local and remote");
     let base = local::load_snapshot(&config)?;
     let local_snapshot = local::snapshot(&config)?;
-    let mut client = RemoteClient::connect(config.clone())?;
+    let mut client = StorageClient::connect(config.clone())?;
     let remote = client.snapshot()?;
     spinner.finish_and_clear();
     let plan = sync_items(&base, &local_snapshot, &remote, args.delete);
@@ -169,7 +188,7 @@ pub fn status() -> Result<()> {
     let config = AppConfig::load()?;
     let spinner = ui::spinner("scanning local and remote");
     let local_snapshot = local::snapshot(&config)?;
-    let mut client = RemoteClient::connect(config)?;
+    let mut client = StorageClient::connect(config)?;
     let remote = client.snapshot()?;
     spinner.finish_and_clear();
     let items = status_plan(&local_snapshot, &remote);
@@ -191,7 +210,7 @@ pub fn status() -> Result<()> {
 
 pub fn run(args: RunArgs) -> Result<()> {
     let config = AppConfig::load()?;
-    let mut client = RemoteClient::connect(config)?;
+    let mut client = StorageClient::connect(config)?;
     let command = args.command.join(" ");
     ui::info("run", command);
     let (code, stdout, stderr) = client.run(args.command)?;
@@ -215,11 +234,21 @@ pub fn doctor() -> Result<()> {
         "remote",
         format!("{}:{}", config.remote.host, config.remote.path),
     );
+    ui::info(
+        "backend",
+        crate::storage::backend_label(&config.remote.backend),
+    );
     let spinner = ui::spinner("checking daemon");
-    let mut client = RemoteClient::connect(config.clone())?;
+    let mut client = StorageClient::connect(config.clone())?;
     spinner.set_message("scanning remote");
     let _ = client.snapshot()?;
     spinner.finish_and_clear();
+    let backends = crate::storage::supported_backends()
+        .iter()
+        .map(crate::storage::backend_label)
+        .collect::<Vec<_>>()
+        .join(", ");
+    ui::info("storage", backends);
     ui::ok("workspace ready");
     Ok(())
 }
@@ -300,8 +329,8 @@ fn watch_push_loop(debounce_ms: u64, delete: bool) -> Result<()> {
                     .unwrap_or(false)
                 {
                     let local_snapshot = local::snapshot(&config)?;
-                    let mut client = RemoteClient::connect(config.clone())?;
-                    push_plan(&mut client, &config, &local_snapshot, delete)?;
+                    let mut client = StorageClient::connect(config.clone())?;
+                    push_plan(&mut client, &local_snapshot, delete)?;
                     let remote = client.snapshot()?;
                     local::save_snapshot(&config, &remote)?;
                     last_change = None;
@@ -317,7 +346,7 @@ fn watch_push_loop(debounce_ms: u64, delete: bool) -> Result<()> {
 fn resilient_sync_once(config: &AppConfig, delete: bool) -> Result<()> {
     let base = local::load_snapshot(config)?;
     let local_snapshot = local::snapshot(config)?;
-    let mut client = RemoteClient::connect(config.clone())?;
+    let mut client = StorageClient::connect(config.clone())?;
     let remote = client.snapshot()?;
     let plan = sync_items(&base, &local_snapshot, &remote, delete);
     if plan.is_empty() {
@@ -356,7 +385,7 @@ fn write_conflict_copy(config: &AppConfig, rel: &str) -> Result<()> {
 }
 
 fn apply_plan(
-    client: &mut RemoteClient,
+    client: &mut StorageClient,
     config: &AppConfig,
     remote: &Snapshot,
     plan: &[PlanItem],
@@ -436,14 +465,9 @@ fn remove_local(config: &AppConfig, rel: &str) -> Result<()> {
     Ok(())
 }
 
-fn push_plan(
-    client: &mut RemoteClient,
-    config: &AppConfig,
-    local_snapshot: &Snapshot,
-    delete: bool,
-) -> Result<usize> {
+fn push_plan(client: &mut StorageClient, local_snapshot: &Snapshot, delete: bool) -> Result<usize> {
     let remote = client.snapshot()?;
-    ensure_remote_dirs(client, local_snapshot, config)?;
+    ensure_remote_dirs(client, local_snapshot)?;
     let plan = push_items(local_snapshot, &remote, delete);
     let count = plan.len();
     for item in plan {
@@ -464,14 +488,10 @@ fn push_plan(
     Ok(count)
 }
 
-fn ensure_remote_dirs(
-    client: &mut RemoteClient,
-    local_snapshot: &Snapshot,
-    config: &AppConfig,
-) -> Result<()> {
+fn ensure_remote_dirs(client: &mut StorageClient, local_snapshot: &Snapshot) -> Result<()> {
     for (rel, meta) in &local_snapshot.entries {
         if meta.kind == EntryKind::Dir {
-            client.mkdir_p(&format!("{}/{}", config.remote.path, rel))?;
+            client.mkdir_p(rel)?;
         }
     }
     Ok(())

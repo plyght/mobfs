@@ -1,4 +1,4 @@
-use crate::config::AppConfig;
+use crate::config::{AppConfig, StorageBackend};
 use crate::daemon;
 use crate::error::{MobfsError, Result};
 use crate::protocol::{self, PROTOCOL_VERSION, Request, Response};
@@ -22,6 +22,12 @@ impl RemoteClient {
     }
 
     fn try_connect(config: AppConfig) -> Result<Self> {
+        if config.remote.backend != StorageBackend::Daemon {
+            return Err(MobfsError::Config(format!(
+                "backend {:?} is configured but this command needs a live mobfs daemon",
+                config.remote.backend
+            )));
+        }
         let port = config.remote.port;
         let mut stream = TcpStream::connect((config.remote.host.as_str(), port))?;
         stream.set_read_timeout(Some(Duration::from_secs(30)))?;
@@ -30,7 +36,12 @@ impl RemoteClient {
             .remote
             .token
             .clone()
-            .ok_or_else(|| MobfsError::Config("remote token missing".to_string()))?;
+            .or_else(|| std::env::var("MOBFS_TOKEN").ok())
+            .ok_or_else(|| {
+                MobfsError::Config(
+                    "remote token missing; pass --token or set MOBFS_TOKEN".to_string(),
+                )
+            })?;
         match protocol::send(&mut stream, &Request::Hello { token })? {
             Response::Hello { version } if version == PROTOCOL_VERSION => {
                 Ok(Self { config, stream })
@@ -103,11 +114,11 @@ impl RemoteClient {
         Ok(())
     }
 
-    pub fn mkdir_p(&mut self, abs: &str) -> Result<()> {
+    pub fn mkdir_p(&mut self, path: &str) -> Result<()> {
         let root = self.config.remote.path.clone();
-        let rel = abs
+        let rel = path
             .strip_prefix(&root)
-            .unwrap_or("")
+            .unwrap_or(path)
             .trim_start_matches('/')
             .to_string();
         self.op(|stream, _| {

@@ -30,12 +30,13 @@ cd ~/MobFS/project
 mobfs serve
 ```
 
-`mount` creates `~/MobFS/project`, pulls the remote tree, writes `.mobfs.toml`, and opens Finder on macOS. `serve` keeps both sides reconciled using the mobfs protocol.
+`start` is the frictionless path: it mounts when given a remote, pulls the tree, opens Finder on macOS, then stays online with the resilient sync loop. `mount` only creates `~/MobFS/project`, pulls the remote tree, writes `.mobfs.toml`, and opens Finder. `serve` keeps an existing workspace reconciled using the mobfs protocol.
 
 ## Commands
 
 ```sh
 mobfs daemon --bind 0.0.0.0:7727 --token secret
+MOBFS_TOKEN=secret mobfs start host:/absolute/path --name app
 mobfs mount host:/absolute/path --name app --token secret
 mobfs serve
 mobfs sync
@@ -58,6 +59,23 @@ mobfs run bun test
 ```
 
 This keeps the local Mac as the fast editor/agent workspace while the remote does canonical compute.
+
+## iCloud and Google Drive
+
+mobfs supports provider-synced folder backends for iCloud and Google Drive. These do not run a hosting server; the cloud folder is the canonical storage root and mobfs reconciles it with the visible workspace.
+
+```sh
+mobfs start icloud:///Users/me/Library/Mobile Documents/com~apple~CloudDocs/MobFS/app --name app
+mobfs start gdrive:///Users/me/Library/CloudStorage/GoogleDrive-me@example.com/My Drive/MobFS/app --name app
+```
+
+This supports pull, push, sync, status, watch, serve, conflict detection, and network-drop recovery through the provider's local sync client. `mobfs run` still requires the daemon backend because iCloud and Google Drive have no compute host.
+
+The folder backend filters common provider noise such as `.icloud`, `.tmp.drivedownload`, `.DS_Store`, `.TemporaryItems`, and `.Trashes`.
+
+## Storage direction
+
+The config has an explicit storage backend field. `daemon` is the fast path for live filesystem work and remote compute. `icloud` and `gdrive` work today through provider-synced folders. The accepted backend names are `daemon`, `r2`, `s3`, `icloud`, and `gdrive`, so the config format can grow into object-store APIs without breaking workspaces.
 
 ## Protocol
 

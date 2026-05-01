@@ -18,12 +18,28 @@ pub struct AppConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteConfig {
+    #[serde(default = "default_backend")]
+    pub backend: StorageBackend,
     pub host: String,
     pub user: String,
     pub path: String,
     pub port: u16,
     pub identity: Option<PathBuf>,
     pub token: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum StorageBackend {
+    Daemon,
+    R2,
+    S3,
+    Icloud,
+    Gdrive,
+}
+
+fn default_backend() -> StorageBackend {
+    StorageBackend::Daemon
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +55,7 @@ pub struct SyncConfig {
 }
 
 pub struct RemoteTarget {
+    pub backend: StorageBackend,
     pub host: String,
     pub path: String,
 }
@@ -64,18 +81,55 @@ impl AppConfig {
 }
 
 pub fn parse_remote(input: &str) -> Result<RemoteTarget> {
-    let (host, path) = input
-        .split_once(':')
-        .ok_or_else(|| MobfsError::InvalidRemote("expected host:/absolute/path".to_string()))?;
+    if let Some((scheme, rest)) = input.split_once("://") {
+        let backend = match scheme {
+            "icloud" => StorageBackend::Icloud,
+            "gdrive" | "google-drive" => StorageBackend::Gdrive,
+            "r2" => StorageBackend::R2,
+            "s3" => StorageBackend::S3,
+            "file" => StorageBackend::Icloud,
+            _ => {
+                return Err(MobfsError::InvalidRemote(format!(
+                    "unsupported backend scheme: {scheme}"
+                )));
+            }
+        };
+        let path = if rest.starts_with('/') {
+            rest.to_string()
+        } else {
+            format!("/{rest}")
+        };
+        return Ok(RemoteTarget {
+            backend,
+            host: scheme.to_string(),
+            path: expand_home(&path),
+        });
+    }
+
+    let (host, path) = input.split_once(':').ok_or_else(|| {
+        MobfsError::InvalidRemote(
+            "expected host:/absolute/path or backend:///absolute/path".to_string(),
+        )
+    })?;
     if host.is_empty() || path.is_empty() || !path.starts_with('/') {
         return Err(MobfsError::InvalidRemote(
-            "expected host:/absolute/path".to_string(),
+            "expected host:/absolute/path or backend:///absolute/path".to_string(),
         ));
     }
     Ok(RemoteTarget {
+        backend: StorageBackend::Daemon,
         host: host.to_string(),
         path: path.trim_end_matches('/').to_string(),
     })
+}
+
+fn expand_home(path: &str) -> String {
+    if path == "/~" || path.starts_with("/~/") {
+        if let Some(home) = dirs::home_dir() {
+            return format!("{}{}", home.display(), &path[2..]);
+        }
+    }
+    path.trim_end_matches('/').to_string()
 }
 
 fn find_config_path() -> Result<PathBuf> {

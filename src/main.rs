@@ -6,6 +6,7 @@ mod local;
 mod protocol;
 mod remote;
 mod snapshot;
+mod storage;
 mod sync;
 mod ui;
 
@@ -17,6 +18,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Init(args) => sync::init(args),
+        Command::Start(args) => sync::start(args),
         Command::Mount(args) => sync::mount(args),
         Command::Pull(args) => sync::pull(args),
         Command::Push(args) => sync::push(args),
