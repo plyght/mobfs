@@ -23,3 +23,6 @@ thiserror = "2.0.17"
 toml = "0.9.8"
 walkdir = "2.5.0"
 x25519-dalek = "2.0.1"
+
+[dev-dependencies]
+tempfile = "3.23.0"

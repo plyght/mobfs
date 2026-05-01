@@ -3,7 +3,7 @@ use crate::error::{MobfsError, Result};
 use crate::snapshot::Snapshot;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
@@ -16,10 +16,30 @@ pub enum Request {
         root: String,
         rel: String,
     },
+    ReadFileChunk {
+        root: String,
+        rel: String,
+        offset: u64,
+        len: u64,
+    },
     WriteFile {
         root: String,
         rel: String,
         data: Vec<u8>,
+    },
+    WriteFileStart {
+        root: String,
+        rel: String,
+    },
+    WriteFileChunk {
+        root: String,
+        rel: String,
+        offset: u64,
+        data: Vec<u8>,
+    },
+    WriteFileFinish {
+        root: String,
+        rel: String,
     },
     Mkdir {
         root: String,
@@ -44,6 +64,10 @@ pub enum Response {
     Snapshot(Snapshot),
     File {
         data: Vec<u8>,
+    },
+    FileChunk {
+        data: Vec<u8>,
+        eof: bool,
     },
     RunResult {
         code: Option<i32>,

@@ -6,22 +6,24 @@ use crate::snapshot::{EntryKind, EntryMeta, Snapshot};
 use filetime::{FileTime, set_file_mtime};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::thread;
 use walkdir::WalkDir;
 
-pub fn serve(bind: &str, token: &str) -> Result<()> {
+pub fn serve(bind: &str, token: &str, allow_roots: Vec<PathBuf>) -> Result<()> {
     let listener = TcpListener::bind(bind)?;
+    let policy = RootPolicy::new(allow_roots)?;
     crate::ui::info("mobfsd", format!("listening on {bind}"));
     for stream in listener.incoming() {
         let token = token.to_string();
+        let policy = policy.clone();
         match stream {
             Ok(stream) => {
                 thread::spawn(move || {
-                    if let Err(error) = handle_client(stream, &token) {
+                    if let Err(error) = handle_client(stream, &token, &policy) {
                         crate::ui::warn(format!("client error: {error}"));
                     }
                 });
@@ -32,7 +34,35 @@ pub fn serve(bind: &str, token: &str) -> Result<()> {
     Ok(())
 }
 
-fn handle_client(stream: TcpStream, token: &str) -> Result<()> {
+#[derive(Clone)]
+struct RootPolicy {
+    allow_roots: Vec<PathBuf>,
+}
+
+impl RootPolicy {
+    fn new(allow_roots: Vec<PathBuf>) -> Result<Self> {
+        let mut canonical = Vec::new();
+        for root in allow_roots {
+            canonical.push(root.canonicalize()?);
+        }
+        Ok(Self {
+            allow_roots: canonical,
+        })
+    }
+
+    fn check(&self, root: &str) -> Result<PathBuf> {
+        let root = PathBuf::from(root).canonicalize()?;
+        if self.allow_roots.is_empty() || self.allow_roots.contains(&root) {
+            return Ok(root);
+        }
+        Err(MobfsError::Remote(format!(
+            "remote root {} is not allowed by mobfsd",
+            root.display()
+        )))
+    }
+}
+
+fn handle_client(stream: TcpStream, token: &str, policy: &RootPolicy) -> Result<()> {
     let mut stream = SecureStream::server(stream, token)?;
     loop {
         let request = match protocol::read_frame::<Request>(&mut stream) {
@@ -42,23 +72,49 @@ fn handle_client(stream: TcpStream, token: &str) -> Result<()> {
             }
             Err(error) => return Err(error),
         };
-        let response = handle_request(request).unwrap_or_else(|error| Response::Error {
+        let response = handle_request(request, policy).unwrap_or_else(|error| Response::Error {
             message: error.to_string(),
         });
         protocol::write_frame(&mut stream, &response)?;
     }
 }
 
-fn handle_request(request: Request) -> Result<Response> {
+fn handle_request(request: Request, policy: &RootPolicy) -> Result<Response> {
     match request {
         Request::Hello => Ok(Response::Hello {
             version: PROTOCOL_VERSION,
         }),
-        Request::Snapshot { root, ignore } => Ok(Response::Snapshot(snapshot(&root, &ignore)?)),
-        Request::ReadFile { root, rel } => Ok(Response::File {
-            data: fs::read(safe_join(&root, &rel)?)?,
-        }),
+        Request::Snapshot { root, ignore } => {
+            let root = policy.check(&root)?;
+            Ok(Response::Snapshot(snapshot(&root, &ignore)?))
+        }
+        Request::ReadFile { root, rel } => {
+            let root = policy.check(&root)?;
+            Ok(Response::File {
+                data: fs::read(safe_join(&root, &rel)?)?,
+            })
+        }
+        Request::ReadFileChunk {
+            root,
+            rel,
+            offset,
+            len,
+        } => {
+            let root = policy.check(&root)?;
+            let path = safe_join(&root, &rel)?;
+            let mut file = fs::File::open(path)?;
+            file.seek(SeekFrom::Start(offset))?;
+            let mut data = vec![0_u8; usize::try_from(len.min(1024 * 1024)).unwrap_or(1024 * 1024)];
+            let read = file.read(&mut data)?;
+            data.truncate(read);
+            Ok(Response::FileChunk {
+                eof: read == 0
+                    || read < usize::try_from(len.min(1024 * 1024)).unwrap_or(1024 * 1024),
+                data,
+            })
+        }
         Request::WriteFile { root, rel, data } => {
+            let root = policy.check(&root)?;
             let path = safe_join(&root, &rel)?;
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
@@ -68,11 +124,44 @@ fn handle_request(request: Request) -> Result<Response> {
             fs::rename(temp, path)?;
             Ok(Response::Ok)
         }
+        Request::WriteFileStart { root, rel } => {
+            let root = policy.check(&root)?;
+            let path = safe_join(&root, &rel)?;
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let temp = atomic_temp_path(&path);
+            fs::File::create(temp)?;
+            Ok(Response::Ok)
+        }
+        Request::WriteFileChunk {
+            root,
+            rel,
+            offset,
+            data,
+        } => {
+            let root = policy.check(&root)?;
+            let path = safe_join(&root, &rel)?;
+            let temp = atomic_temp_path(&path);
+            let mut file = fs::OpenOptions::new().write(true).open(temp)?;
+            file.seek(SeekFrom::Start(offset))?;
+            file.write_all(&data)?;
+            Ok(Response::Ok)
+        }
+        Request::WriteFileFinish { root, rel } => {
+            let root = policy.check(&root)?;
+            let path = safe_join(&root, &rel)?;
+            let temp = atomic_temp_path(&path);
+            fs::rename(temp, path)?;
+            Ok(Response::Ok)
+        }
         Request::Mkdir { root, rel } => {
+            let root = policy.check(&root)?;
             fs::create_dir_all(safe_join(&root, &rel)?)?;
             Ok(Response::Ok)
         }
         Request::Remove { root, rel, dir } => {
+            let root = policy.check(&root)?;
             let path = safe_join(&root, &rel)?;
             if dir && path.exists() {
                 fs::remove_dir_all(path)?;
@@ -82,6 +171,7 @@ fn handle_request(request: Request) -> Result<Response> {
             Ok(Response::Ok)
         }
         Request::Run { root, command } => {
+            let root = policy.check(&root)?;
             if command.is_empty() {
                 return Err(MobfsError::Remote("empty command".to_string()));
             }
@@ -98,8 +188,8 @@ fn handle_request(request: Request) -> Result<Response> {
     }
 }
 
-fn snapshot(root: &str, ignore: &[String]) -> Result<Snapshot> {
-    let root = PathBuf::from(root);
+fn snapshot(root: &Path, ignore: &[String]) -> Result<Snapshot> {
+    let root = root.to_path_buf();
     let mut entries = BTreeMap::new();
     for item in WalkDir::new(&root).into_iter() {
         let item = item?;
@@ -172,16 +262,15 @@ fn relative_path(root: &Path, path: &Path) -> Result<String> {
     Ok(parts.join("/"))
 }
 
-fn safe_join(root: &str, rel: &str) -> Result<PathBuf> {
-    let root = PathBuf::from(root);
-    let mut path = root.clone();
+fn safe_join(root: &Path, rel: &str) -> Result<PathBuf> {
+    let mut path = root.to_path_buf();
     for component in Path::new(rel).components() {
         match component {
             Component::Normal(value) => path.push(value),
             _ => return Err(MobfsError::InvalidPath(rel.to_string())),
         }
     }
-    if !path.starts_with(&root) {
+    if !path.starts_with(root) {
         return Err(MobfsError::InvalidPath(rel.to_string()));
     }
     Ok(path)

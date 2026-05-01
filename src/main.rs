@@ -29,7 +29,7 @@ fn main() -> Result<()> {
         Command::Watch(args) => sync::watch(args),
         Command::Serve(args) => sync::serve(args),
         Command::Open => sync::open(),
-        Command::Daemon(args) => daemon::serve(&args.bind, &args.token),
+        Command::Daemon(args) => daemon::serve(&args.bind, &args.token, args.allow_roots),
         Command::Doctor => sync::doctor(),
     }
 }

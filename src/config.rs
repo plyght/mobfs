@@ -124,10 +124,10 @@ pub fn parse_remote(input: &str) -> Result<RemoteTarget> {
 }
 
 fn expand_home(path: &str) -> String {
-    if path == "/~" || path.starts_with("/~/") {
-        if let Some(home) = dirs::home_dir() {
-            return format!("{}{}", home.display(), &path[2..]);
-        }
+    if (path == "/~" || path.starts_with("/~/"))
+        && let Some(home) = dirs::home_dir()
+    {
+        return format!("{}{}", home.display(), &path[2..]);
     }
     path.trim_end_matches('/').to_string()
 }

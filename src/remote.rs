@@ -5,10 +5,12 @@ use crate::error::{MobfsError, Result};
 use crate::protocol::{self, PROTOCOL_VERSION, Request, Response};
 use crate::snapshot::{EntryKind, EntryMeta, Snapshot};
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::thread;
 use std::time::Duration;
+
+const TRANSFER_CHUNK_SIZE: usize = 1024 * 1024;
 
 pub struct RemoteClient {
     config: AppConfig,
@@ -79,20 +81,33 @@ impl RemoteClient {
         }
         let root = self.config.remote.path.clone();
         let rel = rel.to_string();
-        let data = match self.op(|stream, _| {
-            protocol::send(
-                stream,
-                &Request::ReadFile {
-                    root: root.clone(),
-                    rel: rel.clone(),
-                },
-            )
-        })? {
-            Response::File { data } => data,
-            _ => return Err(MobfsError::Remote("invalid read response".to_string())),
-        };
         let temp = atomic_temp_path(&local);
-        File::create(&temp)?.write_all(&data)?;
+        let mut file = File::create(&temp)?;
+        let mut offset = 0_u64;
+        loop {
+            let response = self.op(|stream, _| {
+                protocol::send(
+                    stream,
+                    &Request::ReadFileChunk {
+                        root: root.clone(),
+                        rel: rel.clone(),
+                        offset,
+                        len: TRANSFER_CHUNK_SIZE as u64,
+                    },
+                )
+            })?;
+            match response {
+                Response::FileChunk { data, eof } => {
+                    file.write_all(&data)?;
+                    offset = offset.saturating_add(data.len() as u64);
+                    if eof {
+                        break;
+                    }
+                }
+                _ => return Err(MobfsError::Remote("invalid read response".to_string())),
+            }
+        }
+        drop(file);
         fs::rename(&temp, &local)?;
         daemon::set_mtime(&local, meta.modified)?;
         Ok(())
@@ -100,16 +115,45 @@ impl RemoteClient {
 
     pub fn upload_file(&mut self, rel: &str) -> Result<()> {
         let local = self.config.local.root.join(rel);
-        let data = fs::read(&local)?;
         let root = self.config.remote.path.clone();
         let rel = rel.to_string();
         self.op(|stream, _| {
             protocol::send(
                 stream,
-                &Request::WriteFile {
+                &Request::WriteFileStart {
                     root: root.clone(),
                     rel: rel.clone(),
-                    data: data.clone(),
+                },
+            )
+        })?;
+        let mut file = File::open(&local)?;
+        let mut offset = 0_u64;
+        let mut buffer = vec![0_u8; TRANSFER_CHUNK_SIZE];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            let data = buffer[..read].to_vec();
+            self.op(|stream, _| {
+                protocol::send(
+                    stream,
+                    &Request::WriteFileChunk {
+                        root: root.clone(),
+                        rel: rel.clone(),
+                        offset,
+                        data: data.clone(),
+                    },
+                )
+            })?;
+            offset = offset.saturating_add(read as u64);
+        }
+        self.op(|stream, _| {
+            protocol::send(
+                stream,
+                &Request::WriteFileFinish {
+                    root: root.clone(),
+                    rel: rel.clone(),
                 },
             )
         })?;

@@ -143,6 +143,11 @@ pub struct DaemonArgs {
     pub bind: String,
     #[arg(long, env = "MOBFS_TOKEN", help = "Shared client token")]
     pub token: String,
+    #[arg(
+        long = "allow-root",
+        help = "Allowed canonical workspace root; repeatable"
+    )]
+    pub allow_roots: Vec<PathBuf>,
 }
 
 #[derive(Args)]
