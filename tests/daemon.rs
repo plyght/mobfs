@@ -337,6 +337,58 @@ fn sync_preserves_symlinks_and_executable_bits() {
 }
 
 #[test]
+fn mountfs_smoke_test_when_enabled() {
+    if std::env::var("MOBFS_RUN_FUSE_TESTS").ok().as_deref() != Some("1") {
+        return;
+    }
+    let temp = TempDir::new().unwrap();
+    let remote = temp.path().join("remote");
+    let mountpoint = temp.path().join("mnt");
+    fs::create_dir_all(&remote).unwrap();
+    fs::write(remote.join("a.txt"), "remote").unwrap();
+    let daemon = start_daemon(&remote);
+    let remote_arg = format!("127.0.0.1:{}", remote.display());
+    let mut child = Command::new(bin())
+        .arg("mountfs")
+        .arg(&remote_arg)
+        .arg(&mountpoint)
+        .arg("--token")
+        .arg(TOKEN)
+        .arg("--port")
+        .arg(daemon.port.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !mountpoint.join("a.txt").exists() {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        fs::read_to_string(mountpoint.join("a.txt")).unwrap(),
+        "remote"
+    );
+    fs::write(mountpoint.join("b.txt"), "local through fuse").unwrap();
+    assert_eq!(
+        fs::read_to_string(remote.join("b.txt")).unwrap(),
+        "local through fuse"
+    );
+    let _ = if cfg!(target_os = "macos") {
+        Command::new("diskutil")
+            .arg("unmount")
+            .arg(&mountpoint)
+            .status()
+    } else {
+        Command::new("fusermount")
+            .arg("-u")
+            .arg(&mountpoint)
+            .status()
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
 fn sync_stops_on_same_path_conflict() {
     let temp = TempDir::new().unwrap();
     let remote = temp.path().join("remote");

@@ -19,7 +19,7 @@ pub enum Command {
     Start(StartArgs),
     #[command(about = "Create/open a visible local workspace backed by mobfsd")]
     Mount(MountArgs),
-    #[command(about = "Mount a real on-demand read-only FUSE filesystem")]
+    #[command(about = "Mount a real on-demand read-write FUSE filesystem")]
     Mountfs(MountFsArgs),
     #[command(about = "Pull remote files into the local workspace  [alias: get]")]
     #[command(visible_alias = "get")]

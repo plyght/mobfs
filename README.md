@@ -136,14 +136,14 @@ mobfs start host:/absolute/path --name app
 
 mobfsd is safe-by-default: it refuses to start unless you pass one or more `--allow-root` values or explicitly opt into `--allow-any-root` for unsafe local testing. An allowed root also permits canonical descendants, so `--allow-root /srv` can serve `/srv/project`.
 
-For true filesystem semantics, use the built-in FUSE mount:
+For true no-local-copy filesystem semantics, use the built-in FUSE mount:
 
 ```bash
 cargo build --release
 mobfs mountfs host:/absolute/path /Volumes/project --token secret
 ```
 
-`mountfs` exposes remote files on demand through FUSE without performing an initial full pull. It supports remote reads, writes, create, truncate, mkdir, unlink, rmdir, and rename against the daemon-backed tree. Use `mobfs mount`/`mobfs start` when you prefer an offline-capable local mirror with conflict reconciliation.
+`mountfs` exposes remote files on demand through FUSE without performing an initial full pull. File contents are streamed through the daemon and only held in memory for active reads. It supports remote reads, writes, create, truncate, chmod/mtime updates, mkdir, symlink/readlink, unlink, rmdir, and rename against the daemon-backed tree. Use `mobfs mount`/`mobfs start` when you prefer an offline-capable local mirror with conflict reconciliation.
 
 iCloud and Google Drive can be used as folder-backed canonical storage roots. They do not provide remote compute, so `mobfs run` requires the daemon backend.
 

@@ -77,6 +77,40 @@ impl RemoteClient {
         }
     }
 
+    pub fn stat(&mut self, rel: &str) -> Result<Option<EntryMeta>> {
+        let root = self.config.remote.path.clone();
+        let rel = rel.to_string();
+        match self.op(|stream, _| {
+            protocol::send(
+                stream,
+                &Request::Stat {
+                    root: root.clone(),
+                    rel: rel.clone(),
+                },
+            )
+        })? {
+            Response::Stat(meta) => Ok(meta),
+            _ => Err(MobfsError::Remote("invalid stat response".to_string())),
+        }
+    }
+
+    pub fn list_dir(&mut self, rel: &str) -> Result<Vec<(String, EntryMeta)>> {
+        let root = self.config.remote.path.clone();
+        let rel = rel.to_string();
+        match self.op(|stream, _| {
+            protocol::send(
+                stream,
+                &Request::ListDir {
+                    root: root.clone(),
+                    rel: rel.clone(),
+                },
+            )
+        })? {
+            Response::DirEntries(entries) => Ok(entries),
+            _ => Err(MobfsError::Remote("invalid list response".to_string())),
+        }
+    }
+
     pub fn read_file_chunk(&mut self, rel: &str, offset: u64, len: u64) -> Result<(Vec<u8>, bool)> {
         let root = self.config.remote.path.clone();
         let rel = rel.to_string();
@@ -278,6 +312,45 @@ impl RemoteClient {
                 &Request::Mkdir {
                     root: root.clone(),
                     rel: rel.clone(),
+                },
+            )
+        })?;
+        Ok(())
+    }
+
+    pub fn create_symlink(&mut self, rel: &str, target: &str) -> Result<()> {
+        let root = self.config.remote.path.clone();
+        let rel = rel.to_string();
+        let target = target.to_string();
+        self.op(|stream, _| {
+            protocol::send(
+                stream,
+                &Request::Symlink {
+                    root: root.clone(),
+                    rel: rel.clone(),
+                    target: target.clone(),
+                },
+            )
+        })?;
+        Ok(())
+    }
+
+    pub fn set_metadata(
+        &mut self,
+        rel: &str,
+        mode: Option<u32>,
+        modified: Option<i64>,
+    ) -> Result<()> {
+        let root = self.config.remote.path.clone();
+        let rel = rel.to_string();
+        self.op(|stream, _| {
+            protocol::send(
+                stream,
+                &Request::SetMetadata {
+                    root: root.clone(),
+                    rel: rel.clone(),
+                    mode,
+                    modified,
                 },
             )
         })?;

@@ -119,6 +119,27 @@ fn handle_request(request: Request, policy: &RootPolicy) -> Result<Response> {
             let root = policy.check(&root)?;
             Ok(Response::Snapshot(snapshot(&root, &ignore)?))
         }
+        Request::Stat { root, rel } => {
+            let root = policy.check(&root)?;
+            Ok(Response::Stat(entry_meta(&safe_join(&root, &rel)?)?))
+        }
+        Request::ListDir { root, rel } => {
+            let root = policy.check(&root)?;
+            let path = safe_join(&root, &rel)?;
+            let mut entries = Vec::new();
+            for item in fs::read_dir(path)? {
+                let item = item?;
+                let name = item
+                    .file_name()
+                    .to_str()
+                    .ok_or_else(|| MobfsError::InvalidPath(rel.clone()))?
+                    .to_string();
+                if let Some(meta) = entry_meta(&item.path())? {
+                    entries.push((name, meta));
+                }
+            }
+            Ok(Response::DirEntries(entries))
+        }
         Request::ReadFile { root, rel } => {
             let root = policy.check(&root)?;
             Ok(Response::File {
@@ -268,6 +289,22 @@ fn handle_request(request: Request, policy: &RootPolicy) -> Result<Response> {
             ));
             Ok(Response::Ok)
         }
+        Request::SetMetadata {
+            root,
+            rel,
+            mode,
+            modified,
+        } => {
+            let root = policy.check(&root)?;
+            let path = safe_join(&root, &rel)?;
+            if let Some(mode) = mode {
+                set_mode(&path, mode)?;
+            }
+            if let Some(modified) = modified {
+                set_mtime(&path, modified)?;
+            }
+            Ok(Response::Ok)
+        }
         Request::Mkdir { root, rel } => {
             let root = policy.check(&root)?;
             fs::create_dir_all(safe_join(&root, &rel)?)?;
@@ -370,51 +407,54 @@ fn snapshot(root: &Path, ignore: &[String]) -> Result<Snapshot> {
         {
             continue;
         }
-        let metadata = fs::symlink_metadata(path)?;
-        if metadata.file_type().is_symlink() {
-            let target = fs::read_link(path)?;
-            let target = target
-                .to_str()
-                .ok_or_else(|| MobfsError::InvalidPath(path.display().to_string()))?
-                .to_string();
-            entries.insert(
-                rel,
-                EntryMeta {
-                    kind: EntryKind::Symlink,
-                    size: target.len() as u64,
-                    modified: modified_secs(&metadata),
-                    sha256: Some(hex::encode(sha2::Sha256::digest(target.as_bytes()))),
-                    mode: mode(&metadata),
-                    link_target: Some(target),
-                },
-            );
-        } else if metadata.is_dir() {
-            entries.insert(
-                rel,
-                EntryMeta {
-                    kind: EntryKind::Dir,
-                    size: 0,
-                    modified: 0,
-                    sha256: None,
-                    mode: mode(&metadata),
-                    link_target: None,
-                },
-            );
-        } else if metadata.is_file() {
-            entries.insert(
-                rel,
-                EntryMeta {
-                    kind: EntryKind::File,
-                    size: metadata.len(),
-                    modified: modified_secs(&metadata),
-                    sha256: Some(local::file_sha256(path)?),
-                    mode: mode(&metadata),
-                    link_target: None,
-                },
-            );
+        if let Some(meta) = entry_meta(path)? {
+            entries.insert(rel, meta);
         }
     }
     Ok(Snapshot { entries })
+}
+
+fn entry_meta(path: &Path) -> Result<Option<EntryMeta>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() {
+        let target = fs::read_link(path)?;
+        let target = target
+            .to_str()
+            .ok_or_else(|| MobfsError::InvalidPath(path.display().to_string()))?
+            .to_string();
+        Ok(Some(EntryMeta {
+            kind: EntryKind::Symlink,
+            size: target.len() as u64,
+            modified: modified_secs(&metadata),
+            sha256: Some(hex::encode(sha2::Sha256::digest(target.as_bytes()))),
+            mode: mode(&metadata),
+            link_target: Some(target),
+        }))
+    } else if metadata.is_dir() {
+        Ok(Some(EntryMeta {
+            kind: EntryKind::Dir,
+            size: 0,
+            modified: 0,
+            sha256: None,
+            mode: mode(&metadata),
+            link_target: None,
+        }))
+    } else if metadata.is_file() {
+        Ok(Some(EntryMeta {
+            kind: EntryKind::File,
+            size: metadata.len(),
+            modified: modified_secs(&metadata),
+            sha256: Some(local::file_sha256(path)?),
+            mode: mode(&metadata),
+            link_target: None,
+        }))
+    } else {
+        Ok(None)
+    }
 }
 
 fn upload_temp_path(path: &Path, upload_id: &str) -> Result<PathBuf> {
