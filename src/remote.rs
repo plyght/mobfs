@@ -126,7 +126,13 @@ impl RemoteClient {
                 },
             )
         })? {
-            Response::DirEntries(entries) => Ok(entries),
+            Response::DirEntries(entries) => {
+                let ignore = self.config.sync.ignore.clone();
+                Ok(entries
+                    .into_iter()
+                    .filter(|(name, _)| !ignore.iter().any(|ignored| ignored == name))
+                    .collect())
+            }
             _ => Err(MobfsError::Remote("invalid list response".to_string())),
         }
     }

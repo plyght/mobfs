@@ -14,6 +14,7 @@ use crate::snapshot::{
 use crate::storage::StorageClient;
 use crate::ui;
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::process::Command;
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -100,6 +101,7 @@ pub fn mount(args: MountArgs) -> Result<()> {
             root.display().to_string(),
         );
         ui::info("cache ttl", format!("{}s", config.sync.cache_ttl_secs));
+        save_mount_registry_entry(&config)?;
         crate::mountfs::mount(config, root)
     }
     #[cfg(not(feature = "fuse"))]
@@ -306,13 +308,13 @@ pub fn git(args: GitArgs) -> Result<()> {
 }
 
 fn run_remote(command: Vec<String>, sync_first: bool) -> Result<()> {
-    if sync_first {
+    let (config, mirror_workspace) = load_command_config()?;
+    if sync_first && mirror_workspace {
         sync(SyncArgs {
             delete: false,
             dry_run: false,
         })?;
     }
-    let config = AppConfig::load()?;
     let mut client = StorageClient::connect(config)?;
     let label = command.join(" ");
     ui::info("run", label);
@@ -326,6 +328,75 @@ fn run_remote(command: Vec<String>, sync_first: bool) -> Result<()> {
                 .unwrap_or_else(|| "signal".to_string())
         )))
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct MountRegistry {
+    entries: Vec<AppConfig>,
+}
+
+fn load_command_config() -> Result<(AppConfig, bool)> {
+    match AppConfig::load() {
+        Ok(config) => Ok((config, true)),
+        Err(config_error) => match load_mount_registry_entry()? {
+            Some(config) => Ok((config, false)),
+            None => Err(config_error),
+        },
+    }
+}
+
+fn save_mount_registry_entry(config: &AppConfig) -> Result<()> {
+    let path = mount_registry_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut registry = read_mount_registry(&path)?;
+    registry
+        .entries
+        .retain(|entry| entry.local.root != config.local.root);
+    registry.entries.push(config.clone());
+    fs::write(&path, toml::to_string_pretty(&registry)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn load_mount_registry_entry() -> Result<Option<AppConfig>> {
+    let path = mount_registry_path()?;
+    let registry = read_mount_registry(&path)?;
+    let cwd = std::env::current_dir()?.canonicalize()?;
+    Ok(registry
+        .entries
+        .into_iter()
+        .filter_map(|mut entry| {
+            let root = entry.local.root.canonicalize().ok()?;
+            if cwd.starts_with(&root) {
+                entry.local.root = root;
+                Some(entry)
+            } else {
+                None
+            }
+        })
+        .max_by_key(|entry| entry.local.root.as_os_str().len()))
+}
+
+fn read_mount_registry(path: &std::path::Path) -> Result<MountRegistry> {
+    if !path.exists() {
+        return Ok(MountRegistry::default());
+    }
+    Ok(toml::from_str(&fs::read_to_string(path)?)?)
+}
+
+fn mount_registry_path() -> Result<std::path::PathBuf> {
+    let base = dirs::cache_dir().ok_or_else(|| {
+        MobfsError::Config(
+            "could not determine user cache directory for mount registry".to_string(),
+        )
+    })?;
+    Ok(base.join("mobfs").join("mounts.toml"))
 }
 
 pub fn token() -> Result<()> {

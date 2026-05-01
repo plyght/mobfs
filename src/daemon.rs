@@ -165,7 +165,7 @@ fn handle_request(request: Request, policy: &RootPolicy) -> Result<Response> {
         }
         Request::Stat { root, rel } => {
             let root = policy.check(&root)?;
-            Ok(Response::Stat(entry_meta(&safe_join(&root, &rel)?)?))
+            Ok(Response::Stat(entry_meta_fast(&safe_join(&root, &rel)?)?))
         }
         Request::ListDir { root, rel } => {
             let root = policy.check(&root)?;
@@ -178,7 +178,7 @@ fn handle_request(request: Request, policy: &RootPolicy) -> Result<Response> {
                     .to_str()
                     .ok_or_else(|| MobfsError::InvalidPath(rel.clone()))?
                     .to_string();
-                if let Some(meta) = entry_meta(&item.path())? {
+                if let Some(meta) = entry_meta_fast(&item.path())? {
                     entries.push((name, meta));
                 }
             }
@@ -538,6 +538,49 @@ fn entry_meta(path: &Path) -> Result<Option<EntryMeta>> {
             size: metadata.len(),
             modified: modified_secs(&metadata),
             sha256: Some(local::file_sha256(path)?),
+            mode: mode(&metadata),
+            link_target: None,
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+fn entry_meta_fast(path: &Path) -> Result<Option<EntryMeta>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() {
+        let target = fs::read_link(path)?;
+        let target = target
+            .to_str()
+            .ok_or_else(|| MobfsError::InvalidPath(path.display().to_string()))?
+            .to_string();
+        Ok(Some(EntryMeta {
+            kind: EntryKind::Symlink,
+            size: target.len() as u64,
+            modified: modified_secs(&metadata),
+            sha256: None,
+            mode: mode(&metadata),
+            link_target: Some(target),
+        }))
+    } else if metadata.is_dir() {
+        Ok(Some(EntryMeta {
+            kind: EntryKind::Dir,
+            size: 0,
+            modified: 0,
+            sha256: None,
+            mode: mode(&metadata),
+            link_target: None,
+        }))
+    } else if metadata.is_file() {
+        Ok(Some(EntryMeta {
+            kind: EntryKind::File,
+            size: metadata.len(),
+            modified: modified_secs(&metadata),
+            sha256: None,
             mode: mode(&metadata),
             link_target: None,
         }))

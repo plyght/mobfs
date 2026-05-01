@@ -68,12 +68,14 @@ On non-macOS systems, the default mount root is `~/MobFSMounts/<name>`. You can 
 mobfs mount example.com:/srv/projects/app --local ~/mnt/app --token "$MOBFS_TOKEN" --ssh-tunnel
 ```
 
-Run remote commands from a configured mirror workspace, or run tools directly in the no-local-code mount when the tool can operate over FUSE:
+Run remote commands from a configured mirror workspace or directly inside a no-local-code mount. Mount mode records a small user-cache registry outside the source tree so these helpers work without creating `.mobfs.toml` in the mount:
 
 ```bash
 mobfs run cargo test
 mobfs git status
 ```
+
+For metadata-heavy commands such as `git status`, prefer `mobfs git` when you want remote-native behavior. Running `git` directly through FUSE works, but it is still slower than executing git on the machine that owns the repository.
 
 Use mirror mode only when you intentionally want a durable local working tree:
 
@@ -164,15 +166,28 @@ mobfs bench --iterations 5 --mib 64
 mobfs bench --scale-files 50000 --iterations 3
 ```
 
-Useful aliases in mirror mode: `start` as `up`, `pull` as `get`, `push` as `put`, `sync` as `s`, `status` as `st`, `run` as `r`, `git` as `g`, and `open` as `o`.
+Useful aliases: `start` as `up`, `pull` as `get`, `push` as `put`, `sync` as `s`, `status` as `st`, `run` as `r`, `git` as `g`, and `open` as `o`.
 
 ## No-Local-Code Semantics
 
-`mobfs mount` does not create `.mobfs.toml`, `.mobfs/token`, snapshots, or a project mirror under the mountpoint. Reads are fetched from the daemon on demand. Writes are sent to the daemon immediately. The only local persistence used by FUSE mode is a small operation journal in the system temp directory so interrupted metadata and namespace operations can be replayed after reconnect.
+`mobfs mount` does not create `.mobfs.toml`, `.mobfs/token`, snapshots, or a project mirror under the mountpoint. Reads are fetched from the daemon on demand. Writes are sent to the daemon immediately. FUSE mode uses a small operation journal in the system temp directory so interrupted metadata and namespace operations can be replayed after reconnect. It also records active mounts in the user cache directory so `mobfs run` and `mobfs git` can resolve the remote workspace from inside a mount without writing config into source.
 
-Metadata lookups and directory entries use a short kernel cache TTL. The default is 1 second and can be changed with `mobfs mount --cache-ttl-secs <seconds>`. Use `0` while dogfooding remote-side edits from another shell, and use a small nonzero value when testing IDE indexing performance. Direct reads go to the daemon first and only fall back to the last successful chunk if the daemon is temporarily unavailable.
+Metadata lookups and directory entries use a short kernel cache TTL. The default is 1 second and can be changed with `mobfs mount --cache-ttl-secs <seconds>`. Use `0` while dogfooding remote-side edits from another shell, and use a small nonzero value for normal editor, agent, git, search, and traversal workflows. With a nonzero TTL, MobFS serves known metadata and directory entries from the initial snapshot and local mutation cache where safe. Direct reads go to the daemon first and only fall back to the last successful chunk if the daemon is temporarily unavailable.
 
 This means local tools may still create their own caches outside the mount, and operating systems may keep normal kernel/page-cache data while the mount is active. MobFS does not intentionally mirror project source into a durable local workspace in mount mode.
+
+## Performance Guidance
+
+Current local proof testing on a real Rust repo shows the mount path is ready for controlled dogfooding: targeted source reads, `rg`, editor atomic-save patterns, symlinks, deletes, daemon restart recovery, 32 MiB writes, ignored-directory `find`, and `du` all complete quickly. It is still not a native local filesystem replacement for arbitrary metadata-heavy scans.
+
+Use these rules of thumb:
+
+- use default `--cache-ttl-secs 1` for normal editing, agent work, search, and git workflows
+- use `--cache-ttl-secs 0` only when you need immediate visibility of remote-side edits made outside MobFS
+- use `mobfs git ...` and `mobfs run ...` from inside the mount for remote-native command latency
+- avoid broad raw-FUSE scans of unignored build/cache directories; keep heavy directories such as `target` and `node_modules` ignored
+
+See `benchmarks.md` and `testing.md` for current measured proof results.
 
 ## Development
 

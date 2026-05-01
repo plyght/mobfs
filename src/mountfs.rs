@@ -14,7 +14,7 @@ use std::ffi::OsStr;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub fn mount(config: AppConfig, mountpoint: PathBuf) -> Result<()> {
     prepare_mountpoint(&mountpoint)?;
@@ -109,12 +109,16 @@ pub fn config_from_remote(
     })
 }
 
+type DirEntries = Vec<(String, EntryMeta)>;
+type DirCache = BTreeMap<String, (Instant, DirEntries)>;
+
 struct MobfsFuse {
     client: Mutex<RemoteClient>,
     snapshot: Mutex<Snapshot>,
     path_to_ino: Mutex<BTreeMap<String, u64>>,
     ino_to_path: Mutex<BTreeMap<u64, String>>,
     read_cache: Mutex<BTreeMap<(String, u64, u32), Vec<u8>>>,
+    dir_cache: Mutex<DirCache>,
     handle_to_path: Mutex<BTreeMap<u64, String>>,
     journal: PathBuf,
     ttl: Duration,
@@ -163,33 +167,22 @@ impl MobfsFuse {
             path_to_ino.insert(path.clone(), ino);
             ino_to_path.insert(ino, path.clone());
         }
+        let dir_cache = if ttl.is_zero() {
+            BTreeMap::new()
+        } else {
+            dir_cache_from_snapshot(&snapshot)
+        };
         Ok(Self {
             client: Mutex::new(client),
             snapshot: Mutex::new(snapshot),
             path_to_ino: Mutex::new(path_to_ino),
             ino_to_path: Mutex::new(ino_to_path),
             read_cache: Mutex::new(BTreeMap::new()),
+            dir_cache: Mutex::new(dir_cache),
             handle_to_path: Mutex::new(BTreeMap::new()),
             journal,
             ttl,
         })
-    }
-
-    fn refresh(&self) -> Result<()> {
-        let snapshot = self.client.lock().unwrap().snapshot()?;
-        let mut path_to_ino = BTreeMap::new();
-        let mut ino_to_path = BTreeMap::new();
-        path_to_ino.insert(String::new(), 1);
-        ino_to_path.insert(1, String::new());
-        for path in snapshot.entries.keys() {
-            let ino = inode_for(path);
-            path_to_ino.insert(path.clone(), ino);
-            ino_to_path.insert(ino, path.clone());
-        }
-        *self.snapshot.lock().unwrap() = snapshot;
-        *self.path_to_ino.lock().unwrap() = path_to_ino;
-        *self.ino_to_path.lock().unwrap() = ino_to_path;
-        Ok(())
     }
 
     fn invalidate_path_cache(&self, path: &str) {
@@ -197,10 +190,11 @@ impl MobfsFuse {
             .lock()
             .unwrap()
             .retain(|(cached, _, _), _| cached != path && !cached.starts_with(&format!("{path}/")));
-    }
-
-    fn refresh_or_eio(&self) -> std::result::Result<(), Errno> {
-        self.refresh().map_err(|_| Errno::EIO)
+        self.dir_cache.lock().unwrap().retain(|cached, _| {
+            cached != path
+                && !path.starts_with(&format!("{cached}/"))
+                && !cached.starts_with(&format!("{path}/"))
+        });
     }
 
     fn record(&self, op: &JournalOp) -> std::result::Result<(), Errno> {
@@ -228,10 +222,163 @@ impl MobfsFuse {
             .insert(ino, path.to_string());
     }
 
+    fn update_file_write(&self, path: &str, offset: u64, len: usize) {
+        let mut snapshot = self.snapshot.lock().unwrap();
+        let entry = snapshot
+            .entries
+            .entry(path.to_string())
+            .or_insert_with(|| EntryMeta {
+                kind: EntryKind::File,
+                size: 0,
+                modified: unix_now_secs(),
+                sha256: None,
+                mode: 0o644,
+                link_target: None,
+            });
+        entry.kind = EntryKind::File;
+        entry.size = entry.size.max(offset.saturating_add(len as u64));
+        entry.modified = unix_now_secs();
+        entry.sha256 = None;
+        drop(snapshot);
+        let ino = inode_for(path);
+        self.path_to_ino
+            .lock()
+            .unwrap()
+            .insert(path.to_string(), ino);
+        self.ino_to_path
+            .lock()
+            .unwrap()
+            .insert(ino, path.to_string());
+    }
+
+    fn update_dir_entry(&self, path: &str, mode: u32) {
+        self.update_entry(
+            path,
+            EntryMeta {
+                kind: EntryKind::Dir,
+                size: 0,
+                modified: 0,
+                sha256: None,
+                mode,
+                link_target: None,
+            },
+        );
+    }
+
+    fn update_symlink_entry(&self, path: &str, target: &str) {
+        self.update_entry(
+            path,
+            EntryMeta {
+                kind: EntryKind::Symlink,
+                size: target.len() as u64,
+                modified: unix_now_secs(),
+                sha256: None,
+                mode: 0o777,
+                link_target: Some(target.to_string()),
+            },
+        );
+    }
+
+    fn update_file_size(&self, path: &str, size: u64) {
+        let mut snapshot = self.snapshot.lock().unwrap();
+        let entry = snapshot
+            .entries
+            .entry(path.to_string())
+            .or_insert_with(|| EntryMeta {
+                kind: EntryKind::File,
+                size,
+                modified: unix_now_secs(),
+                sha256: None,
+                mode: 0o644,
+                link_target: None,
+            });
+        entry.kind = EntryKind::File;
+        entry.size = size;
+        entry.modified = unix_now_secs();
+        entry.sha256 = None;
+        drop(snapshot);
+        let ino = inode_for(path);
+        self.path_to_ino
+            .lock()
+            .unwrap()
+            .insert(path.to_string(), ino);
+        self.ino_to_path
+            .lock()
+            .unwrap()
+            .insert(ino, path.to_string());
+    }
+
+    fn apply_metadata_update(&self, path: &str, mode: Option<u32>, modified: Option<i64>) {
+        if let Some(entry) = self.snapshot.lock().unwrap().entries.get_mut(path) {
+            if let Some(mode) = mode {
+                entry.mode = mode;
+            }
+            if let Some(modified) = modified {
+                entry.modified = modified;
+            }
+        }
+    }
+
+    fn cached_dir_entries(&self, dir: &str) -> Option<DirEntries> {
+        if self.ttl.is_zero() {
+            return None;
+        }
+        let cache = self.dir_cache.lock().unwrap();
+        let (created, entries) = cache.get(dir)?;
+        if created.elapsed() <= self.ttl {
+            Some(entries.clone())
+        } else {
+            None
+        }
+    }
+
+    fn cache_dir_entries(&self, dir: &str, entries: &[(String, EntryMeta)]) {
+        if !self.ttl.is_zero() {
+            self.dir_cache
+                .lock()
+                .unwrap()
+                .insert(dir.to_string(), (Instant::now(), entries.to_vec()));
+        }
+    }
+
     fn remove_entry(&self, path: &str) {
         self.snapshot.lock().unwrap().entries.remove(path);
         if let Some(ino) = self.path_to_ino.lock().unwrap().remove(path) {
             self.ino_to_path.lock().unwrap().remove(&ino);
+        }
+    }
+
+    fn remove_tree_entries(&self, path: &str) {
+        let prefix = format!("{path}/");
+        let paths = self
+            .snapshot
+            .lock()
+            .unwrap()
+            .entries
+            .keys()
+            .filter(|entry| *entry == path || entry.starts_with(&prefix))
+            .cloned()
+            .collect::<Vec<_>>();
+        for path in paths {
+            self.remove_entry(&path);
+        }
+    }
+
+    fn rename_tree_entries(&self, from: &str, to: &str) {
+        let prefix = format!("{from}/");
+        let entries = self
+            .snapshot
+            .lock()
+            .unwrap()
+            .entries
+            .iter()
+            .filter(|(path, _)| *path == from || path.starts_with(&prefix))
+            .map(|(path, meta)| (path.clone(), meta.clone()))
+            .collect::<Vec<_>>();
+        for (old_path, meta) in entries {
+            let suffix = old_path.strip_prefix(from).unwrap_or("");
+            self.remove_entry(&old_path);
+            self.update_entry(&format!("{to}{suffix}"), meta);
         }
     }
 
@@ -307,6 +454,16 @@ impl Filesystem for MobfsFuse {
             }
         };
         let path = join_rel(&parent_path, name);
+        if !self.ttl.is_zero()
+            && let Some(meta) = self.snapshot.lock().unwrap().entries.get(&path).cloned()
+        {
+            reply.entry(
+                &self.ttl,
+                &self.attr_for(&path, Some(&meta)),
+                fuser::Generation(0),
+            );
+            return;
+        }
         match self.client.lock().unwrap().stat(&path) {
             Ok(Some(meta)) => {
                 self.update_entry(&path, meta.clone());
@@ -342,6 +499,12 @@ impl Filesystem for MobfsFuse {
                 return;
             }
         };
+        if !self.ttl.is_zero()
+            && let Some(meta) = self.snapshot.lock().unwrap().entries.get(&path).cloned()
+        {
+            reply.attr(&self.ttl, &self.attr_for(&path, Some(&meta)));
+            return;
+        }
         match self.client.lock().unwrap().stat(&path) {
             Ok(Some(meta)) => {
                 self.update_entry(&path, meta.clone());
@@ -370,12 +533,18 @@ impl Filesystem for MobfsFuse {
                 return;
             }
         };
-        let remote_entries = match self.client.lock().unwrap().list_dir(&dir) {
-            Ok(entries) => entries,
-            Err(_) => {
-                reply.error(Errno::EIO);
-                return;
-            }
+        let remote_entries = match self.cached_dir_entries(&dir) {
+            Some(entries) => entries,
+            None => match self.client.lock().unwrap().list_dir(&dir) {
+                Ok(entries) => {
+                    self.cache_dir_entries(&dir, &entries);
+                    entries
+                }
+                Err(_) => {
+                    reply.error(Errno::EIO);
+                    return;
+                }
+            },
         };
         let mut entries = vec![(u64::from(ino), FileType::Directory, ".".to_string())];
         entries.push((1, FileType::Directory, "..".to_string()));
@@ -504,10 +673,8 @@ impl Filesystem for MobfsFuse {
         match write_result {
             Ok(()) => {
                 self.invalidate_path_cache(&path);
-                match self.refresh_or_eio() {
-                    Ok(()) => reply.written(data.len() as u32),
-                    Err(errno) => reply.error(errno),
-                }
+                self.update_file_write(&path, offset, data.len());
+                reply.written(data.len() as u32);
             }
             Err(_) => reply.error(Errno::EIO),
         }
@@ -660,7 +827,8 @@ impl Filesystem for MobfsFuse {
                 return;
             }
             self.invalidate_path_cache(&path);
-            if let Err(errno) = self.clear_record().and_then(|_| self.refresh_or_eio()) {
+            self.update_file_size(&path, size);
+            if let Err(errno) = self.clear_record() {
                 reply.error(errno);
                 return;
             }
@@ -696,11 +864,12 @@ impl Filesystem for MobfsFuse {
             reply.error(Errno::EIO);
             return;
         }
-        if (mode.is_some() || modified.is_some())
-            && let Err(errno) = self.clear_record().and_then(|_| self.refresh_or_eio())
-        {
-            reply.error(errno);
-            return;
+        if mode.is_some() || modified.is_some() {
+            self.apply_metadata_update(&path, mode, modified);
+            if let Err(errno) = self.clear_record() {
+                reply.error(errno);
+                return;
+            }
         }
         let snapshot = self.snapshot.lock().unwrap();
         match snapshot.entries.get(&path) {
@@ -755,7 +924,9 @@ impl Filesystem for MobfsFuse {
             return;
         }
         self.invalidate_path_cache(&path);
-        if let Err(errno) = self.clear_record().and_then(|_| self.refresh_or_eio()) {
+        self.update_file_size(&path, 0);
+        self.apply_metadata_update(&path, Some(mode), None);
+        if let Err(errno) = self.clear_record() {
             reply.error(errno);
             return;
         }
@@ -820,7 +991,9 @@ impl Filesystem for MobfsFuse {
             reply.error(Errno::EIO);
             return;
         }
-        if let Err(errno) = self.clear_record().and_then(|_| self.refresh_or_eio()) {
+        self.invalidate_path_cache(&path);
+        self.update_dir_entry(&path, mode);
+        if let Err(errno) = self.clear_record() {
             reply.error(errno);
             return;
         }
@@ -875,7 +1048,8 @@ impl Filesystem for MobfsFuse {
             return;
         }
         self.invalidate_path_cache(&path);
-        if let Err(errno) = self.clear_record().and_then(|_| self.refresh_or_eio()) {
+        self.update_symlink_entry(&path, target);
+        if let Err(errno) = self.clear_record() {
             reply.error(errno);
             return;
         }
@@ -947,7 +1121,8 @@ impl Filesystem for MobfsFuse {
             Ok(()) => {
                 self.invalidate_path_cache(&from);
                 self.invalidate_path_cache(&to);
-                match self.clear_record().and_then(|_| self.refresh_or_eio()) {
+                self.rename_tree_entries(&from, &to);
+                match self.clear_record() {
                     Ok(()) => reply.ok(),
                     Err(errno) => reply.error(errno),
                 }
@@ -996,7 +1171,8 @@ impl MobfsFuse {
         match remove_result {
             Ok(()) => {
                 self.invalidate_path_cache(&path);
-                match self.clear_record().and_then(|_| self.refresh_or_eio()) {
+                self.remove_tree_entries(&path);
+                match self.clear_record() {
                     Ok(()) => reply.ok(),
                     Err(errno) => reply.error(errno),
                 }
@@ -1004,6 +1180,21 @@ impl MobfsFuse {
             Err(_) => reply.error(Errno::EIO),
         }
     }
+}
+
+fn dir_cache_from_snapshot(snapshot: &Snapshot) -> DirCache {
+    let now = Instant::now();
+    let mut dirs: BTreeMap<String, DirEntries> = BTreeMap::new();
+    for (path, meta) in &snapshot.entries {
+        let (parent, name) = match path.rsplit_once('/') {
+            Some((parent, name)) => (parent.to_string(), name.to_string()),
+            None => (String::new(), path.clone()),
+        };
+        dirs.entry(parent).or_default().push((name, meta.clone()));
+    }
+    dirs.into_iter()
+        .map(|(path, entries)| (path, (now, entries)))
+        .collect()
 }
 
 fn mountfs_journal_path(config: &AppConfig) -> PathBuf {
@@ -1102,6 +1293,13 @@ fn join_rel(parent: &str, name: &str) -> String {
     } else {
         format!("{parent}/{name}")
     }
+}
+
+fn unix_now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn time_or_now_secs(value: TimeOrNow) -> Option<i64> {
