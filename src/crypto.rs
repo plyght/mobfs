@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use subtle::ConstantTimeEq;
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -28,7 +29,8 @@ enum HandshakeFrame {
 
 pub struct SecureStream {
     stream: TcpStream,
-    cipher: ChaCha20Poly1305,
+    send_cipher: ChaCha20Poly1305,
+    recv_cipher: ChaCha20Poly1305,
     send_counter: u64,
     recv_counter: u64,
 }
@@ -52,9 +54,9 @@ impl SecureStream {
             }
         };
         let shared = secret.diffie_hellman(&PublicKey::from(server_public));
-        let key = derive_key(shared.as_bytes(), token, &public.to_bytes(), &server_public)?;
+        let keys = derive_keys(shared.as_bytes(), token, &public.to_bytes(), &server_public)?;
         let expected = auth_tag(token, b"server", &public.to_bytes(), &server_public)?;
-        if server_auth != expected {
+        if server_auth.ct_eq(&expected).unwrap_u8() != 1 {
             return Err(MobfsError::Remote(
                 "encrypted handshake authentication failed".to_string(),
             ));
@@ -64,7 +66,11 @@ impl SecureStream {
             &mut stream,
             &HandshakeFrame::ClientAuth { auth: client_auth },
         )?;
-        Ok(Self::new(stream, key))
+        Ok(Self::new(
+            stream,
+            keys.client_to_server,
+            keys.server_to_client,
+        ))
     }
 
     pub fn server(mut stream: TcpStream, token: &str) -> Result<Self> {
@@ -80,7 +86,7 @@ impl SecureStream {
         let public = PublicKey::from(&secret);
         let server_public = public.to_bytes();
         let shared = secret.diffie_hellman(&PublicKey::from(client_public));
-        let key = derive_key(shared.as_bytes(), token, &client_public, &server_public)?;
+        let keys = derive_keys(shared.as_bytes(), token, &client_public, &server_public)?;
         let server_auth = auth_tag(token, b"server", &client_public, &server_public)?;
         write_plain(
             &mut stream,
@@ -98,18 +104,23 @@ impl SecureStream {
             }
         };
         let expected = auth_tag(token, b"client", &client_public, &server_public)?;
-        if client_auth != expected {
+        if client_auth.ct_eq(&expected).unwrap_u8() != 1 {
             return Err(MobfsError::Remote(
                 "encrypted handshake authentication failed".to_string(),
             ));
         }
-        Ok(Self::new(stream, key))
+        Ok(Self::new(
+            stream,
+            keys.server_to_client,
+            keys.client_to_server,
+        ))
     }
 
-    fn new(stream: TcpStream, key: [u8; 32]) -> Self {
+    fn new(stream: TcpStream, send_key: [u8; 32], recv_key: [u8; 32]) -> Self {
         Self {
             stream,
-            cipher: ChaCha20Poly1305::new(Key::from_slice(&key)),
+            send_cipher: ChaCha20Poly1305::new(Key::from_slice(&send_key)),
+            recv_cipher: ChaCha20Poly1305::new(Key::from_slice(&recv_key)),
             send_counter: 0,
             recv_counter: 0,
         }
@@ -119,7 +130,7 @@ impl SecureStream {
         let data = read_raw(&mut self.stream)?;
         let nonce = nonce(self.recv_counter);
         self.recv_counter = self.recv_counter.saturating_add(1);
-        self.cipher
+        self.recv_cipher
             .decrypt(&nonce, data.as_ref())
             .map_err(|_| MobfsError::Remote("encrypted frame authentication failed".to_string()))
     }
@@ -128,29 +139,43 @@ impl SecureStream {
         let nonce = nonce(self.send_counter);
         self.send_counter = self.send_counter.saturating_add(1);
         let encrypted = self
-            .cipher
+            .send_cipher
             .encrypt(&nonce, data)
             .map_err(|_| MobfsError::Remote("encrypted frame failed".to_string()))?;
         write_raw(&mut self.stream, &encrypted)
     }
 }
 
-fn derive_key(
+struct DirectionKeys {
+    client_to_server: [u8; 32],
+    server_to_client: [u8; 32],
+}
+
+fn derive_keys(
     shared: &[u8],
     token: &str,
     client_public: &[u8; 32],
     server_public: &[u8; 32],
-) -> Result<[u8; 32]> {
+) -> Result<DirectionKeys> {
     let salt = Sha256::digest(token.as_bytes());
     let hk = Hkdf::<Sha256>::new(Some(&salt), shared);
-    let mut key = [0_u8; 32];
-    let mut info = Vec::with_capacity(69);
-    info.extend_from_slice(b"mobfs-e2ee-v1");
+    let mut client_to_server = [0_u8; 32];
+    let mut server_to_client = [0_u8; 32];
+    let mut info = Vec::with_capacity(85);
+    info.extend_from_slice(b"mobfs-e2ee-v2");
     info.extend_from_slice(client_public);
     info.extend_from_slice(server_public);
-    hk.expand(&info, &mut key)
+    info.extend_from_slice(b"client-to-server");
+    hk.expand(&info, &mut client_to_server)
         .map_err(|_| MobfsError::Remote("encrypted key derivation failed".to_string()))?;
-    Ok(key)
+    info.truncate(b"mobfs-e2ee-v2".len() + 64);
+    info.extend_from_slice(b"server-to-client");
+    hk.expand(&info, &mut server_to_client)
+        .map_err(|_| MobfsError::Remote("encrypted key derivation failed".to_string()))?;
+    Ok(DirectionKeys {
+        client_to_server,
+        server_to_client,
+    })
 }
 
 fn auth_tag(

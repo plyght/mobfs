@@ -3,7 +3,7 @@ use crate::error::{MobfsError, Result};
 use crate::snapshot::Snapshot;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
@@ -26,14 +26,17 @@ pub enum Request {
         root: String,
         rel: String,
         data: Vec<u8>,
+        mode: u32,
     },
     WriteFileStart {
         root: String,
         rel: String,
+        upload_id: String,
     },
     WriteFileChunk {
         root: String,
         rel: String,
+        upload_id: String,
         offset: u64,
         data: Vec<u8>,
     },
@@ -56,6 +59,14 @@ pub enum Request {
     WriteFileFinish {
         root: String,
         rel: String,
+        upload_id: String,
+        sha256: String,
+        mode: u32,
+    },
+    Symlink {
+        root: String,
+        rel: String,
+        target: String,
     },
     Mkdir {
         root: String,
@@ -85,6 +96,10 @@ pub enum Response {
         data: Vec<u8>,
         eof: bool,
     },
+    RunOutput {
+        stream: RunStream,
+        data: Vec<u8>,
+    },
     RunResult {
         code: Option<i32>,
         stdout: Vec<u8>,
@@ -94,6 +109,12 @@ pub enum Response {
     Error {
         message: String,
     },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum RunStream {
+    Stdout,
+    Stderr,
 }
 
 pub fn send(stream: &mut SecureStream, request: &Request) -> Result<Response> {

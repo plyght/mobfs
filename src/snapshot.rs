@@ -7,12 +7,17 @@ pub struct EntryMeta {
     pub size: u64,
     pub modified: i64,
     pub sha256: Option<String>,
+    #[serde(default)]
+    pub mode: u32,
+    #[serde(default)]
+    pub link_target: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum EntryKind {
     File,
     Dir,
+    Symlink,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -39,7 +44,9 @@ pub enum StatusItem {
 pub fn push_items(local: &Snapshot, remote: &Snapshot, delete: bool) -> Vec<PlanItem> {
     let mut items = Vec::new();
     for (rel, local_meta) in &local.entries {
-        if local_meta.kind == EntryKind::File && remote.entries.get(rel) != Some(local_meta) {
+        if matches!(local_meta.kind, EntryKind::File | EntryKind::Symlink)
+            && remote.entries.get(rel) != Some(local_meta)
+        {
             items.push(PlanItem::Put(rel.clone()));
         }
     }
@@ -56,7 +63,9 @@ pub fn push_items(local: &Snapshot, remote: &Snapshot, delete: bool) -> Vec<Plan
 pub fn pull_items(local: &Snapshot, remote: &Snapshot, delete: bool) -> Vec<PlanItem> {
     let mut items = Vec::new();
     for (rel, remote_meta) in &remote.entries {
-        if remote_meta.kind == EntryKind::File && local.entries.get(rel) != Some(remote_meta) {
+        if matches!(remote_meta.kind, EntryKind::File | EntryKind::Symlink)
+            && local.entries.get(rel) != Some(remote_meta)
+        {
             items.push(PlanItem::Get(rel.clone()));
         }
     }
@@ -94,11 +103,15 @@ pub fn sync_items(
         let local_changed = local_meta != base_meta;
         let remote_changed = remote_meta != base_meta;
         match (local_changed, remote_changed, local_meta, remote_meta) {
-            (true, false, Some(meta), _) if meta.kind == EntryKind::File => {
+            (true, false, Some(meta), _)
+                if matches!(meta.kind, EntryKind::File | EntryKind::Symlink) =>
+            {
                 items.push(PlanItem::Put(path))
             }
             (true, false, None, _) if delete => items.push(PlanItem::DeleteRemote(path)),
-            (false, true, _, Some(meta)) if meta.kind == EntryKind::File => {
+            (false, true, _, Some(meta))
+                if matches!(meta.kind, EntryKind::File | EntryKind::Symlink) =>
+            {
                 items.push(PlanItem::Get(path))
             }
             (false, true, _, None) if delete => items.push(PlanItem::DeleteLocal(path)),
@@ -140,6 +153,8 @@ mod tests {
             size: 1,
             modified: 1,
             sha256: hash.map(str::to_string),
+            mode: 0,
+            link_target: None,
         }
     }
 

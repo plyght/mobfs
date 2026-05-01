@@ -1,5 +1,7 @@
 use std::fs;
 use std::net::TcpListener;
+#[cfg(unix)]
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -260,6 +262,78 @@ fn git_command_runs_on_remote_after_syncing() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("tracked.txt"));
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_preserves_symlinks_and_executable_bits() {
+    let temp = TempDir::new().unwrap();
+    let remote = temp.path().join("remote");
+    let local = temp.path().join("local");
+    fs::create_dir_all(&remote).unwrap();
+    fs::write(remote.join("tool.sh"), "#!/bin/sh\necho ok\n").unwrap();
+    fs::set_permissions(remote.join("tool.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+    symlink("tool.sh", remote.join("tool-link")).unwrap();
+    let daemon = start_daemon(&remote);
+    let remote_arg = format!("127.0.0.1:{}", remote.display());
+
+    let output = mobfs(
+        temp.path(),
+        &[
+            "mount",
+            &remote_arg,
+            "--local",
+            local.to_str().unwrap(),
+            "--token",
+            TOKEN,
+            "--port",
+            &daemon.port.to_string(),
+            "--no-open",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_link(local.join("tool-link")).unwrap(),
+        Path::new("tool.sh")
+    );
+    assert_eq!(
+        fs::metadata(local.join("tool.sh"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o111,
+        0o111
+    );
+
+    fs::write(local.join("local-tool.sh"), "#!/bin/sh\necho local\n").unwrap();
+    fs::set_permissions(
+        local.join("local-tool.sh"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    symlink("local-tool.sh", local.join("local-tool-link")).unwrap();
+    let output = mobfs(&local, &["push"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_link(remote.join("local-tool-link")).unwrap(),
+        Path::new("local-tool.sh")
+    );
+    assert_eq!(
+        fs::metadata(remote.join("local-tool.sh"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o111,
+        0o111
+    );
 }
 
 #[test]

@@ -2,11 +2,14 @@ use crate::config::{AppConfig, StorageBackend};
 use crate::crypto::SecureStream;
 use crate::daemon;
 use crate::error::{MobfsError, Result};
-use crate::protocol::{self, PROTOCOL_VERSION, Request, Response};
+use crate::protocol::{self, PROTOCOL_VERSION, Request, Response, RunStream};
 use crate::snapshot::{EntryKind, EntryMeta, Snapshot};
+use sha2::Digest;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::net::TcpStream;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::thread;
 use std::time::Duration;
 
@@ -98,6 +101,20 @@ impl RemoteClient {
         if let Some(parent) = local.parent() {
             fs::create_dir_all(parent)?;
         }
+        if meta.kind == EntryKind::Symlink {
+            let target = meta
+                .link_target
+                .as_ref()
+                .ok_or_else(|| MobfsError::Remote("symlink target missing".to_string()))?;
+            let _ = fs::remove_file(&local);
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(target, &local)?;
+            #[cfg(not(unix))]
+            return Err(MobfsError::Remote(
+                "symlinks are not supported on this platform".to_string(),
+            ));
+            return Ok(());
+        }
         let rel = rel.to_string();
         let temp = atomic_temp_path(&local);
         let mut file = File::create(&temp)?;
@@ -112,6 +129,7 @@ impl RemoteClient {
         }
         drop(file);
         fs::rename(&temp, &local)?;
+        daemon::set_mode(&local, meta.mode)?;
         daemon::set_mtime(&local, meta.modified)?;
         Ok(())
     }
@@ -171,18 +189,43 @@ impl RemoteClient {
 
     pub fn upload_file(&mut self, rel: &str) -> Result<()> {
         let local = self.config.local.root.join(rel);
+        let metadata = fs::symlink_metadata(&local)?;
         let root = self.config.remote.path.clone();
         let rel = rel.to_string();
+        if metadata.file_type().is_symlink() {
+            let target = fs::read_link(&local)?
+                .to_str()
+                .ok_or_else(|| MobfsError::InvalidPath(local.display().to_string()))?
+                .to_string();
+            self.op(|stream, _| {
+                protocol::send(
+                    stream,
+                    &Request::Symlink {
+                        root: root.clone(),
+                        rel: rel.clone(),
+                        target: target.clone(),
+                    },
+                )
+            })?;
+            return Ok(());
+        }
+        let upload_id = format!(
+            "{}-{}",
+            std::process::id(),
+            hex::encode(sha2::Sha256::digest(rel.as_bytes()))
+        );
         self.op(|stream, _| {
             protocol::send(
                 stream,
                 &Request::WriteFileStart {
                     root: root.clone(),
                     rel: rel.clone(),
+                    upload_id: upload_id.clone(),
                 },
             )
         })?;
         let mut file = File::open(&local)?;
+        let mut hasher = sha2::Sha256::new();
         let mut offset = 0_u64;
         let mut buffer = vec![0_u8; TRANSFER_CHUNK_SIZE];
         loop {
@@ -190,6 +233,7 @@ impl RemoteClient {
             if read == 0 {
                 break;
             }
+            hasher.update(&buffer[..read]);
             let data = buffer[..read].to_vec();
             self.op(|stream, _| {
                 protocol::send(
@@ -197,6 +241,7 @@ impl RemoteClient {
                     &Request::WriteFileChunk {
                         root: root.clone(),
                         rel: rel.clone(),
+                        upload_id: upload_id.clone(),
                         offset,
                         data: data.clone(),
                     },
@@ -204,12 +249,16 @@ impl RemoteClient {
             })?;
             offset = offset.saturating_add(read as u64);
         }
+        let sha256 = hex::encode(hasher.finalize());
         self.op(|stream, _| {
             protocol::send(
                 stream,
                 &Request::WriteFileFinish {
                     root: root.clone(),
                     rel: rel.clone(),
+                    upload_id: upload_id.clone(),
+                    sha256: sha256.clone(),
+                    mode: mode(&metadata),
                 },
             )
         })?;
@@ -254,22 +303,34 @@ impl RemoteClient {
 
     pub fn run(&mut self, command: Vec<String>) -> Result<(Option<i32>, Vec<u8>, Vec<u8>)> {
         let root = self.config.remote.path.clone();
-        match self.op(|stream, _| {
-            protocol::send(
+        self.op(|stream, _| {
+            protocol::write_frame(
                 stream,
                 &Request::Run {
                     root: root.clone(),
                     command: command.clone(),
                 },
-            )
-        })? {
-            Response::RunResult {
-                code,
-                stdout,
-                stderr,
-            } => Ok((code, stdout, stderr)),
-            _ => Err(MobfsError::Remote("invalid run response".to_string())),
-        }
+            )?;
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            loop {
+                match protocol::read_frame::<Response>(stream)? {
+                    Response::RunOutput { stream, data } => match stream {
+                        RunStream::Stdout => {
+                            print!("{}", String::from_utf8_lossy(&data));
+                            stdout.extend(data);
+                        }
+                        RunStream::Stderr => {
+                            eprint!("{}", String::from_utf8_lossy(&data));
+                            stderr.extend(data);
+                        }
+                    },
+                    Response::RunResult { code, .. } => return Ok((code, stdout, stderr)),
+                    Response::Error { message } => return Err(MobfsError::Remote(message)),
+                    _ => return Err(MobfsError::Remote("invalid run response".to_string())),
+                }
+            }
+        })
     }
 
     fn reconnect(&mut self) -> Result<()> {
@@ -297,6 +358,18 @@ impl RemoteClient {
                 Err(error) => return Err(error),
             }
         }
+    }
+}
+
+fn mode(metadata: &fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        metadata.permissions().mode() & 0o7777
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        0
     }
 }
 

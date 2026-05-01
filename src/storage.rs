@@ -4,9 +4,12 @@ use crate::error::{MobfsError, Result};
 use crate::local;
 use crate::remote::RemoteClient;
 use crate::snapshot::{EntryKind, EntryMeta, Snapshot};
+use sha2::Digest;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -98,8 +101,25 @@ impl FolderClient {
             if local::should_ignore_rel(&self.config, &rel) || provider_noise(&rel) {
                 continue;
             }
-            let metadata = item.metadata()?;
-            if metadata.is_dir() {
+            let metadata = fs::symlink_metadata(path)?;
+            if metadata.file_type().is_symlink() {
+                let target = fs::read_link(path)?;
+                let target = target
+                    .to_str()
+                    .ok_or_else(|| MobfsError::InvalidPath(path.display().to_string()))?
+                    .to_string();
+                entries.insert(
+                    rel,
+                    EntryMeta {
+                        kind: EntryKind::Symlink,
+                        size: target.len() as u64,
+                        modified: modified_secs(&metadata),
+                        sha256: Some(hex::encode(sha2::Sha256::digest(target.as_bytes()))),
+                        mode: mode(&metadata),
+                        link_target: Some(target),
+                    },
+                );
+            } else if metadata.is_dir() {
                 entries.insert(
                     rel,
                     EntryMeta {
@@ -107,6 +127,8 @@ impl FolderClient {
                         size: 0,
                         modified: 0,
                         sha256: None,
+                        mode: mode(&metadata),
+                        link_target: None,
                     },
                 );
             } else if metadata.is_file() {
@@ -117,6 +139,8 @@ impl FolderClient {
                         size: metadata.len(),
                         modified: modified_secs(&metadata),
                         sha256: Some(local::file_sha256(path)?),
+                        mode: mode(&metadata),
+                        link_target: None,
                     },
                 );
             }
@@ -127,7 +151,22 @@ impl FolderClient {
     fn download_file(&self, rel: &str, meta: &EntryMeta) -> Result<()> {
         let src = safe_join(&self.root, rel)?;
         let dst = self.config.local.root.join(rel);
+        if meta.kind == EntryKind::Symlink {
+            let target = meta
+                .link_target
+                .as_ref()
+                .ok_or_else(|| MobfsError::Remote("symlink target missing".to_string()))?;
+            let _ = fs::remove_file(&dst);
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(target, &dst)?;
+            #[cfg(not(unix))]
+            return Err(MobfsError::Remote(
+                "symlinks are not supported on this platform".to_string(),
+            ));
+            return Ok(());
+        }
         copy_file_atomic(&src, &dst)?;
+        daemon::set_mode(&dst, meta.mode)?;
         daemon::set_mtime(&dst, meta.modified)?;
         Ok(())
     }
@@ -135,7 +174,20 @@ impl FolderClient {
     fn upload_file(&self, rel: &str) -> Result<()> {
         let src = self.config.local.root.join(rel);
         let dst = safe_join(&self.root, rel)?;
-        copy_file_atomic(&src, &dst)
+        let metadata = fs::symlink_metadata(&src)?;
+        if metadata.file_type().is_symlink() {
+            let target = fs::read_link(&src)?;
+            let _ = fs::remove_file(&dst);
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(target, &dst)?;
+            #[cfg(not(unix))]
+            return Err(MobfsError::Remote(
+                "symlinks are not supported on this platform".to_string(),
+            ));
+            return Ok(());
+        }
+        copy_file_atomic(&src, &dst)?;
+        daemon::set_mode(&dst, mode(&metadata))
     }
 
     fn mkdir_p(&self, rel: &str) -> Result<()> {
@@ -171,6 +223,18 @@ pub fn backend_label(backend: &StorageBackend) -> &'static str {
         StorageBackend::S3 => "s3",
         StorageBackend::Icloud => "icloud",
         StorageBackend::Gdrive => "gdrive",
+    }
+}
+
+fn mode(metadata: &fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        metadata.permissions().mode() & 0o7777
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        0
     }
 }
 

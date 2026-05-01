@@ -80,6 +80,7 @@ pub fn mount(args: MountArgs) -> Result<()> {
     let remote = client.snapshot()?;
     let local_snapshot = local::snapshot(&config)?;
     let plan = pull_items(&local_snapshot, &remote, false);
+    ensure_local_dirs(&config, &remote)?;
     apply_plan(&mut client, &config, &remote, &plan)?;
     local::save_snapshot(&config, &remote)?;
     spinner.finish_and_clear();
@@ -110,7 +111,6 @@ fn new_config(
         sync: SyncConfig {
             ignore: vec![
                 STATE_DIR.to_string(),
-                ".git".to_string(),
                 "target".to_string(),
                 "node_modules".to_string(),
                 ".mobfs.toml".to_string(),
@@ -141,6 +141,7 @@ pub fn pull(args: PullArgs) -> Result<()> {
     spinner.set_message("pulling files");
     let plan = pull_items(&local_snapshot, &remote, args.delete);
     let count = plan.len();
+    ensure_local_dirs(&config, &remote)?;
     apply_plan(&mut client, &config, &remote, &plan)?;
     local::save_snapshot(&config, &remote)?;
     spinner.finish_and_clear();
@@ -248,9 +249,7 @@ fn run_remote(command: Vec<String>, sync_first: bool) -> Result<()> {
     let mut client = StorageClient::connect(config)?;
     let label = command.join(" ");
     ui::info("run", label);
-    let (code, stdout, stderr) = client.run(command)?;
-    print!("{}", String::from_utf8_lossy(&stdout));
-    eprint!("{}", String::from_utf8_lossy(&stderr));
+    let (code, _, _) = client.run(command)?;
     if code.unwrap_or(1) == 0 {
         Ok(())
     } else {
@@ -532,6 +531,15 @@ fn push_plan(client: &mut StorageClient, local_snapshot: &Snapshot, delete: bool
         }
     }
     Ok(count)
+}
+
+fn ensure_local_dirs(config: &AppConfig, remote: &Snapshot) -> Result<()> {
+    for (rel, meta) in &remote.entries {
+        if meta.kind == EntryKind::Dir {
+            fs::create_dir_all(config.local.root.join(rel))?;
+        }
+    }
+    Ok(())
 }
 
 fn ensure_remote_dirs(client: &mut StorageClient, local_snapshot: &Snapshot) -> Result<()> {

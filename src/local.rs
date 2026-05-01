@@ -4,6 +4,8 @@ use crate::snapshot::{EntryKind, EntryMeta, Snapshot};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path};
 use std::time::UNIX_EPOCH;
 use walkdir::WalkDir;
@@ -20,8 +22,25 @@ pub fn snapshot(config: &AppConfig) -> Result<Snapshot> {
         if should_ignore_rel(config, &rel) {
             continue;
         }
-        let metadata = item.metadata()?;
-        if metadata.is_dir() {
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() {
+            let target = fs::read_link(path)?;
+            let target = target
+                .to_str()
+                .ok_or_else(|| MobfsError::InvalidPath(path.display().to_string()))?
+                .to_string();
+            entries.insert(
+                rel,
+                EntryMeta {
+                    kind: EntryKind::Symlink,
+                    size: target.len() as u64,
+                    modified: modified_secs(&metadata),
+                    sha256: Some(hex::encode(Sha256::digest(target.as_bytes()))),
+                    mode: mode(&metadata),
+                    link_target: Some(target),
+                },
+            );
+        } else if metadata.is_dir() {
             entries.insert(
                 rel,
                 EntryMeta {
@@ -29,6 +48,8 @@ pub fn snapshot(config: &AppConfig) -> Result<Snapshot> {
                     size: 0,
                     modified: 0,
                     sha256: None,
+                    mode: mode(&metadata),
+                    link_target: None,
                 },
             );
         } else if metadata.is_file() {
@@ -39,6 +60,8 @@ pub fn snapshot(config: &AppConfig) -> Result<Snapshot> {
                     size: metadata.len(),
                     modified: modified_secs(&metadata),
                     sha256: Some(file_sha256(path)?),
+                    mode: mode(&metadata),
+                    link_target: None,
                 },
             );
         }
@@ -103,6 +126,18 @@ pub fn file_sha256(path: &Path) -> Result<String> {
         hasher.update(&buffer[..read]);
     }
     Ok(hex::encode(hasher.finalize()))
+}
+
+fn mode(metadata: &fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        metadata.permissions().mode() & 0o7777
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        0
+    }
 }
 
 fn modified_secs(metadata: &fs::Metadata) -> i64 {

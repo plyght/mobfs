@@ -50,7 +50,6 @@ pub fn config_from_remote(
         sync: SyncConfig {
             ignore: vec![
                 ".mobfs".to_string(),
-                ".git".to_string(),
                 "target".to_string(),
                 "node_modules".to_string(),
                 ".mobfs.toml".to_string(),
@@ -66,6 +65,7 @@ struct MobfsFuse {
     snapshot: Mutex<Snapshot>,
     path_to_ino: Mutex<BTreeMap<String, u64>>,
     ino_to_path: Mutex<BTreeMap<u64, String>>,
+    read_cache: Mutex<BTreeMap<(String, u64, u32), Vec<u8>>>,
 }
 
 impl MobfsFuse {
@@ -86,6 +86,7 @@ impl MobfsFuse {
             snapshot: Mutex::new(snapshot),
             path_to_ino: Mutex::new(path_to_ino),
             ino_to_path: Mutex::new(ino_to_path),
+            read_cache: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -130,10 +131,16 @@ impl MobfsFuse {
             kind: match kind {
                 EntryKind::File => FileType::RegularFile,
                 EntryKind::Dir => FileType::Directory,
+                EntryKind::Symlink => FileType::Symlink,
             },
-            perm: match kind {
-                EntryKind::File => 0o644,
-                EntryKind::Dir => 0o755,
+            perm: if meta.map(|m| m.mode).unwrap_or(0) != 0 {
+                meta.map(|m| m.mode as u16).unwrap_or(0o755)
+            } else {
+                match kind {
+                    EntryKind::File => 0o644,
+                    EntryKind::Dir => 0o755,
+                    EntryKind::Symlink => 0o777,
+                }
             },
             nlink: 1,
             uid: unsafe { libc::getuid() },
@@ -162,10 +169,7 @@ impl Filesystem for MobfsFuse {
             }
         };
         let path = join_rel(&parent_path, name);
-        if self.refresh().is_err() {
-            reply.error(Errno::EIO);
-            return;
-        }
+        let _ = self.refresh();
         let snapshot = self.snapshot.lock().unwrap();
         match snapshot.entries.get(&path) {
             Some(meta) => reply.entry(
@@ -217,10 +221,7 @@ impl Filesystem for MobfsFuse {
                 return;
             }
         };
-        if self.refresh().is_err() {
-            reply.error(Errno::EIO);
-            return;
-        }
+        let _ = self.refresh();
         let snapshot = self.snapshot.lock().unwrap();
         let mut entries = vec![(u64::from(ino), FileType::Directory, ".".to_string())];
         entries.push((1, FileType::Directory, "..".to_string()));
@@ -230,6 +231,7 @@ impl Filesystem for MobfsFuse {
                 let kind = match meta.kind {
                     EntryKind::File => FileType::RegularFile,
                     EntryKind::Dir => FileType::Directory,
+                    EntryKind::Symlink => FileType::Symlink,
                 };
                 entries.push((inode_for(path), kind, name));
             }
@@ -268,14 +270,21 @@ impl Filesystem for MobfsFuse {
                 return;
             }
         };
+        let key = (path.clone(), offset, size);
         match self
             .client
             .lock()
             .unwrap()
             .read_file_chunk(&path, offset, size as u64)
         {
-            Ok((data, _)) => reply.data(&data),
-            Err(_) => reply.error(Errno::EIO),
+            Ok((data, _)) => {
+                self.read_cache.lock().unwrap().insert(key, data.clone());
+                reply.data(&data);
+            }
+            Err(_) => match self.read_cache.lock().unwrap().get(&key) {
+                Some(data) => reply.data(data),
+                None => reply.error(Errno::EIO),
+            },
         }
     }
 
@@ -510,6 +519,8 @@ impl MobfsFuse {
             size: 0,
             modified: 0,
             sha256: None,
+            mode: 0,
+            link_target: None,
         };
         match self.client.lock().unwrap().remove(&path, &meta) {
             Ok(()) => {

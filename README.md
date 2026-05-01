@@ -13,7 +13,8 @@ The mosh-inspired filesystem layer for remote development. mobfs gives Finder, e
 - **Resilient Sync Loop**: Watches local changes, scans remote changes, reconnects after drops, and keeps both sides converged
 - **Remote Authority**: Stores the canonical project tree on a remote machine through `mobfsd`
 - **Remote Compute**: Syncs local edits, then runs commands such as builds, tests, and git operations on the machine that owns the code
-- **Encrypted Protocol**: Authenticates with a shared token, performs an X25519 handshake, derives session keys with HKDF-SHA256, and encrypts chunked file-transfer frames with ChaCha20-Poly1305
+- **Repository Semantics**: Syncs `.git` by default and preserves executable bits, symlinks, empty directories, and large chunked files for coding-agent workflows
+- **Encrypted Protocol**: Authenticates with a shared token, performs an X25519 handshake, derives directional session keys with HKDF-SHA256, verifies auth tags in constant time, and encrypts chunked file-transfer frames with ChaCha20-Poly1305
 - **Daemon Root Policy**: Restricts mobfsd to explicitly allowed canonical workspace roots with repeatable `--allow-root` flags
 - **Conflict Safety**: Uses a saved snapshot as the sync base and writes conflict copies instead of clobbering divergent edits
 - **Provider Backends**: Supports iCloud and Google Drive folder-backed workspaces through the provider's local sync client
@@ -117,7 +118,7 @@ token = "change-me"
 root = "/Users/me/MobFS/project"
 
 [sync]
-ignore = [".mobfs", ".git", "target", "node_modules", ".mobfs.toml"]
+ignore = [".mobfs", "target", "node_modules", ".mobfs.toml"]
 connect_retries = 8
 operation_retries = 5
 ```
@@ -163,7 +164,7 @@ The config schema also reserves `r2` and `s3` backend names for future object-st
 - `remote.rs`: Client connection, protocol calls, retries, and remote operation wrappers
 - `crypto.rs`: Token-authenticated handshake and encrypted stream framing
 - `protocol.rs`: Versioned request and response messages over the encrypted chunked transport
-- `snapshot.rs`: File metadata snapshots, diff planning, status output, and conflict decisions
+- `snapshot.rs`: File metadata snapshots, symlink/mode tracking, diff planning, status output, and conflict decisions
 - `local.rs`: Local tree scanning, ignore handling, hashing, and snapshot persistence
 - `storage.rs`: Unified storage abstraction for daemon and provider-folder backends
 - `mountfs.rs`: Optional FUSE filesystem for real on-demand remote tree mounting
@@ -180,7 +181,7 @@ cargo fmt --check
 cargo clippy --all-targets --all-features
 ```
 
-Requires Rust with edition 2024 support. Key dependencies include clap, notify, serde/toml, walkdir, indicatif, x25519-dalek, hkdf, sha2, and chacha20poly1305. Integration tests use tempfile.
+Requires Rust with edition 2024 support. Key dependencies include clap, notify, serde/toml, walkdir, indicatif, x25519-dalek, hkdf, sha2, subtle, and chacha20poly1305. Integration tests use tempfile.
 
 ## License
 
