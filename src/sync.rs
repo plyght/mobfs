@@ -1,0 +1,478 @@
+use crate::cli::{
+    InitArgs, MountArgs, PullArgs, PushArgs, RunArgs, ServeArgs, SyncArgs, WatchArgs,
+};
+use crate::config::{
+    AppConfig, DEFAULT_CONNECT_RETRIES, DEFAULT_OP_RETRIES, LocalConfig, RemoteConfig, STATE_DIR,
+    SyncConfig, parse_remote,
+};
+use crate::error::{MobfsError, Result};
+use crate::local;
+use crate::remote::RemoteClient;
+use crate::snapshot::{
+    EntryKind, PlanItem, Snapshot, StatusItem, pull_items, push_items, status_plan, sync_items,
+};
+use crate::ui;
+use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
+use std::fs;
+use std::process::Command;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::{Duration, Instant};
+
+pub fn init(args: InitArgs) -> Result<()> {
+    let target = parse_remote(&args.remote)?;
+    let root = args.local.unwrap_or(std::env::current_dir()?);
+    let config = new_config(target, root, args.port, args.token);
+    write_config(&config)?;
+    ui::ok("initialized .mobfs.toml");
+    Ok(())
+}
+
+pub fn mount(args: MountArgs) -> Result<()> {
+    let target = parse_remote(&args.remote)?;
+    let root = match args.local {
+        Some(path) => path,
+        None => default_mount_root(args.name.as_deref(), &target.host, &target.path)?,
+    };
+    let config = new_config(target, root.clone(), args.port, args.token);
+    write_config(&config)?;
+    ui::added("mounted", root.display().to_string());
+    let spinner = ui::spinner("initial pull");
+    let mut client = RemoteClient::connect(config.clone())?;
+    let remote = client.snapshot()?;
+    let local_snapshot = local::snapshot(&config)?;
+    let plan = pull_items(&local_snapshot, &remote, false);
+    apply_plan(&mut client, &config, &remote, &plan)?;
+    local::save_snapshot(&config, &remote)?;
+    spinner.finish_and_clear();
+    if !args.no_open {
+        open_path(&root)?;
+    }
+    ui::ok("ready");
+    Ok(())
+}
+
+fn new_config(
+    target: crate::config::RemoteTarget,
+    root: std::path::PathBuf,
+    port: u16,
+    token: Option<String>,
+) -> AppConfig {
+    AppConfig {
+        remote: RemoteConfig {
+            host: target.host,
+            user: String::new(),
+            path: target.path,
+            port,
+            identity: None,
+            token,
+        },
+        local: LocalConfig { root },
+        sync: SyncConfig {
+            ignore: vec![
+                STATE_DIR.to_string(),
+                ".git".to_string(),
+                "target".to_string(),
+                "node_modules".to_string(),
+                ".mobfs.toml".to_string(),
+            ],
+            connect_retries: DEFAULT_CONNECT_RETRIES,
+            operation_retries: DEFAULT_OP_RETRIES,
+        },
+    }
+}
+
+fn write_config(config: &AppConfig) -> Result<()> {
+    fs::create_dir_all(config.local.root.join(STATE_DIR))?;
+    let previous = std::env::current_dir()?;
+    fs::create_dir_all(&config.local.root)?;
+    std::env::set_current_dir(&config.local.root)?;
+    let result = config.save();
+    std::env::set_current_dir(previous)?;
+    result
+}
+
+pub fn pull(args: PullArgs) -> Result<()> {
+    let config = AppConfig::load()?;
+    let spinner = ui::spinner("connecting");
+    let mut client = RemoteClient::connect(config.clone())?;
+    spinner.set_message("scanning remote");
+    let remote = client.snapshot()?;
+    let local_snapshot = local::snapshot(&config)?;
+    spinner.set_message("pulling files");
+    let plan = pull_items(&local_snapshot, &remote, args.delete);
+    let count = plan.len();
+    apply_plan(&mut client, &config, &remote, &plan)?;
+    local::save_snapshot(&config, &remote)?;
+    spinner.finish_and_clear();
+    if count == 0 {
+        ui::ok("already up to date");
+    } else {
+        ui::summary("changes pulled", count);
+    }
+    Ok(())
+}
+
+pub fn push(args: PushArgs) -> Result<()> {
+    let config = AppConfig::load()?;
+    let spinner = ui::spinner("scanning local");
+    let local_snapshot = local::snapshot(&config)?;
+    spinner.set_message("connecting");
+    let mut client = RemoteClient::connect(config.clone())?;
+    spinner.set_message("pushing changes");
+    let count = push_plan(&mut client, &config, &local_snapshot, args.delete)?;
+    let remote = client.snapshot()?;
+    local::save_snapshot(&config, &remote)?;
+    spinner.finish_and_clear();
+    if count == 0 {
+        ui::ok("already up to date");
+    } else {
+        ui::summary("changes pushed", count);
+    }
+    Ok(())
+}
+
+pub fn sync(args: SyncArgs) -> Result<()> {
+    let config = AppConfig::load()?;
+    let spinner = ui::spinner("scanning local and remote");
+    let base = local::load_snapshot(&config)?;
+    let local_snapshot = local::snapshot(&config)?;
+    let mut client = RemoteClient::connect(config.clone())?;
+    let remote = client.snapshot()?;
+    spinner.finish_and_clear();
+    let plan = sync_items(&base, &local_snapshot, &remote, args.delete);
+    if plan
+        .iter()
+        .any(|item| matches!(item, PlanItem::Conflict(_)))
+    {
+        for item in &plan {
+            if let PlanItem::Conflict(path) = item {
+                ui::change("conflict", path);
+            }
+        }
+        return Err(MobfsError::Remote(
+            "sync stopped because both sides changed the same path".to_string(),
+        ));
+    }
+    let count = plan.len();
+    apply_plan(&mut client, &config, &remote, &plan)?;
+    let remote = client.snapshot()?;
+    local::save_snapshot(&config, &remote)?;
+    if count == 0 {
+        ui::ok("clean");
+    } else {
+        ui::summary("changes synced", count);
+    }
+    Ok(())
+}
+
+pub fn status() -> Result<()> {
+    let config = AppConfig::load()?;
+    let spinner = ui::spinner("scanning local and remote");
+    let local_snapshot = local::snapshot(&config)?;
+    let mut client = RemoteClient::connect(config)?;
+    let remote = client.snapshot()?;
+    spinner.finish_and_clear();
+    let items = status_plan(&local_snapshot, &remote);
+    if items.is_empty() {
+        ui::ok("clean");
+        return Ok(());
+    }
+    let count = items.len();
+    for item in items {
+        match item {
+            StatusItem::LocalOnly(path) => ui::change("local-only", path),
+            StatusItem::RemoteOnly(path) => ui::change("remote-only", path),
+            StatusItem::Modified(path) => ui::change("modified", path),
+        }
+    }
+    ui::summary("differences", count);
+    Ok(())
+}
+
+pub fn run(args: RunArgs) -> Result<()> {
+    let config = AppConfig::load()?;
+    let mut client = RemoteClient::connect(config)?;
+    let command = args.command.join(" ");
+    ui::info("run", command);
+    let (code, stdout, stderr) = client.run(args.command)?;
+    print!("{}", String::from_utf8_lossy(&stdout));
+    eprint!("{}", String::from_utf8_lossy(&stderr));
+    if code.unwrap_or(1) == 0 {
+        Ok(())
+    } else {
+        Err(MobfsError::Remote(format!(
+            "remote command exited with {}",
+            code.map(|value| value.to_string())
+                .unwrap_or_else(|| "signal".to_string())
+        )))
+    }
+}
+
+pub fn doctor() -> Result<()> {
+    let config = AppConfig::load()?;
+    ui::info("local", config.local.root.display().to_string());
+    ui::info(
+        "remote",
+        format!("{}:{}", config.remote.host, config.remote.path),
+    );
+    let spinner = ui::spinner("checking daemon");
+    let mut client = RemoteClient::connect(config.clone())?;
+    spinner.set_message("scanning remote");
+    let _ = client.snapshot()?;
+    spinner.finish_and_clear();
+    ui::ok("workspace ready");
+    Ok(())
+}
+
+pub fn watch(args: WatchArgs) -> Result<()> {
+    watch_push_loop(args.debounce_ms, args.delete)
+}
+
+pub fn serve(args: ServeArgs) -> Result<()> {
+    let config = AppConfig::load()?;
+    let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
+    let mut watcher = RecommendedWatcher::new(tx, NotifyConfig::default())?;
+    watcher.watch(&config.local.root, RecursiveMode::Recursive)?;
+    ui::info("serving", config.local.root.display().to_string());
+    let debounce = Duration::from_millis(args.debounce_ms);
+    let remote_interval = Duration::from_secs(args.remote_interval.max(1));
+    let mut last_change: Option<Instant> = None;
+    let mut last_remote_scan = Instant::now() - remote_interval;
+    loop {
+        match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(Ok(event)) => {
+                if event
+                    .paths
+                    .iter()
+                    .any(|path| local::should_ignore_path(&config, path))
+                {
+                    continue;
+                }
+                last_change = Some(Instant::now());
+            }
+            Ok(Err(error)) => ui::warn(format!("watch error: {error}")),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(MobfsError::Remote("watcher disconnected".to_string()));
+            }
+        }
+        if last_change
+            .map(|instant| instant.elapsed() >= debounce)
+            .unwrap_or(false)
+            || last_remote_scan.elapsed() >= remote_interval
+        {
+            resilient_sync_once(&config, args.delete)?;
+            last_change = None;
+            last_remote_scan = Instant::now();
+        }
+    }
+}
+
+pub fn open() -> Result<()> {
+    let config = AppConfig::load()?;
+    open_path(&config.local.root)
+}
+
+fn watch_push_loop(debounce_ms: u64, delete: bool) -> Result<()> {
+    let config = AppConfig::load()?;
+    let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
+    let mut watcher = RecommendedWatcher::new(tx, NotifyConfig::default())?;
+    watcher.watch(&config.local.root, RecursiveMode::Recursive)?;
+    ui::info("watching", config.local.root.display().to_string());
+    let debounce = Duration::from_millis(debounce_ms);
+    let mut last_change: Option<Instant> = None;
+    loop {
+        match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(Ok(event)) => {
+                if event
+                    .paths
+                    .iter()
+                    .any(|path| local::should_ignore_path(&config, path))
+                {
+                    continue;
+                }
+                last_change = Some(Instant::now());
+            }
+            Ok(Err(error)) => ui::warn(format!("watch error: {error}")),
+            Err(RecvTimeoutError::Timeout) => {
+                if last_change
+                    .map(|instant| instant.elapsed() >= debounce)
+                    .unwrap_or(false)
+                {
+                    let local_snapshot = local::snapshot(&config)?;
+                    let mut client = RemoteClient::connect(config.clone())?;
+                    push_plan(&mut client, &config, &local_snapshot, delete)?;
+                    let remote = client.snapshot()?;
+                    local::save_snapshot(&config, &remote)?;
+                    last_change = None;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(MobfsError::Remote("watcher disconnected".to_string()));
+            }
+        }
+    }
+}
+
+fn resilient_sync_once(config: &AppConfig, delete: bool) -> Result<()> {
+    let base = local::load_snapshot(config)?;
+    let local_snapshot = local::snapshot(config)?;
+    let mut client = RemoteClient::connect(config.clone())?;
+    let remote = client.snapshot()?;
+    let plan = sync_items(&base, &local_snapshot, &remote, delete);
+    if plan.is_empty() {
+        return Ok(());
+    }
+    if plan
+        .iter()
+        .any(|item| matches!(item, PlanItem::Conflict(_)))
+    {
+        for item in &plan {
+            if let PlanItem::Conflict(path) = item {
+                write_conflict_copy(config, path)?;
+                ui::change("conflict", path);
+            }
+        }
+        return Ok(());
+    }
+    apply_plan(&mut client, config, &remote, &plan)?;
+    let remote = client.snapshot()?;
+    local::save_snapshot(config, &remote)?;
+    Ok(())
+}
+
+fn write_conflict_copy(config: &AppConfig, rel: &str) -> Result<()> {
+    let path = config.local.root.join(rel);
+    if !path.is_file() {
+        return Ok(());
+    }
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| MobfsError::InvalidPath(path.display().to_string()))?;
+    let conflict = path.with_file_name(format!("{name}.mobfs-conflict-local"));
+    fs::copy(path, conflict)?;
+    Ok(())
+}
+
+fn apply_plan(
+    client: &mut RemoteClient,
+    config: &AppConfig,
+    remote: &Snapshot,
+    plan: &[PlanItem],
+) -> Result<()> {
+    for item in plan {
+        match item {
+            PlanItem::Put(rel) => {
+                ui::change("put", rel);
+                client.upload_file(rel)?;
+            }
+            PlanItem::Get(rel) => {
+                ui::change("get", rel);
+                if let Some(meta) = remote.entries.get(rel) {
+                    client.download_file(rel, meta)?;
+                }
+            }
+            PlanItem::DeleteLocal(rel) => {
+                ui::change("delete-local", rel);
+                remove_local(config, rel)?;
+            }
+            PlanItem::DeleteRemote(rel) => {
+                if let Some(meta) = remote.entries.get(rel) {
+                    ui::change("delete-remote", rel);
+                    client.remove(rel, meta)?;
+                }
+            }
+            PlanItem::Conflict(rel) => ui::change("conflict", rel),
+        }
+    }
+    Ok(())
+}
+
+fn default_mount_root(
+    name: Option<&str>,
+    host: &str,
+    remote_path: &str,
+) -> Result<std::path::PathBuf> {
+    let home = dirs::home_dir()
+        .ok_or_else(|| MobfsError::Config("home directory not found".to_string()))?;
+    let fallback = remote_path
+        .trim_matches('/')
+        .replace('/', "-")
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_' || *ch == '.')
+        .collect::<String>();
+    let workspace = name
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{host}-{}", fallback));
+    Ok(home.join("MobFS").join(workspace))
+}
+
+fn open_path(path: &std::path::Path) -> Result<()> {
+    let status = if cfg!(target_os = "macos") {
+        Command::new("open").arg(path).status()?
+    } else if cfg!(target_os = "windows") {
+        Command::new("explorer").arg(path).status()?
+    } else {
+        Command::new("xdg-open").arg(path).status()?
+    };
+    if status.success() {
+        Ok(())
+    } else {
+        Err(MobfsError::Remote(format!(
+            "failed to open {}",
+            path.display()
+        )))
+    }
+}
+
+fn remove_local(config: &AppConfig, rel: &str) -> Result<()> {
+    let path = config.local.root.join(rel);
+    if path.is_dir() {
+        fs::remove_dir_all(path)?;
+    } else if path.exists() {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn push_plan(
+    client: &mut RemoteClient,
+    config: &AppConfig,
+    local_snapshot: &Snapshot,
+    delete: bool,
+) -> Result<usize> {
+    let remote = client.snapshot()?;
+    ensure_remote_dirs(client, local_snapshot, config)?;
+    let plan = push_items(local_snapshot, &remote, delete);
+    let count = plan.len();
+    for item in plan {
+        match item {
+            PlanItem::Put(rel) => {
+                ui::change("put", &rel);
+                client.upload_file(&rel)?;
+            }
+            PlanItem::DeleteRemote(rel) => {
+                if let Some(meta) = remote.entries.get(&rel) {
+                    ui::change("delete", &rel);
+                    client.remove(&rel, meta)?;
+                }
+            }
+            PlanItem::Get(_) | PlanItem::DeleteLocal(_) | PlanItem::Conflict(_) => {}
+        }
+    }
+    Ok(count)
+}
+
+fn ensure_remote_dirs(
+    client: &mut RemoteClient,
+    local_snapshot: &Snapshot,
+    config: &AppConfig,
+) -> Result<()> {
+    for (rel, meta) in &local_snapshot.entries {
+        if meta.kind == EntryKind::Dir {
+            client.mkdir_p(&format!("{}/{}", config.remote.path, rel))?;
+        }
+    }
+    Ok(())
+}
