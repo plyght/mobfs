@@ -105,6 +105,19 @@ fn mobfs(cwd: &Path, args: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn cli_is_no_local_code_first() {
+    let temp = TempDir::new().unwrap();
+    let output = mobfs(temp.path(), &["--help"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Mount a no-local-code"), "{stdout}");
+    assert!(
+        stdout.contains("Create/open a durable local mirror"),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn token_and_setup_are_safe_by_default() {
     let temp = TempDir::new().unwrap();
     let output = mobfs(temp.path(), &["token"]);
@@ -130,7 +143,8 @@ fn token_and_setup_are_safe_by_default() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("--bind 127.0.0.1:7727"), "{stdout}");
-    assert!(stdout.contains("devbox:"), "{stdout}");
+    assert!(stdout.contains("mobfs mount devbox:"), "{stdout}");
+    assert!(stdout.contains("mobfs mirror devbox:"), "{stdout}");
     assert!(stdout.contains("--ssh-tunnel --name app"), "{stdout}");
 }
 
@@ -165,7 +179,7 @@ fn daemon_mount_push_pull_and_run_roundtrip() {
     let output = mobfs(
         temp.path(),
         &[
-            "mount",
+            "mirror",
             &remote_arg,
             "--local",
             local.to_str().unwrap(),
@@ -277,7 +291,7 @@ fn daemon_allows_descendants_of_allowed_roots() {
     let output = mobfs(
         temp.path(),
         &[
-            "mount",
+            "mirror",
             &remote_arg,
             "--local",
             local.to_str().unwrap(),
@@ -310,7 +324,7 @@ fn daemon_rejects_roots_outside_allowlist() {
     let output = mobfs(
         temp.path(),
         &[
-            "mount",
+            "mirror",
             &remote_arg,
             "--local",
             local.to_str().unwrap(),
@@ -338,7 +352,7 @@ fn git_command_runs_on_remote_after_syncing() {
     let output = mobfs(
         temp.path(),
         &[
-            "mount",
+            "mirror",
             &remote_arg,
             "--local",
             local.to_str().unwrap(),
@@ -387,7 +401,7 @@ fn sync_preserves_symlinks_and_executable_bits() {
     let output = mobfs(
         temp.path(),
         &[
-            "mount",
+            "mirror",
             &remote_arg,
             "--local",
             local.to_str().unwrap(),
@@ -606,7 +620,7 @@ fn sync_stops_on_same_path_conflict() {
     let output = mobfs(
         temp.path(),
         &[
-            "mount",
+            "mirror",
             &remote_arg,
             "--local",
             local.to_str().unwrap(),
@@ -652,7 +666,7 @@ fn resilient_sync_conflict_returns_failure() {
     let output = mobfs(
         temp.path(),
         &[
-            "mount",
+            "mirror",
             &remote_arg,
             "--local",
             local.to_str().unwrap(),
@@ -690,7 +704,7 @@ fn network_drop_during_upload_recovers() {
     let output = mobfs(
         temp.path(),
         &[
-            "mount",
+            "mirror",
             &remote_arg,
             "--local",
             local.to_str().unwrap(),
@@ -736,7 +750,7 @@ fn network_drop_during_download_recovers() {
     let output = mobfs(
         temp.path(),
         &[
-            "mount",
+            "mirror",
             &remote_arg,
             "--local",
             local.to_str().unwrap(),
@@ -779,7 +793,7 @@ fn network_drop_during_git_index_write_recovers() {
     let output = mobfs(
         temp.path(),
         &[
-            "mount",
+            "mirror",
             &remote_arg,
             "--local",
             local.to_str().unwrap(),
@@ -828,7 +842,7 @@ fn network_drop_during_agent_style_temp_file_write_recovers() {
     let output = mobfs(
         temp.path(),
         &[
-            "mount",
+            "mirror",
             &remote_arg,
             "--local",
             local.to_str().unwrap(),
@@ -875,7 +889,7 @@ fn reconnects_after_daemon_restart_for_later_operations() {
     let output = mobfs(
         temp.path(),
         &[
-            "mount",
+            "mirror",
             &remote_arg,
             "--local",
             local.to_str().unwrap(),

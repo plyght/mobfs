@@ -143,6 +143,7 @@ fn request_label(request: &Request) -> &'static str {
         Request::WriteFileOffset { .. } => "WriteFileOffset",
         Request::WriteFileAt { .. } => "WriteFileAt",
         Request::Truncate { .. } => "Truncate",
+        Request::Fsync { .. } => "Fsync",
         Request::Rename { .. } => "Rename",
         Request::WriteFileFinish { .. } => "WriteFileFinish",
         Request::Symlink { .. } => "Symlink",
@@ -299,6 +300,14 @@ fn handle_request(request: Request, policy: &RootPolicy) -> Result<Response> {
                 .truncate(false)
                 .open(path)?;
             file.set_len(size)?;
+            Ok(Response::Ok)
+        }
+        Request::Fsync { root, rel } => {
+            let root = policy.check(&root)?;
+            fs::OpenOptions::new()
+                .read(true)
+                .open(safe_join(&root, &rel)?)?
+                .sync_all()?;
             Ok(Response::Ok)
         }
         Request::Rename { root, from, to } => {

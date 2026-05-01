@@ -3,7 +3,7 @@ use crate::error::{MobfsError, Result};
 use crate::snapshot::Snapshot;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
@@ -63,6 +63,10 @@ pub enum Request {
         root: String,
         rel: String,
         size: u64,
+    },
+    Fsync {
+        root: String,
+        rel: String,
     },
     Rename {
         root: String,

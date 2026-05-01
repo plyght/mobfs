@@ -17,9 +17,11 @@ pub enum Command {
     #[command(about = "Mount if needed, then run the resilient sync loop  [alias: up]")]
     #[command(visible_alias = "up")]
     Start(StartArgs),
-    #[command(about = "Create/open a visible local workspace backed by mobfsd")]
+    #[command(about = "Mount a no-local-code on-demand read-write filesystem")]
     Mount(MountArgs),
-    #[command(about = "Mount a real on-demand read-write FUSE filesystem")]
+    #[command(about = "Create/open a durable local mirror workspace backed by mobfsd")]
+    Mirror(MountArgs),
+    #[command(about = "Mount a no-local-code on-demand read-write FUSE filesystem")]
     Mountfs(MountFsArgs),
     #[command(about = "Pull remote files into the local workspace  [alias: get]")]
     #[command(visible_alias = "get")]
@@ -104,9 +106,12 @@ pub struct StartArgs {
 pub struct MountArgs {
     #[arg(help = "Remote root like host:/absolute/path")]
     pub remote: String,
-    #[arg(long, help = "Workspace name under ~/MobFS")]
+    #[arg(
+        long,
+        help = "Workspace name under /Volumes on macOS or ~/MobFSMounts elsewhere"
+    )]
     pub name: Option<String>,
-    #[arg(long, help = "Local visible workspace root")]
+    #[arg(long, help = "Local mountpoint or mirror root")]
     pub local: Option<PathBuf>,
     #[arg(long, default_value_t = 7727, help = "mobfsd port")]
     pub port: u16,

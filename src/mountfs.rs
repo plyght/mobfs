@@ -4,8 +4,8 @@ use crate::remote::RemoteClient;
 use crate::snapshot::{EntryKind, EntryMeta, Snapshot};
 use fuser::{
     Config, Errno, FileAttr, FileType, Filesystem, FopenFlags, INodeNo, MountOption, ReplyAttr,
-    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
-    TimeOrNow,
+    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLock, ReplyOpen,
+    ReplyWrite, ReplyXattr, Request, TimeOrNow,
 };
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
@@ -482,10 +482,12 @@ impl Filesystem for MobfsFuse {
         _lock_owner: fuser::LockOwner,
         reply: ReplyEmpty,
     ) {
-        if self.path_for_handle(ino, fh).is_some() {
-            reply.ok();
-        } else {
-            reply.error(Errno::ENOENT);
+        match self.path_for_handle(ino, fh) {
+            Some(path) => match self.client.lock().unwrap().fsync(&path) {
+                Ok(()) => reply.ok(),
+                Err(_) => reply.error(Errno::EIO),
+            },
+            None => reply.error(Errno::ENOENT),
         }
     }
 
@@ -497,11 +499,80 @@ impl Filesystem for MobfsFuse {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        if self.path_for_handle(ino, fh).is_some() {
-            reply.ok();
-        } else {
-            reply.error(Errno::ENOENT);
+        match self.path_for_handle(ino, fh) {
+            Some(path) => match self.client.lock().unwrap().fsync(&path) {
+                Ok(()) => reply.ok(),
+                Err(_) => reply.error(Errno::EIO),
+            },
+            None => reply.error(Errno::ENOENT),
         }
+    }
+
+    fn setxattr(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _name: &OsStr,
+        _value: &[u8],
+        _flags: i32,
+        _position: u32,
+        reply: ReplyEmpty,
+    ) {
+        reply.error(Errno::ENOTSUP);
+    }
+
+    fn getxattr(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _name: &OsStr,
+        _size: u32,
+        reply: ReplyXattr,
+    ) {
+        reply.error(Errno::ENOTSUP);
+    }
+
+    fn listxattr(&self, _req: &Request, _ino: INodeNo, size: u32, reply: ReplyXattr) {
+        if size == 0 {
+            reply.size(0);
+        } else {
+            reply.data(&[]);
+        }
+    }
+
+    fn removexattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
+        reply.error(Errno::ENOTSUP);
+    }
+
+    fn getlk(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: fuser::FileHandle,
+        _lock_owner: fuser::LockOwner,
+        start: u64,
+        end: u64,
+        typ: i32,
+        pid: u32,
+        reply: ReplyLock,
+    ) {
+        reply.locked(start, end, typ, pid);
+    }
+
+    fn setlk(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: fuser::FileHandle,
+        _lock_owner: fuser::LockOwner,
+        _start: u64,
+        _end: u64,
+        _typ: i32,
+        _pid: u32,
+        _sleep: bool,
+        reply: ReplyEmpty,
+    ) {
+        reply.ok();
     }
 
     fn setattr(

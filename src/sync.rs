@@ -30,7 +30,7 @@ pub fn init(args: InitArgs) -> Result<()> {
 
 pub fn start(args: StartArgs) -> Result<()> {
     if let Some(remote) = args.remote {
-        mount(MountArgs {
+        mirror(MountArgs {
             remote,
             name: args.name,
             local: args.local,
@@ -81,14 +81,40 @@ pub fn mountfs(args: MountFsArgs) -> Result<()> {
 }
 
 pub fn mount(args: MountArgs) -> Result<()> {
+    #[cfg(feature = "fuse")]
+    {
+        let target = parse_remote(&args.remote)?;
+        let root = match args.local {
+            Some(path) => path,
+            None => {
+                default_no_local_code_mountpoint(args.name.as_deref(), &target.host, &target.path)?
+            }
+        };
+        let config = new_config(target, root.clone(), args.port, args.token, args.ssh_tunnel);
+        ui::added(
+            "mounting no-local-code filesystem",
+            root.display().to_string(),
+        );
+        crate::mountfs::mount(config, root)
+    }
+    #[cfg(not(feature = "fuse"))]
+    {
+        let _ = args;
+        Err(MobfsError::Config(
+            "mobfs mount is no-local-code FUSE-first and requires building with --features fuse; use `mobfs mirror` for a durable local mirror".to_string(),
+        ))
+    }
+}
+
+pub fn mirror(args: MountArgs) -> Result<()> {
     let target = parse_remote(&args.remote)?;
     let root = match args.local {
         Some(path) => path,
-        None => default_mount_root(args.name.as_deref(), &target.host, &target.path)?,
+        None => default_mirror_root(args.name.as_deref(), &target.host, &target.path)?,
     };
     let config = new_config(target, root.clone(), args.port, args.token, args.ssh_tunnel);
     write_config(&config)?;
-    ui::added("mounted", root.display().to_string());
+    ui::added("mirrored", root.display().to_string());
     let spinner = ui::spinner("initial pull");
     let mut client = StorageClient::connect(config.clone())?;
     let remote = client.snapshot()?;
@@ -314,7 +340,12 @@ pub fn setup(args: SetupArgs) -> Result<()> {
         .map(|value| format!(" --name {value}"))
         .unwrap_or_default();
     println!(
-        "mobfs start {}:{} --ssh-tunnel{name} --token \"$MOBFS_TOKEN\"",
+        "mobfs mount {}:{} --ssh-tunnel{name} --token \"$MOBFS_TOKEN\"",
+        args.host,
+        args.remote_root.display()
+    );
+    println!(
+        "mobfs mirror {}:{} --ssh-tunnel{name} --token \"$MOBFS_TOKEN\"",
         args.host,
         args.remote_root.display()
     );
@@ -618,23 +649,43 @@ fn apply_plan(
     Ok(())
 }
 
-fn default_mount_root(
+#[cfg_attr(not(feature = "fuse"), allow(dead_code))]
+fn default_no_local_code_mountpoint(
+    name: Option<&str>,
+    host: &str,
+    remote_path: &str,
+) -> Result<std::path::PathBuf> {
+    let workspace = default_workspace_name(name, host, remote_path);
+    if cfg!(target_os = "macos") {
+        Ok(std::path::PathBuf::from("/Volumes").join(workspace))
+    } else {
+        let home = dirs::home_dir()
+            .ok_or_else(|| MobfsError::Config("home directory not found".to_string()))?;
+        Ok(home.join("MobFSMounts").join(workspace))
+    }
+}
+
+fn default_mirror_root(
     name: Option<&str>,
     host: &str,
     remote_path: &str,
 ) -> Result<std::path::PathBuf> {
     let home = dirs::home_dir()
         .ok_or_else(|| MobfsError::Config("home directory not found".to_string()))?;
+    Ok(home
+        .join("MobFS")
+        .join(default_workspace_name(name, host, remote_path)))
+}
+
+fn default_workspace_name(name: Option<&str>, host: &str, remote_path: &str) -> String {
     let fallback = remote_path
         .trim_matches('/')
         .replace('/', "-")
         .chars()
         .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_' || *ch == '.')
         .collect::<String>();
-    let workspace = name
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("{host}-{}", fallback));
-    Ok(home.join("MobFS").join(workspace))
+    name.map(str::to_string)
+        .unwrap_or_else(|| format!("{host}-{}", fallback))
 }
 
 fn open_path(path: &std::path::Path) -> Result<()> {

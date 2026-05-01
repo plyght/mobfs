@@ -24,6 +24,7 @@ fn main() -> Result<()> {
         Command::Init(args) => sync::init(args),
         Command::Start(args) => sync::start(args),
         Command::Mount(args) => sync::mount(args),
+        Command::Mirror(args) => sync::mirror(args),
         Command::Mountfs(args) => sync::mountfs(args),
         Command::Pull(args) => sync::pull(args),
         Command::Push(args) => sync::push(args),

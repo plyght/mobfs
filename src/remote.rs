@@ -95,6 +95,7 @@ impl RemoteClient {
         }
     }
 
+    #[cfg_attr(not(feature = "fuse"), allow(dead_code))]
     pub fn stat(&mut self, rel: &str) -> Result<Option<EntryMeta>> {
         let root = self.config.remote.path.clone();
         let rel = rel.to_string();
@@ -112,6 +113,7 @@ impl RemoteClient {
         }
     }
 
+    #[cfg_attr(not(feature = "fuse"), allow(dead_code))]
     pub fn list_dir(&mut self, rel: &str) -> Result<Vec<(String, EntryMeta)>> {
         let root = self.config.remote.path.clone();
         let rel = rel.to_string();
@@ -215,6 +217,22 @@ impl RemoteClient {
                     root: root.clone(),
                     rel: rel.clone(),
                     size,
+                },
+            )
+        })?;
+        Ok(())
+    }
+
+    #[cfg_attr(not(feature = "fuse"), allow(dead_code))]
+    pub fn fsync(&mut self, rel: &str) -> Result<()> {
+        let root = self.config.remote.path.clone();
+        let rel = rel.to_string();
+        self.op(|stream, _| {
+            protocol::send(
+                stream,
+                &Request::Fsync {
+                    root: root.clone(),
+                    rel: rel.clone(),
                 },
             )
         })?;
@@ -366,6 +384,7 @@ impl RemoteClient {
         Ok(())
     }
 
+    #[cfg_attr(not(feature = "fuse"), allow(dead_code))]
     pub fn create_symlink(&mut self, rel: &str, target: &str) -> Result<()> {
         let root = self.config.remote.path.clone();
         let rel = rel.to_string();
@@ -383,6 +402,7 @@ impl RemoteClient {
         Ok(())
     }
 
+    #[cfg_attr(not(feature = "fuse"), allow(dead_code))]
     pub fn set_metadata(
         &mut self,
         rel: &str,
