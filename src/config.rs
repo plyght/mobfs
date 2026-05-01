@@ -6,6 +6,7 @@ use std::path::PathBuf;
 pub const CONFIG_FILE: &str = ".mobfs.toml";
 pub const STATE_DIR: &str = ".mobfs";
 pub const SNAPSHOT_FILE: &str = "snapshot.toml";
+pub const TOKEN_FILE: &str = "token";
 pub const DEFAULT_CONNECT_RETRIES: u32 = 8;
 pub const DEFAULT_OP_RETRIES: u32 = 5;
 
@@ -25,6 +26,8 @@ pub struct RemoteConfig {
     pub path: String,
     pub port: u16,
     pub identity: Option<PathBuf>,
+    #[serde(default)]
+    pub ssh_tunnel: bool,
     pub token: Option<String>,
 }
 
@@ -71,13 +74,41 @@ impl AppConfig {
                 .ok_or_else(|| MobfsError::Config("config path has no parent".to_string()))?;
             config.local.root = base.join(&config.local.root);
         }
+        if config.remote.token.is_none() {
+            config.remote.token = load_workspace_token(&config.local.root)?;
+        }
         Ok(config)
     }
 
     pub fn save(&self) -> Result<()> {
-        fs::write(CONFIG_FILE, toml::to_string_pretty(self)?)?;
+        let mut disk = self.clone();
+        if let Some(token) = disk.remote.token.take() {
+            save_workspace_token(&disk.local.root, &token)?;
+        }
+        fs::write(CONFIG_FILE, toml::to_string_pretty(&disk)?)?;
         Ok(())
     }
+}
+
+pub fn load_workspace_token(root: &std::path::Path) -> Result<Option<String>> {
+    let path = root.join(STATE_DIR).join(TOKEN_FILE);
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(fs::read_to_string(path)?.trim().to_string()))
+}
+
+pub fn save_workspace_token(root: &std::path::Path, token: &str) -> Result<()> {
+    let dir = root.join(STATE_DIR);
+    fs::create_dir_all(&dir)?;
+    let path = dir.join(TOKEN_FILE);
+    fs::write(&path, token)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 pub fn parse_remote(input: &str) -> Result<RemoteTarget> {

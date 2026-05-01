@@ -3,7 +3,7 @@ use crate::error::{MobfsError, Result};
 use crate::snapshot::Snapshot;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
@@ -47,6 +47,11 @@ pub enum Request {
         upload_id: String,
         offset: u64,
         data: Vec<u8>,
+    },
+    WriteFileOffset {
+        root: String,
+        rel: String,
+        upload_id: String,
     },
     WriteFileAt {
         root: String,
@@ -112,6 +117,7 @@ pub enum Response {
         data: Vec<u8>,
         eof: bool,
     },
+    FileOffset(u64),
     RunOutput {
         stream: RunStream,
         data: Vec<u8>,

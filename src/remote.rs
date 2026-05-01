@@ -7,9 +7,10 @@ use crate::snapshot::{EntryKind, EntryMeta, Snapshot};
 use sha2::Digest;
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
@@ -18,6 +19,16 @@ pub const TRANSFER_CHUNK_SIZE: usize = 1024 * 1024;
 pub struct RemoteClient {
     config: AppConfig,
     stream: SecureStream,
+    tunnel: Option<Child>,
+}
+
+impl Drop for RemoteClient {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.tunnel {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 impl RemoteClient {
@@ -35,7 +46,12 @@ impl RemoteClient {
             )));
         }
         let port = config.remote.port;
-        let stream = TcpStream::connect((config.remote.host.as_str(), port))?;
+        let (host, port, tunnel) = if config.remote.ssh_tunnel {
+            start_ssh_tunnel(&config.remote.host, port)?
+        } else {
+            (config.remote.host.clone(), port, None)
+        };
+        let stream = TcpStream::connect((host.as_str(), port))?;
         stream.set_read_timeout(Some(Duration::from_secs(30)))?;
         stream.set_write_timeout(Some(Duration::from_secs(30)))?;
         let token = config
@@ -50,9 +66,11 @@ impl RemoteClient {
             })?;
         let mut stream = SecureStream::client(stream, &token)?;
         match protocol::send(&mut stream, &Request::Hello)? {
-            Response::Hello { version } if version == PROTOCOL_VERSION => {
-                Ok(Self { config, stream })
-            }
+            Response::Hello { version } if version == PROTOCOL_VERSION => Ok(Self {
+                config,
+                stream,
+                tunnel,
+            }),
             Response::Hello { version } => Err(MobfsError::Remote(format!(
                 "protocol version mismatch: client {PROTOCOL_VERSION}, server {version}"
             ))),
@@ -248,6 +266,11 @@ impl RemoteClient {
             std::process::id(),
             hex::encode(sha2::Sha256::digest(rel.as_bytes()))
         );
+        let journal_op = crate::journal::JournalOp::Upload {
+            rel: rel.clone(),
+            upload_id: upload_id.clone(),
+        };
+        crate::journal::record(&self.config, journal_op.clone())?;
         self.op(|stream, _| {
             protocol::send(
                 stream,
@@ -260,8 +283,36 @@ impl RemoteClient {
         })?;
         let mut file = File::open(&local)?;
         let mut hasher = sha2::Sha256::new();
-        let mut offset = 0_u64;
+        let mut offset = match self.op(|stream, _| {
+            protocol::send(
+                stream,
+                &Request::WriteFileOffset {
+                    root: root.clone(),
+                    rel: rel.clone(),
+                    upload_id: upload_id.clone(),
+                },
+            )
+        })? {
+            Response::FileOffset(value) => value.min(metadata.len()),
+            _ => {
+                return Err(MobfsError::Remote(
+                    "invalid upload offset response".to_string(),
+                ));
+            }
+        };
         let mut buffer = vec![0_u8; TRANSFER_CHUNK_SIZE];
+        if offset > 0 {
+            let mut remaining = offset;
+            while remaining > 0 {
+                let read =
+                    file.read(&mut buffer[..remaining.min(TRANSFER_CHUNK_SIZE as u64) as usize])?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+                remaining = remaining.saturating_sub(read as u64);
+            }
+        }
         loop {
             let read = file.read(&mut buffer)?;
             if read == 0 {
@@ -296,6 +347,7 @@ impl RemoteClient {
                 },
             )
         })?;
+        crate::journal::complete(&self.config, &journal_op)?;
         Ok(())
     }
 
@@ -407,8 +459,9 @@ impl RemoteClient {
     }
 
     fn reconnect(&mut self) -> Result<()> {
-        let next = Self::connect(self.config.clone())?;
-        self.stream = next.stream;
+        let mut next = Self::connect(self.config.clone())?;
+        std::mem::swap(&mut self.stream, &mut next.stream);
+        std::mem::swap(&mut self.tunnel, &mut next.tunnel);
         Ok(())
     }
 
@@ -432,6 +485,23 @@ impl RemoteClient {
             }
         }
     }
+}
+
+fn start_ssh_tunnel(host: &str, remote_port: u16) -> Result<(String, u16, Option<Child>)> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let local_port = listener.local_addr()?.port();
+    drop(listener);
+    let child = Command::new("ssh")
+        .arg("-N")
+        .arg("-L")
+        .arg(format!("127.0.0.1:{local_port}:127.0.0.1:{remote_port}"))
+        .arg(host)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    thread::sleep(Duration::from_millis(150));
+    Ok(("127.0.0.1".to_string(), local_port, Some(child)))
 }
 
 fn mode(metadata: &fs::Metadata) -> u32 {

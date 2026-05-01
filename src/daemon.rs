@@ -193,7 +193,9 @@ fn handle_request(request: Request, policy: &RootPolicy) -> Result<Response> {
                 fs::create_dir_all(parent)?;
             }
             let temp = upload_temp_path(&path, &upload_id)?;
-            fs::File::create(temp)?;
+            if !temp.exists() {
+                fs::File::create(temp)?;
+            }
             Ok(Response::Ok)
         }
         Request::WriteFileChunk {
@@ -210,6 +212,17 @@ fn handle_request(request: Request, policy: &RootPolicy) -> Result<Response> {
             file.seek(SeekFrom::Start(offset))?;
             file.write_all(&data)?;
             Ok(Response::Ok)
+        }
+        Request::WriteFileOffset {
+            root,
+            rel,
+            upload_id,
+        } => {
+            let root = policy.check(&root)?;
+            let path = safe_join(&root, &rel)?;
+            let temp = upload_temp_path(&path, &upload_id)?;
+            let offset = fs::metadata(temp).map(|meta| meta.len()).unwrap_or(0);
+            Ok(Response::FileOffset(offset))
         }
         Request::WriteFileAt {
             root,

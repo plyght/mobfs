@@ -3,6 +3,7 @@ mod config;
 mod crypto;
 mod daemon;
 mod error;
+mod journal;
 mod local;
 #[cfg(feature = "fuse")]
 mod mountfs;
@@ -40,5 +41,6 @@ fn main() -> Result<()> {
             args.allow_any_root,
         ),
         Command::Doctor => sync::doctor(),
+        Command::Bench(args) => sync::bench(args),
     }
 }

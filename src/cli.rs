@@ -50,6 +50,8 @@ pub enum Command {
     Daemon(DaemonArgs),
     #[command(about = "Check workspace and daemon connectivity")]
     Doctor,
+    #[command(about = "Benchmark snapshot and daemon transfer performance")]
+    Bench(BenchArgs),
 }
 
 #[derive(Args)]
@@ -62,6 +64,8 @@ pub struct InitArgs {
     pub port: u16,
     #[arg(long, env = "MOBFS_TOKEN", help = "Shared mobfsd token")]
     pub token: Option<String>,
+    #[arg(long, help = "Connect to mobfsd through ssh -L using the remote host")]
+    pub ssh_tunnel: bool,
 }
 
 #[derive(Args)]
@@ -76,6 +80,8 @@ pub struct StartArgs {
     pub port: u16,
     #[arg(long, env = "MOBFS_TOKEN", help = "Shared mobfsd token")]
     pub token: Option<String>,
+    #[arg(long, help = "Connect to mobfsd through ssh -L using the remote host")]
+    pub ssh_tunnel: bool,
     #[arg(
         long,
         default_value_t = 500,
@@ -102,6 +108,8 @@ pub struct MountArgs {
     pub port: u16,
     #[arg(long, env = "MOBFS_TOKEN", help = "Shared mobfsd token")]
     pub token: Option<String>,
+    #[arg(long, help = "Connect to mobfsd through ssh -L using the remote host")]
+    pub ssh_tunnel: bool,
     #[arg(long, help = "Do not open Finder after mounting")]
     pub no_open: bool,
 }
@@ -116,24 +124,32 @@ pub struct MountFsArgs {
     pub port: u16,
     #[arg(long, env = "MOBFS_TOKEN", help = "Shared mobfsd token")]
     pub token: Option<String>,
+    #[arg(long, help = "Connect to mobfsd through ssh -L using the remote host")]
+    pub ssh_tunnel: bool,
 }
 
 #[derive(Args)]
 pub struct PullArgs {
     #[arg(long, help = "Delete local paths missing from the remote")]
     pub delete: bool,
+    #[arg(long, help = "Show planned changes without applying them")]
+    pub dry_run: bool,
 }
 
 #[derive(Args)]
 pub struct PushArgs {
     #[arg(long, help = "Delete remote paths missing locally")]
     pub delete: bool,
+    #[arg(long, help = "Show planned changes without applying them")]
+    pub dry_run: bool,
 }
 
 #[derive(Args)]
 pub struct SyncArgs {
     #[arg(long, help = "Propagate deletions on the side that did not change")]
     pub delete: bool,
+    #[arg(long, help = "Show planned changes without applying them")]
+    pub dry_run: bool,
 }
 
 #[derive(Args)]
@@ -166,6 +182,14 @@ pub struct WatchArgs {
     pub debounce_ms: u64,
     #[arg(long, help = "Delete remote paths missing locally")]
     pub delete: bool,
+}
+
+#[derive(Args)]
+pub struct BenchArgs {
+    #[arg(long, default_value_t = 3, help = "Number of benchmark iterations")]
+    pub iterations: u32,
+    #[arg(long, default_value_t = 8, help = "Transfer test size in MiB")]
+    pub mib: u64,
 }
 
 #[derive(Args)]

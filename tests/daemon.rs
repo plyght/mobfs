@@ -4,6 +4,7 @@ use std::net::TcpListener;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -26,6 +27,11 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_mobfs")
 }
 
+fn port_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -38,8 +44,17 @@ fn start_daemon(allowed: &Path) -> Daemon {
     start_daemon_with_args(&["--allow-root", allowed.to_str().unwrap()])
 }
 
+fn start_daemon_on_port(allowed: &Path, port: u16) -> Daemon {
+    start_daemon_with_args_on_port(&["--allow-root", allowed.to_str().unwrap()], port)
+}
+
 fn start_daemon_with_args(args: &[&str]) -> Daemon {
+    let _guard = port_lock().lock().unwrap();
     let port = free_port();
+    start_daemon_with_args_on_port(args, port)
+}
+
+fn start_daemon_with_args_on_port(args: &[&str], port: u16) -> Daemon {
     let child = Command::new(bin())
         .arg("daemon")
         .arg("--bind")
@@ -104,6 +119,17 @@ fn daemon_mount_push_pull_and_run_roundtrip() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(fs::read_to_string(local.join("a.txt")).unwrap(), "remote");
+    assert!(
+        !fs::read_to_string(local.join(".mobfs.toml"))
+            .unwrap()
+            .contains(TOKEN)
+    );
+    assert_eq!(
+        fs::read_to_string(local.join(".mobfs").join("token"))
+            .unwrap()
+            .trim(),
+        TOKEN
+    );
 
     let large = vec![b'x'; 2 * 1024 * 1024 + 17];
     fs::write(local.join("big.bin"), &large).unwrap();
@@ -139,6 +165,15 @@ fn daemon_mount_push_pull_and_run_roundtrip() {
         fs::read_to_string(remote.join("local-run.txt")).unwrap(),
         "synced before run"
     );
+
+    fs::write(local.join("dry-run.txt"), "not pushed").unwrap();
+    let output = mobfs(&local, &["push", "--dry-run"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!remote.join("dry-run.txt").exists());
 }
 
 #[test]
@@ -373,6 +408,35 @@ fn mountfs_smoke_test_when_enabled() {
         fs::read_to_string(remote.join("b.txt")).unwrap(),
         "local through fuse"
     );
+    fs::create_dir_all(mountpoint.join("dir")).unwrap();
+    fs::write(mountpoint.join("dir").join("agent.txt"), "agent write").unwrap();
+    fs::rename(
+        mountpoint.join("dir").join("agent.txt"),
+        mountpoint.join("dir").join("agent-renamed.txt"),
+    )
+    .unwrap();
+    let large = vec![b'z'; 1024 * 1024 + 3];
+    fs::write(mountpoint.join("large.bin"), &large).unwrap();
+    assert_eq!(
+        fs::read_to_string(remote.join("dir").join("agent-renamed.txt")).unwrap(),
+        "agent write"
+    );
+    assert_eq!(fs::read(remote.join("large.bin")).unwrap(), large);
+    let output = Command::new("git")
+        .arg("init")
+        .current_dir(&mountpoint)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let output = Command::new("git")
+        .arg("status")
+        .arg("--short")
+        .current_dir(&mountpoint)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    fs::remove_file(mountpoint.join("large.bin")).unwrap();
+    assert!(!remote.join("large.bin").exists());
     let _ = if cfg!(target_os = "macos") {
         Command::new("diskutil")
             .arg("unmount")
@@ -424,4 +488,59 @@ fn sync_stops_on_same_path_conflict() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("both sides changed"), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(local.join("a.txt.mobfs-conflict-local")).unwrap(),
+        "local"
+    );
+    assert_eq!(
+        fs::read_to_string(local.join("a.txt.mobfs-conflict-remote")).unwrap(),
+        "remote"
+    );
+}
+
+#[test]
+fn reconnects_after_daemon_restart_for_later_operations() {
+    let temp = TempDir::new().unwrap();
+    let remote = temp.path().join("remote");
+    let local = temp.path().join("local");
+    fs::create_dir_all(&remote).unwrap();
+    let _guard = port_lock().lock().unwrap();
+    let port = free_port();
+    let mut daemon = start_daemon_on_port(&remote, port);
+    let remote_arg = format!("127.0.0.1:{}", remote.display());
+
+    let output = mobfs(
+        temp.path(),
+        &[
+            "mount",
+            &remote_arg,
+            "--local",
+            local.to_str().unwrap(),
+            "--token",
+            TOKEN,
+            "--port",
+            &daemon.port.to_string(),
+            "--no-open",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    daemon.child.kill().unwrap();
+    daemon.child.wait().unwrap();
+    daemon = start_daemon_on_port(&remote, port);
+    fs::write(local.join("after-restart.txt"), "ok").unwrap();
+    let output = mobfs(&local, &["push"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(remote.join("after-restart.txt")).unwrap(),
+        "ok"
+    );
+    drop(daemon);
 }

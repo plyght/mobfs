@@ -1,6 +1,6 @@
 use crate::cli::{
-    GitArgs, InitArgs, MountArgs, MountFsArgs, PullArgs, PushArgs, RunArgs, ServeArgs, StartArgs,
-    SyncArgs, WatchArgs,
+    BenchArgs, GitArgs, InitArgs, MountArgs, MountFsArgs, PullArgs, PushArgs, RunArgs, ServeArgs,
+    StartArgs, SyncArgs, WatchArgs,
 };
 use crate::config::{
     AppConfig, DEFAULT_CONNECT_RETRIES, DEFAULT_OP_RETRIES, LocalConfig, RemoteConfig, STATE_DIR,
@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 pub fn init(args: InitArgs) -> Result<()> {
     let target = parse_remote(&args.remote)?;
     let root = args.local.unwrap_or(std::env::current_dir()?);
-    let config = new_config(target, root, args.port, args.token);
+    let config = new_config(target, root, args.port, args.token, args.ssh_tunnel);
     write_config(&config)?;
     ui::ok("initialized .mobfs.toml");
     Ok(())
@@ -36,6 +36,7 @@ pub fn start(args: StartArgs) -> Result<()> {
             local: args.local,
             port: args.port,
             token: args.token,
+            ssh_tunnel: args.ssh_tunnel,
             no_open: args.no_open,
         })?;
     }
@@ -50,9 +51,13 @@ pub fn mountfs(args: MountFsArgs) -> Result<()> {
     #[cfg(feature = "fuse")]
     {
         let config = match args.remote {
-            Some(remote) => {
-                crate::mountfs::config_from_remote(remote, &args.mountpoint, args.port, args.token)?
-            }
+            Some(remote) => crate::mountfs::config_from_remote(
+                remote,
+                &args.mountpoint,
+                args.port,
+                args.token,
+                args.ssh_tunnel,
+            )?,
             None => AppConfig::load()?,
         };
         crate::mountfs::mount(config, args.mountpoint)
@@ -72,7 +77,7 @@ pub fn mount(args: MountArgs) -> Result<()> {
         Some(path) => path,
         None => default_mount_root(args.name.as_deref(), &target.host, &target.path)?,
     };
-    let config = new_config(target, root.clone(), args.port, args.token);
+    let config = new_config(target, root.clone(), args.port, args.token, args.ssh_tunnel);
     write_config(&config)?;
     ui::added("mounted", root.display().to_string());
     let spinner = ui::spinner("initial pull");
@@ -96,6 +101,7 @@ fn new_config(
     root: std::path::PathBuf,
     port: u16,
     token: Option<String>,
+    ssh_tunnel: bool,
 ) -> AppConfig {
     AppConfig {
         remote: RemoteConfig {
@@ -105,6 +111,7 @@ fn new_config(
             path: target.path,
             port,
             identity: None,
+            ssh_tunnel,
             token: token.or_else(|| std::env::var("MOBFS_TOKEN").ok()),
         },
         local: LocalConfig { root },
@@ -141,6 +148,11 @@ pub fn pull(args: PullArgs) -> Result<()> {
     spinner.set_message("pulling files");
     let plan = pull_items(&local_snapshot, &remote, args.delete);
     let count = plan.len();
+    if args.dry_run {
+        print_plan(&plan);
+        spinner.finish_and_clear();
+        return Ok(());
+    }
     ensure_local_dirs(&config, &remote)?;
     apply_plan(&mut client, &config, &remote, &plan)?;
     local::save_snapshot(&config, &remote)?;
@@ -160,7 +172,7 @@ pub fn push(args: PushArgs) -> Result<()> {
     spinner.set_message("connecting");
     let mut client = StorageClient::connect(config.clone())?;
     spinner.set_message("pushing changes");
-    let count = push_plan(&mut client, &local_snapshot, args.delete)?;
+    let count = push_plan(&mut client, &local_snapshot, args.delete, args.dry_run)?;
     let remote = client.snapshot()?;
     local::save_snapshot(&config, &remote)?;
     spinner.finish_and_clear();
@@ -187,14 +199,19 @@ pub fn sync(args: SyncArgs) -> Result<()> {
     {
         for item in &plan {
             if let PlanItem::Conflict(path) = item {
+                write_conflict_artifacts(&config, &mut client, &remote, path)?;
                 ui::change("conflict", path);
             }
         }
         return Err(MobfsError::Remote(
-            "sync stopped because both sides changed the same path".to_string(),
+            "sync stopped because both sides changed the same path; local and remote conflict copies were written next to conflicted files".to_string(),
         ));
     }
     let count = plan.len();
+    if args.dry_run {
+        print_plan(&plan);
+        return Ok(());
+    }
     apply_plan(&mut client, &config, &remote, &plan)?;
     let remote = client.snapshot()?;
     local::save_snapshot(&config, &remote)?;
@@ -243,7 +260,10 @@ pub fn git(args: GitArgs) -> Result<()> {
 
 fn run_remote(command: Vec<String>, sync_first: bool) -> Result<()> {
     if sync_first {
-        sync(SyncArgs { delete: false })?;
+        sync(SyncArgs {
+            delete: false,
+            dry_run: false,
+        })?;
     }
     let config = AppConfig::load()?;
     let mut client = StorageClient::connect(config)?;
@@ -259,6 +279,43 @@ fn run_remote(command: Vec<String>, sync_first: bool) -> Result<()> {
                 .unwrap_or_else(|| "signal".to_string())
         )))
     }
+}
+
+pub fn bench(args: BenchArgs) -> Result<()> {
+    let config = AppConfig::load()?;
+    let iterations = args.iterations.max(1);
+    let started = Instant::now();
+    let mut entries = 0_usize;
+    for _ in 0..iterations {
+        entries = local::snapshot(&config)?.entries.len();
+    }
+    let snapshot_ms = started.elapsed().as_millis() / u128::from(iterations);
+    ui::info("snapshot entries", entries.to_string());
+    ui::info("snapshot avg ms", snapshot_ms.to_string());
+    if config.remote.backend == crate::config::StorageBackend::Daemon {
+        let bench_path = config.local.root.join(".mobfs-bench.bin");
+        let size = args.mib.saturating_mul(1024 * 1024);
+        let data = vec![b'm'; size as usize];
+        fs::write(&bench_path, data)?;
+        let mut client = StorageClient::connect(config.clone())?;
+        let started = Instant::now();
+        client.upload_file(".mobfs-bench.bin")?;
+        let upload_secs = started.elapsed().as_secs_f64().max(0.001);
+        let remote = client.snapshot()?;
+        let started = Instant::now();
+        if let Some(meta) = remote.entries.get(".mobfs-bench.bin") {
+            client.download_file(".mobfs-bench.bin", meta)?;
+        }
+        let download_secs = started.elapsed().as_secs_f64().max(0.001);
+        let mib = args.mib as f64;
+        ui::info("upload MiB/s", format!("{:.2}", mib / upload_secs));
+        ui::info("download MiB/s", format!("{:.2}", mib / download_secs));
+        let _ = fs::remove_file(bench_path);
+        if let Some(meta) = remote.entries.get(".mobfs-bench.bin") {
+            let _ = client.remove(".mobfs-bench.bin", meta);
+        }
+    }
+    Ok(())
 }
 
 pub fn doctor() -> Result<()> {
@@ -375,7 +432,7 @@ fn watch_push_loop(debounce_ms: u64, delete: bool) -> Result<()> {
                 {
                     let local_snapshot = local::snapshot(&config)?;
                     let mut client = StorageClient::connect(config.clone())?;
-                    push_plan(&mut client, &local_snapshot, delete)?;
+                    push_plan(&mut client, &local_snapshot, delete, false)?;
                     let remote = client.snapshot()?;
                     local::save_snapshot(&config, &remote)?;
                     last_change = None;
@@ -403,7 +460,7 @@ fn resilient_sync_once(config: &AppConfig, delete: bool) -> Result<()> {
     {
         for item in &plan {
             if let PlanItem::Conflict(path) = item {
-                write_conflict_copy(config, path)?;
+                write_conflict_artifacts(config, &mut client, &remote, path)?;
                 ui::change("conflict", path);
             }
         }
@@ -415,7 +472,12 @@ fn resilient_sync_once(config: &AppConfig, delete: bool) -> Result<()> {
     Ok(())
 }
 
-fn write_conflict_copy(config: &AppConfig, rel: &str) -> Result<()> {
+fn write_conflict_artifacts(
+    config: &AppConfig,
+    client: &mut StorageClient,
+    remote: &Snapshot,
+    rel: &str,
+) -> Result<()> {
     let path = config.local.root.join(rel);
     if !path.is_file() {
         return Ok(());
@@ -424,9 +486,39 @@ fn write_conflict_copy(config: &AppConfig, rel: &str) -> Result<()> {
         .file_name()
         .and_then(|value| value.to_str())
         .ok_or_else(|| MobfsError::InvalidPath(path.display().to_string()))?;
-    let conflict = path.with_file_name(format!("{name}.mobfs-conflict-local"));
-    fs::copy(path, conflict)?;
+    let local_conflict = path.with_file_name(format!("{name}.mobfs-conflict-local"));
+    let remote_conflict = path.with_file_name(format!("{name}.mobfs-conflict-remote"));
+    let swap = path.with_file_name(format!(".{name}.mobfs-conflict-swap"));
+    fs::copy(&path, &local_conflict)?;
+    if let Some(meta) = remote.entries.get(rel)
+        && meta.kind == EntryKind::File
+    {
+        fs::rename(&path, &swap)?;
+        let result = client.download_file(rel, meta);
+        if result.is_ok() {
+            fs::rename(&path, &remote_conflict)?;
+        }
+        fs::rename(&swap, &path)?;
+        result?;
+    }
     Ok(())
+}
+
+fn print_plan(plan: &[PlanItem]) {
+    if plan.is_empty() {
+        ui::ok("no changes planned");
+        return;
+    }
+    for item in plan {
+        match item {
+            PlanItem::Put(rel) => ui::change("would-put", rel),
+            PlanItem::Get(rel) => ui::change("would-get", rel),
+            PlanItem::DeleteLocal(rel) => ui::change("would-delete-local", rel),
+            PlanItem::DeleteRemote(rel) => ui::change("would-delete-remote", rel),
+            PlanItem::Conflict(rel) => ui::change("would-conflict", rel),
+        }
+    }
+    ui::summary("planned changes", plan.len());
 }
 
 fn apply_plan(
@@ -510,11 +602,20 @@ fn remove_local(config: &AppConfig, rel: &str) -> Result<()> {
     Ok(())
 }
 
-fn push_plan(client: &mut StorageClient, local_snapshot: &Snapshot, delete: bool) -> Result<usize> {
+fn push_plan(
+    client: &mut StorageClient,
+    local_snapshot: &Snapshot,
+    delete: bool,
+    dry_run: bool,
+) -> Result<usize> {
     let remote = client.snapshot()?;
     ensure_remote_dirs(client, local_snapshot)?;
     let plan = push_items(local_snapshot, &remote, delete);
     let count = plan.len();
+    if dry_run {
+        print_plan(&plan);
+        return Ok(count);
+    }
     for item in plan {
         match item {
             PlanItem::Put(rel) => {

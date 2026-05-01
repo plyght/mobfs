@@ -164,6 +164,7 @@ mod tests {
                 path: "/r".to_string(),
                 port: 22,
                 identity: None,
+                ssh_tunnel: false,
                 token: None,
             },
             local: LocalConfig {

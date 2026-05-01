@@ -34,6 +34,7 @@ pub fn config_from_remote(
     mountpoint: &Path,
     port: u16,
     token: Option<String>,
+    ssh_tunnel: bool,
 ) -> Result<AppConfig> {
     let target = parse_remote(&remote)?;
     Ok(AppConfig {
@@ -44,6 +45,7 @@ pub fn config_from_remote(
             path: target.path,
             port,
             identity: None,
+            ssh_tunnel,
             token: token.or_else(|| std::env::var("MOBFS_TOKEN").ok()),
         },
         local: LocalConfig {
