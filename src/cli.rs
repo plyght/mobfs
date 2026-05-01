@@ -218,6 +218,14 @@ pub struct DaemonArgs {
 pub struct SetupArgs {
     #[arg(help = "Remote workspace root to allow")]
     pub remote_root: PathBuf,
+    #[arg(
+        long,
+        default_value = "host",
+        help = "SSH host used in the local start command"
+    )]
+    pub host: String,
+    #[arg(long, help = "Workspace name under ~/MobFS")]
+    pub name: Option<String>,
     #[arg(long, default_value_t = 7727, help = "mobfsd port")]
     pub port: u16,
     #[arg(long, env = "MOBFS_TOKEN", help = "Shared mobfsd token")]

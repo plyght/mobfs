@@ -87,7 +87,7 @@ mobfs mountfs example.com:/srv/projects/app /Volumes/app --token "$MOBFS_TOKEN"
 For a setup template, run:
 
 ```bash
-mobfs setup /srv/projects
+mobfs setup /srv/projects --host example.com
 ```
 
 MobFS stores workspace configuration in `.mobfs.toml`:
@@ -160,7 +160,7 @@ mobfs watch
 mobfs token
 
 # Print setup commands
-mobfs setup /srv/projects
+mobfs setup /srv/projects --host example.com
 
 # Run the remote daemon
 mobfs daemon --bind 127.0.0.1:7727 --allow-root /srv/projects --token "$MOBFS_TOKEN"

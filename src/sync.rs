@@ -300,8 +300,13 @@ pub fn setup(args: SetupArgs) -> Result<()> {
         args.port,
         args.remote_root.display()
     );
+    let name = args
+        .name
+        .map(|value| format!(" --name {value}"))
+        .unwrap_or_default();
     println!(
-        "mobfs start host:{} --ssh-tunnel --token \"$MOBFS_TOKEN\"",
+        "mobfs start {}:{} --ssh-tunnel{name} --token \"$MOBFS_TOKEN\"",
+        args.host,
         args.remote_root.display()
     );
     Ok(())
@@ -363,8 +368,20 @@ pub fn doctor() -> Result<()> {
             ui::warn("daemon token missing; set MOBFS_TOKEN or configure a token");
         }
         ui::info("remote compute", "available");
+        if config.remote.ssh_tunnel {
+            check_tool("ssh");
+        } else {
+            ui::warn(
+                "daemon is configured without --ssh-tunnel; expose mobfsd only on trusted networks",
+            );
+        }
     } else {
         ui::warn("remote compute unavailable for provider-backed workspaces");
+    }
+    check_tool("git");
+    #[cfg(target_os = "macos")]
+    if !std::path::Path::new("/Library/Filesystems/macfuse.fs").exists() {
+        ui::warn("macFUSE not found; mountfs will be unavailable until macFUSE is installed");
     }
     let spinner = ui::spinner("checking storage");
     let mut client = StorageClient::connect(config.clone())?;
@@ -428,6 +445,15 @@ pub fn serve(args: ServeArgs) -> Result<()> {
 pub fn open() -> Result<()> {
     let config = AppConfig::load()?;
     open_path(&config.local.root)
+}
+
+fn check_tool(name: &str) {
+    let available = Command::new(name).arg("--version").output().is_ok();
+    if available {
+        ui::ok(format!("{name} available"));
+    } else {
+        ui::warn(format!("{name} not found in PATH"));
+    }
 }
 
 fn watch_push_loop(debounce_ms: u64, delete: bool) -> Result<()> {

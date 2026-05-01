@@ -90,6 +90,54 @@ fn mobfs(cwd: &Path, args: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn token_and_setup_are_safe_by_default() {
+    let temp = TempDir::new().unwrap();
+    let output = mobfs(temp.path(), &["token"]);
+    assert!(output.status.success());
+    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    assert_eq!(token.len(), 64);
+    assert!(token.chars().all(|ch| ch.is_ascii_hexdigit()));
+
+    let remote = temp.path().join("remote");
+    let output = mobfs(
+        temp.path(),
+        &[
+            "setup",
+            remote.to_str().unwrap(),
+            "--host",
+            "devbox",
+            "--name",
+            "app",
+            "--token",
+            TOKEN,
+        ],
+    );
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--bind 127.0.0.1:7727"), "{stdout}");
+    assert!(stdout.contains("devbox:"), "{stdout}");
+    assert!(stdout.contains("--ssh-tunnel --name app"), "{stdout}");
+}
+
+#[test]
+fn daemon_token_error_is_clear() {
+    let temp = TempDir::new().unwrap();
+    let allowed = temp.path().join("allowed");
+    fs::create_dir_all(&allowed).unwrap();
+    let output = Command::new(bin())
+        .arg("daemon")
+        .arg("--bind")
+        .arg("127.0.0.1:0")
+        .arg("--allow-root")
+        .arg(&allowed)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("daemon token missing"), "{stderr}");
+}
+
+#[test]
 fn daemon_mount_push_pull_and_run_roundtrip() {
     let temp = TempDir::new().unwrap();
     let remote = temp.path().join("remote");
@@ -165,6 +213,15 @@ fn daemon_mount_push_pull_and_run_roundtrip() {
         fs::read_to_string(remote.join("local-run.txt")).unwrap(),
         "synced before run"
     );
+
+    fs::write(local.join(".DS_Store"), "mac noise").unwrap();
+    let output = mobfs(&local, &["push"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!remote.join(".DS_Store").exists());
 
     fs::write(local.join("dry-run.txt"), "not pushed").unwrap();
     let output = mobfs(&local, &["push", "--dry-run"]);
