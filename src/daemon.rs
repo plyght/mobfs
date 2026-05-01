@@ -13,9 +13,14 @@ use std::process::Command;
 use std::thread;
 use walkdir::WalkDir;
 
-pub fn serve(bind: &str, token: &str, allow_roots: Vec<PathBuf>) -> Result<()> {
+pub fn serve(
+    bind: &str,
+    token: &str,
+    allow_roots: Vec<PathBuf>,
+    allow_any_root: bool,
+) -> Result<()> {
     let listener = TcpListener::bind(bind)?;
-    let policy = RootPolicy::new(allow_roots)?;
+    let policy = RootPolicy::new(allow_roots, allow_any_root)?;
     crate::ui::info("mobfsd", format!("listening on {bind}"));
     for stream in listener.incoming() {
         let token = token.to_string();
@@ -37,22 +42,34 @@ pub fn serve(bind: &str, token: &str, allow_roots: Vec<PathBuf>) -> Result<()> {
 #[derive(Clone)]
 struct RootPolicy {
     allow_roots: Vec<PathBuf>,
+    allow_any_root: bool,
 }
 
 impl RootPolicy {
-    fn new(allow_roots: Vec<PathBuf>) -> Result<Self> {
+    fn new(allow_roots: Vec<PathBuf>, allow_any_root: bool) -> Result<Self> {
+        if allow_roots.is_empty() && !allow_any_root {
+            return Err(MobfsError::Config(
+                "mobfsd requires --allow-root for real use or --allow-any-root for explicit unsafe local testing".to_string(),
+            ));
+        }
         let mut canonical = Vec::new();
         for root in allow_roots {
             canonical.push(root.canonicalize()?);
         }
         Ok(Self {
             allow_roots: canonical,
+            allow_any_root,
         })
     }
 
     fn check(&self, root: &str) -> Result<PathBuf> {
         let root = PathBuf::from(root).canonicalize()?;
-        if self.allow_roots.is_empty() || self.allow_roots.contains(&root) {
+        if self.allow_any_root
+            || self
+                .allow_roots
+                .iter()
+                .any(|allowed| root.starts_with(allowed))
+        {
             return Ok(root);
         }
         Err(MobfsError::Remote(format!(

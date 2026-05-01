@@ -162,9 +162,14 @@ pub struct DaemonArgs {
     pub token: String,
     #[arg(
         long = "allow-root",
-        help = "Allowed canonical workspace root; repeatable"
+        help = "Allowed canonical workspace root or parent; repeatable"
     )]
     pub allow_roots: Vec<PathBuf>,
+    #[arg(
+        long,
+        help = "Allow clients to request any root the daemon process can access"
+    )]
+    pub allow_any_root: bool,
 }
 
 #[derive(Args)]

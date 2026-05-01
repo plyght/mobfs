@@ -33,6 +33,10 @@ fn free_port() -> u16 {
 }
 
 fn start_daemon(allowed: &Path) -> Daemon {
+    start_daemon_with_args(&["--allow-root", allowed.to_str().unwrap()])
+}
+
+fn start_daemon_with_args(args: &[&str]) -> Daemon {
     let port = free_port();
     let child = Command::new(bin())
         .arg("daemon")
@@ -40,8 +44,7 @@ fn start_daemon(allowed: &Path) -> Daemon {
         .arg(format!("127.0.0.1:{port}"))
         .arg("--token")
         .arg(TOKEN)
-        .arg("--allow-root")
-        .arg(allowed)
+        .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -134,6 +137,54 @@ fn daemon_mount_push_pull_and_run_roundtrip() {
         fs::read_to_string(remote.join("local-run.txt")).unwrap(),
         "synced before run"
     );
+}
+
+#[test]
+fn daemon_requires_explicit_root_policy() {
+    let output = Command::new(bin())
+        .arg("daemon")
+        .arg("--bind")
+        .arg("127.0.0.1:0")
+        .arg("--token")
+        .arg(TOKEN)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("requires --allow-root"), "{stderr}");
+}
+
+#[test]
+fn daemon_allows_descendants_of_allowed_roots() {
+    let temp = TempDir::new().unwrap();
+    let parent = temp.path().join("parent");
+    let remote = parent.join("project");
+    let local = temp.path().join("local");
+    fs::create_dir_all(&remote).unwrap();
+    fs::write(remote.join("a.txt"), "remote").unwrap();
+    let daemon = start_daemon(&parent);
+    let remote_arg = format!("127.0.0.1:{}", remote.display());
+
+    let output = mobfs(
+        temp.path(),
+        &[
+            "mount",
+            &remote_arg,
+            "--local",
+            local.to_str().unwrap(),
+            "--token",
+            TOKEN,
+            "--port",
+            &daemon.port.to_string(),
+            "--no-open",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read_to_string(local.join("a.txt")).unwrap(), "remote");
 }
 
 #[test]

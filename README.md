@@ -88,7 +88,7 @@ mobfs git status
 # Watch local changes and push them
 mobfs watch
 
-# Check workspace and daemon connectivity
+# Check workspace, token availability, backend capabilities, and daemon connectivity
 mobfs doctor
 
 # Open the workspace in Finder on macOS
@@ -130,7 +130,7 @@ mobfs daemon --bind 0.0.0.0:7727 --allow-root /absolute/path
 mobfs start host:/absolute/path --name app
 ```
 
-Daemon roots are open when no `--allow-root` is provided, which is useful for quick local tests. For real use, pass one or more `--allow-root` values so clients cannot request arbitrary filesystem roots.
+mobfsd is safe-by-default: it refuses to start unless you pass one or more `--allow-root` values or explicitly opt into `--allow-any-root` for unsafe local testing. An allowed root also permits canonical descendants, so `--allow-root /srv` can serve `/srv/project`.
 
 iCloud and Google Drive can be used as folder-backed canonical storage roots. They do not provide remote compute, so `mobfs run` requires the daemon backend.
 

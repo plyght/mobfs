@@ -253,7 +253,18 @@ pub fn doctor() -> Result<()> {
         "backend",
         crate::storage::backend_label(&config.remote.backend),
     );
-    let spinner = ui::spinner("checking daemon");
+    let has_token = config.remote.token.is_some() || std::env::var("MOBFS_TOKEN").is_ok();
+    if config.remote.backend == crate::config::StorageBackend::Daemon {
+        if has_token {
+            ui::ok("daemon token available");
+        } else {
+            ui::warn("daemon token missing; set MOBFS_TOKEN or configure a token");
+        }
+        ui::info("remote compute", "available");
+    } else {
+        ui::warn("remote compute unavailable for provider-backed workspaces");
+    }
+    let spinner = ui::spinner("checking storage");
     let mut client = StorageClient::connect(config.clone())?;
     spinner.set_message("scanning remote");
     let _ = client.snapshot()?;
