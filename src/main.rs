@@ -48,6 +48,7 @@ fn main() -> Result<()> {
         }
         Command::Token => sync::token(),
         Command::Setup(args) => sync::setup(args),
+        Command::Remote(args) => sync::remote(args),
         Command::SetupRemote(args) => sync::setup_remote(args),
         Command::Doctor => sync::doctor(),
         Command::Bench(args) => sync::bench(args),

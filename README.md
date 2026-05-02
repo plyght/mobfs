@@ -99,9 +99,12 @@ mobfs setup /srv/projects --host example.com
 For one-command SSH setup that creates the remote root and starts `mobfsd` on the remote host:
 
 ```bash
-mobfs setup-remote nico@example.com --root ~/code
+mobfs remote start nico@example.com --root ~/code
+mobfs remote status nico@example.com
 mobfs mount nico@example.com:~/code/app --ssh-tunnel
 ```
+
+`remote start` records the remote daemon pid in `~/.mobfsd/daemon.pid` and logs to `~/.mobfsd/daemon.log`. Re-run it safely if the daemon is already up; use `mobfs remote restart ...` to stop the recorded pid and start a fresh daemon.
 
 Mirror mode stores workspace configuration in `.mobfs.toml`:
 
@@ -146,6 +149,7 @@ R2 and S3 are represented in configuration, but are not implemented yet.
 ```bash
 # No-local-code primary path
 mobfs mount host:/absolute/path --name app
+mobfs add host:/absolute/path --name app
 mobfs mountfs host:/absolute/path /Volumes/app
 
 # Durable mirror path
@@ -167,11 +171,14 @@ mobfs git <args...>
 # Daemon, setup, security, and FUSE UX
 mobfs token
 mobfs setup /srv/projects --host example.com
-mobfs setup-remote nico@example.com --root ~/code
+mobfs remote start nico@example.com --root ~/code
+mobfs remote status nico@example.com
+mobfs remote restart nico@example.com --root ~/code
 mobfs daemon --bind 127.0.0.1:7727 --allow-root /srv/projects --token "$MOBFS_TOKEN"
 mobfs doctor
 mobfs mount-doctor /Volumes/app
 mobfs unmount /Volumes/app
+mobfs rm /Volumes/app
 mobfs security
 mobfs bench --iterations 5 --mib 64
 mobfs bench --scale-files 50000 --iterations 3
@@ -182,6 +189,16 @@ Useful aliases: `start` as `up`, `pull` as `get`, `push` as `put`, `sync` as `s`
 ## No-Local-Code Semantics
 
 `mobfs mount` does not create `.mobfs.toml`, `.mobfs/token`, snapshots, or a project mirror under the mountpoint. Reads are fetched from the daemon on demand. Writes are sent to the daemon immediately. FUSE mode uses a small operation journal in the system temp directory so interrupted metadata and namespace operations can be replayed after reconnect. It also records active mounts in the user cache directory so `mobfs run` and `mobfs git` can resolve the remote workspace from inside a mount without writing config into source.
+
+## Recovery and Conflict UX
+
+Run `mobfs status` from inside a mount or mirror to see connection state and pending journal operations. If the daemon restarts or the network drops, normal metadata operations and buffered writes retry; any pending mount journal entries replay on the next successful reconnect or remount. If a hard failure happens mid-stream during a large write, MobFS is designed to fail quickly instead of hanging forever. After that kind of failure, run `mobfs status`, restart the remote daemon if needed, and remount if existing file handles keep returning `EIO`.
+
+Mirror-mode conflicts stop the sync before clobbering either side. MobFS writes sibling conflict files named `.mobfs-conflict-local` and `.mobfs-conflict-remote`; choose one or merge them, replace the original file with the resolved content, delete the conflict copies, then run `mobfs sync` again.
+
+## Safe Usage Model
+
+Treat MobFS as a remote workspace mount, not as a backup system. Keep authoritative code in Git on the remote machine, commit before risky bulk edits, and prefer `mobfs git ...` and `mobfs run ...` for repository operations. Use raw FUSE paths for editors, agents, search, and focused file edits. Avoid running broad tools across unignored build/cache directories; keep `target`, `node_modules`, and similar generated trees ignored. For first dogfooding, use non-critical repositories until your sleep/wake, network, and editor workflows have passed.
 
 Metadata lookups and directory entries use a short kernel cache TTL. The default is 1 second and can be changed with `mobfs mount --cache-ttl-secs <seconds>`. Use `0` while dogfooding remote-side edits from another shell, and use a small nonzero value for normal editor, agent, git, search, and traversal workflows. With a nonzero TTL, MobFS serves known metadata and directory entries from the initial snapshot and local mutation cache where safe. Direct reads go to the daemon first and only fall back to the last successful chunk if the daemon is temporarily unavailable.
 

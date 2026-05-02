@@ -1,6 +1,7 @@
 use crate::cli::{
     BenchArgs, GitArgs, InitArgs, MountArgs, MountDoctorArgs, MountFsArgs, PullArgs, PushArgs,
-    RunArgs, ServeArgs, SetupArgs, SetupRemoteArgs, StartArgs, SyncArgs, UnmountArgs, WatchArgs,
+    RemoteArgs, RemoteCommand, RemoteHostArgs, RemoteStatusArgs, RunArgs, ServeArgs, SetupArgs,
+    SetupRemoteArgs, StartArgs, SyncArgs, UnmountArgs, WatchArgs,
 };
 use crate::config::{
     AppConfig, DEFAULT_CONNECT_RETRIES, DEFAULT_OP_RETRIES, LocalConfig, RemoteConfig, STATE_DIR,
@@ -277,7 +278,7 @@ pub fn sync(args: SyncArgs) -> Result<()> {
             }
         }
         return Err(MobfsError::Remote(
-            "sync stopped because both sides changed the same path; local and remote conflict copies were written next to conflicted files".to_string(),
+            "sync stopped because both sides changed the same path; local and remote conflict copies were written next to conflicted files. Resolve by choosing or merging the .mobfs-conflict-local and .mobfs-conflict-remote files, then run `mobfs sync` again".to_string(),
         ));
     }
     let count = plan.len();
@@ -329,6 +330,11 @@ pub fn status() -> Result<()> {
     ui::change("connection", "connected");
     ui::change("mode", if mirror_workspace { "mirror" } else { "mount" });
     ui::change("pending-writes", pending.to_string());
+    if pending > 0 {
+        ui::warn(
+            "pending mount journal operations will replay on the next successful reconnect or remount",
+        );
+    }
     ui::change("last-synced", unix_timestamp().to_string());
     if !mirror_workspace {
         ui::info("remote-entries", remote.entries.len().to_string());
@@ -582,36 +588,81 @@ pub fn setup(args: SetupArgs) -> Result<()> {
     Ok(())
 }
 
+pub fn remote(args: RemoteArgs) -> Result<()> {
+    match args.command {
+        RemoteCommand::Start(args) => setup_remote(remote_host_to_setup(args, false, false)),
+        RemoteCommand::Restart(args) => setup_remote(remote_host_to_setup(args, true, false)),
+        RemoteCommand::Status(args) => setup_remote(remote_status_to_setup(args)),
+    }
+}
+
+fn remote_host_to_setup(args: RemoteHostArgs, restart: bool, status: bool) -> SetupRemoteArgs {
+    SetupRemoteArgs {
+        ssh_target: args.ssh_target,
+        root: args.root,
+        port: args.port,
+        token: args.token,
+        dry_run: args.dry_run,
+        restart,
+        status,
+        name: args.name,
+    }
+}
+
+fn remote_status_to_setup(args: RemoteStatusArgs) -> SetupRemoteArgs {
+    SetupRemoteArgs {
+        ssh_target: args.ssh_target,
+        root: args.root,
+        port: args.port,
+        token: args.token,
+        dry_run: args.dry_run,
+        restart: false,
+        status: true,
+        name: args.name,
+    }
+}
+
 pub fn setup_remote(args: SetupRemoteArgs) -> Result<()> {
     let token = args.token.unwrap_or_else(crate::config::generate_token);
     let root = args.root.display().to_string();
     let remote_root = shell_path_quote(&root);
-    let remote_command = format!(
-        "mkdir -p {root} ~/.mobfsd && command -v mobfs >/dev/null && MOBFS_TOKEN={token} mobfs daemon --bind 127.0.0.1:{port} --allow-root {root} --token \"$MOBFS_TOKEN\" > ~/.mobfsd/daemon.log 2>&1 &",
-        root = remote_root,
-        token = shell_quote(&token),
-        port = args.port,
-    );
     let name = args
         .name
         .as_ref()
         .map(|value| format!(" --name {}", shell_quote(value)))
         .unwrap_or_default();
+    let remote_command = if args.status {
+        "if [ -s ~/.mobfsd/daemon.pid ] && kill -0 \"$(cat ~/.mobfsd/daemon.pid)\" 2>/dev/null; then echo running pid=$(cat ~/.mobfsd/daemon.pid); else echo stopped; [ -f ~/.mobfsd/daemon.log ] && tail -n 20 ~/.mobfsd/daemon.log; fi".to_string()
+    } else {
+        format!(
+            "mkdir -p {root} ~/.mobfsd && command -v mobfs >/dev/null || {{ echo 'mobfs not found in PATH; install it on the remote first' >&2; exit 127; }}; if [ -s ~/.mobfsd/daemon.pid ] && kill -0 \"$(cat ~/.mobfsd/daemon.pid)\" 2>/dev/null; then if [ {restart} = yes ]; then kill \"$(cat ~/.mobfsd/daemon.pid)\"; sleep 1; else echo 'mobfsd already running pid='$(cat ~/.mobfsd/daemon.pid); exit 0; fi; fi; MOBFS_TOKEN={token} nohup mobfs daemon --bind 127.0.0.1:{port} --allow-root {root} --token \"$MOBFS_TOKEN\" > ~/.mobfsd/daemon.log 2>&1 < /dev/null & echo $! > ~/.mobfsd/daemon.pid; echo started pid=$(cat ~/.mobfsd/daemon.pid)",
+            root = remote_root,
+            token = shell_quote(&token),
+            port = args.port,
+            restart = if args.restart { "yes" } else { "no" },
+        )
+    };
     if args.dry_run {
-        ui::section("Remote setup");
+        ui::section(if args.status {
+            "Remote daemon status"
+        } else {
+            "Remote setup"
+        });
         ui::command(format!(
             "ssh {} {}",
             args.ssh_target,
             shell_quote(&remote_command)
         ));
-        ui::blank();
-        ui::section("Local mount");
-        ui::command(format!(
-            "MOBFS_TOKEN={} mobfs mount {}:{} --ssh-tunnel{name}",
-            shell_quote(&token),
-            args.ssh_target,
-            args.root.display()
-        ));
+        if !args.status {
+            ui::blank();
+            ui::section("Local mount");
+            ui::command(format!(
+                "MOBFS_TOKEN={} mobfs mount {}:{} --ssh-tunnel{name}",
+                shell_quote(&token),
+                args.ssh_target,
+                args.root.display()
+            ));
+        }
         return Ok(());
     }
     let status = Command::new("ssh")
@@ -624,10 +675,18 @@ pub fn setup_remote(args: SetupRemoteArgs) -> Result<()> {
             args.ssh_target
         )));
     }
-    ui::ok("remote daemon start requested");
+    if args.status {
+        return Ok(());
+    }
+    ui::ok("remote daemon ready");
     ui::info("token", token);
     ui::command(format!(
         "MOBFS_TOKEN=... mobfs mount {}:{} --ssh-tunnel{name}",
+        args.ssh_target,
+        args.root.display()
+    ));
+    ui::command(format!(
+        "mobfs remote status {} --root {}",
         args.ssh_target,
         args.root.display()
     ));
@@ -879,7 +938,7 @@ fn resilient_sync_once(config: &AppConfig, delete: bool) -> Result<()> {
             }
         }
         return Err(MobfsError::Remote(
-            "resilient sync stopped because both sides changed the same path; local and remote conflict copies were written next to conflicted files".to_string(),
+            "resilient sync stopped because both sides changed the same path; local and remote conflict copies were written next to conflicted files. Resolve by choosing or merging the .mobfs-conflict-local and .mobfs-conflict-remote files, then run `mobfs sync` again".to_string(),
         ));
     }
     apply_plan(&mut client, config, &remote, &plan)?;

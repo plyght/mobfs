@@ -17,7 +17,8 @@ pub enum Command {
     #[command(about = "Mount if needed, then run the resilient sync loop  [alias: up]")]
     #[command(visible_alias = "up")]
     Start(StartArgs),
-    #[command(about = "Mount a no-local-code on-demand read-write filesystem")]
+    #[command(about = "Mount a no-local-code on-demand read-write filesystem  [alias: add]")]
+    #[command(visible_alias = "add")]
     Mount(MountArgs),
     #[command(about = "Create/open a durable local mirror workspace backed by mobfsd")]
     Mirror(MountArgs),
@@ -48,7 +49,9 @@ pub enum Command {
     #[command(about = "Open the workspace in Finder  [alias: o]")]
     #[command(visible_alias = "o")]
     Open,
-    #[command(about = "Unmount a mobfs FUSE mount and clean up the mountpoint")]
+    #[command(about = "Unmount a mobfs FUSE mount and clean up the mountpoint  [alias: rm]")]
+    #[command(visible_alias = "rm")]
+    #[command(alias = "remove")]
     Unmount(UnmountArgs),
     #[command(about = "Print macOS/FUSE dogfooding checks for a mount")]
     MountDoctor(MountDoctorArgs),
@@ -60,10 +63,15 @@ pub enum Command {
     Token,
     #[command(about = "Print remote daemon setup commands")]
     Setup(SetupArgs),
+    #[command(about = "Manage a remote mobfsd over SSH  [alias: rmt]")]
+    #[command(visible_alias = "rmt")]
+    Remote(RemoteArgs),
     #[command(about = "Install/start mobfsd on a remote host over SSH  [alias: sr]")]
-    #[command(visible_alias = "sr")]
+    #[command(hide = true)]
+    #[command(alias = "sr")]
     SetupRemote(SetupRemoteArgs),
-    #[command(about = "Check workspace and daemon connectivity")]
+    #[command(about = "Check workspace and daemon connectivity  [alias: dx]")]
+    #[command(visible_alias = "dx")]
     Doctor,
     #[command(about = "Benchmark snapshot and daemon transfer performance")]
     Bench(BenchArgs),
@@ -279,6 +287,64 @@ pub struct SetupRemoteArgs {
     #[arg(help = "SSH target like user@host")]
     pub ssh_target: String,
     #[arg(long, help = "Remote workspace root to create and allow")]
+    pub root: PathBuf,
+    #[arg(long, default_value_t = 7727, help = "mobfsd port")]
+    pub port: u16,
+    #[arg(long, env = "MOBFS_TOKEN", help = "Shared mobfsd token")]
+    pub token: Option<String>,
+    #[arg(long, help = "Print commands without running SSH")]
+    pub dry_run: bool,
+    #[arg(long, help = "Stop any running ~/.mobfsd daemon before starting")]
+    pub restart: bool,
+    #[arg(long, help = "Only check the remote ~/.mobfsd daemon status")]
+    pub status: bool,
+    #[arg(long, help = "Workspace name to show in the suggested mount command")]
+    pub name: Option<String>,
+}
+
+#[derive(Args)]
+pub struct RemoteArgs {
+    #[command(subcommand)]
+    pub command: RemoteCommand,
+}
+
+#[derive(Subcommand)]
+pub enum RemoteCommand {
+    #[command(about = "Start mobfsd on a host over SSH  [alias: up]")]
+    #[command(visible_alias = "up")]
+    Start(RemoteHostArgs),
+    #[command(about = "Restart mobfsd on a host over SSH")]
+    Restart(RemoteHostArgs),
+    #[command(about = "Show remote mobfsd status  [alias: st]")]
+    #[command(visible_alias = "st")]
+    Status(RemoteStatusArgs),
+}
+
+#[derive(Args)]
+pub struct RemoteHostArgs {
+    #[arg(help = "SSH target like user@host")]
+    pub ssh_target: String,
+    #[arg(long, help = "Remote workspace root to create and allow")]
+    pub root: PathBuf,
+    #[arg(long, default_value_t = 7727, help = "mobfsd port")]
+    pub port: u16,
+    #[arg(long, env = "MOBFS_TOKEN", help = "Shared mobfsd token")]
+    pub token: Option<String>,
+    #[arg(long, help = "Print commands without running SSH")]
+    pub dry_run: bool,
+    #[arg(long, help = "Workspace name to show in the suggested mount command")]
+    pub name: Option<String>,
+}
+
+#[derive(Args)]
+pub struct RemoteStatusArgs {
+    #[arg(help = "SSH target like user@host")]
+    pub ssh_target: String,
+    #[arg(
+        long,
+        default_value = "~",
+        help = "Remote workspace root used for command context"
+    )]
     pub root: PathBuf,
     #[arg(long, default_value_t = 7727, help = "mobfsd port")]
     pub port: u16,

@@ -739,13 +739,12 @@ impl Filesystem for MobfsFuse {
                     reply.data(&chunk);
                     return;
                 }
-                Err(_) => match self.read_cache.lock().unwrap().get(&key) {
-                    Some(data) => {
+                Err(_) => {
+                    if let Some(data) = self.read_cache.lock().unwrap().get(&key) {
                         reply.data(data);
                         return;
                     }
-                    None => {}
-                },
+                }
             }
         }
         match self
