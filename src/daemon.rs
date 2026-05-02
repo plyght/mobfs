@@ -177,6 +177,7 @@ fn request_label(request: &Request) -> &'static str {
         Request::ListDir { .. } => "ListDir",
         Request::ReadFile { .. } => "ReadFile",
         Request::ReadFileChunk { .. } => "ReadFileChunk",
+        Request::ReadSmallFiles { .. } => "ReadSmallFiles",
         Request::WriteFile { .. } => "WriteFile",
         Request::WriteFileStart { .. } => "WriteFileStart",
         Request::WriteFileChunk { .. } => "WriteFileChunk",
@@ -250,6 +251,31 @@ fn handle_request(request: Request, policy: &RootPolicy) -> Result<Response> {
                     || read < usize::try_from(len.min(1024 * 1024)).unwrap_or(1024 * 1024),
                 data,
             })
+        }
+        Request::ReadSmallFiles {
+            root,
+            rels,
+            max_file_bytes,
+            max_total_bytes,
+        } => {
+            let root = policy.check(&root)?;
+            let mut files = Vec::new();
+            let mut total = 0_u64;
+            for rel in rels {
+                let path = safe_join(&root, &rel)?;
+                let Some(meta) = entry_meta_fast(&path)? else {
+                    continue;
+                };
+                if meta.kind != EntryKind::File || meta.size > max_file_bytes {
+                    continue;
+                }
+                total = total.saturating_add(meta.size);
+                if total > max_total_bytes {
+                    break;
+                }
+                files.push((rel, fs::read(path)?));
+            }
+            Ok(Response::SmallFiles(files))
         }
         Request::WriteFile {
             root,

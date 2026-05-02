@@ -3,7 +3,7 @@ use crate::error::{MobfsError, Result};
 use crate::snapshot::Snapshot;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
@@ -29,6 +29,12 @@ pub enum Request {
         rel: String,
         offset: u64,
         len: u64,
+    },
+    ReadSmallFiles {
+        root: String,
+        rels: Vec<String>,
+        max_file_bytes: u64,
+        max_total_bytes: u64,
     },
     WriteFile {
         root: String,
@@ -133,6 +139,7 @@ pub enum Response {
         data: Vec<u8>,
         eof: bool,
     },
+    SmallFiles(Vec<(String, Vec<u8>)>),
     FileOffset(u64),
     RunOutput {
         stream: RunStream,

@@ -157,6 +157,30 @@ impl RemoteClient {
         }
     }
 
+    #[cfg_attr(not(feature = "fuse"), allow(dead_code))]
+    pub fn read_small_files(
+        &mut self,
+        rels: Vec<String>,
+        max_file_bytes: u64,
+        max_total_bytes: u64,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        let root = self.config.remote.path.clone();
+        match self.op(|stream, _| {
+            protocol::send(
+                stream,
+                &Request::ReadSmallFiles {
+                    root: root.clone(),
+                    rels: rels.clone(),
+                    max_file_bytes,
+                    max_total_bytes,
+                },
+            )
+        })? {
+            Response::SmallFiles(files) => Ok(files),
+            _ => Err(MobfsError::Remote("invalid small-files response".to_string())),
+        }
+    }
+
     pub fn download_file(&mut self, rel: &str, meta: &EntryMeta) -> Result<()> {
         let local = self.config.local.root.join(rel);
         if let Some(parent) = local.parent() {

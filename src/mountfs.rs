@@ -113,6 +113,8 @@ pub fn config_from_remote(
 type DirEntries = Vec<(String, EntryMeta)>;
 type DirCache = BTreeMap<String, (Instant, DirEntries)>;
 const WRITE_BUFFER_LIMIT: usize = 32 * 1024 * 1024;
+const PREFETCH_MAX_FILE_BYTES: u64 = 64 * 1024;
+const PREFETCH_MAX_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
 
 struct PendingWrite {
     path: String,
@@ -185,6 +187,26 @@ impl MobfsFuse {
             ino_to_path.insert(ino, path.clone());
         }
         let dir_cache = dir_cache_from_snapshot(&snapshot);
+        let small_files = snapshot
+            .entries
+            .iter()
+            .filter_map(|(path, meta)| {
+                if meta.kind == EntryKind::File && meta.size <= PREFETCH_MAX_FILE_BYTES {
+                    Some(path.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        let prefetched = client
+            .read_small_files(
+                small_files,
+                PREFETCH_MAX_FILE_BYTES,
+                PREFETCH_MAX_TOTAL_BYTES,
+            )
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
         Ok(Self {
             ignore,
             client: Mutex::new(client),
@@ -192,7 +214,7 @@ impl MobfsFuse {
             path_to_ino: Mutex::new(path_to_ino),
             ino_to_path: Mutex::new(ino_to_path),
             read_cache: Mutex::new(BTreeMap::new()),
-            file_cache: Mutex::new(BTreeMap::new()),
+            file_cache: Mutex::new(prefetched),
             dir_cache: Mutex::new(dir_cache),
             handle_to_path: Mutex::new(BTreeMap::new()),
             write_buffers: Mutex::new(BTreeMap::new()),

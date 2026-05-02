@@ -135,6 +135,19 @@ The SSH tunnel was faster than direct private VPN TCP in this run. That means th
 
 WebSockets are not a good fit for the hot filesystem path. They are useful for browser clients and HTTP infrastructure, but MobFS is a native daemon moving encrypted binary filesystem frames. Raw TCP avoids WebSocket HTTP framing/masking/upgrade overhead and keeps the protocol simpler. WebSockets may be useful later for a browser dashboard or hosted control plane, not for the mount data plane.
 
+## Remote-network proof after small-file prefetch
+
+The next pass added `ReadSmallFiles`. During mount startup, the client asks the daemon for small files from the initial snapshot in one request and seeds the whole-file cache. The current limit is files up to 64 KiB with a total prefetch cap of 16 MiB. This targets Git, search, editor, and agent workloads that repeatedly read many small files.
+
+| Operation | Before small-file prefetch | After small-file prefetch |
+| --- | ---: | ---: |
+| Raw FUSE `git status --short` over SSH tunnel | 3.85-3.96s | 0.94s cold, 0.52s warm |
+| `rg` through mount on tiny repo | 0.90-0.91s | 0.12s |
+| `mobfs git status --short` from mount | 0.32-0.41s | 0.17s |
+| 32 MiB streaming FUSE write over SSH tunnel | 4.61s | 5.38s |
+
+The metadata-heavy path improved substantially because Git and search avoid many small remote reads after mount. The 32 MiB write remained in the same rough range; the 5.38s sample is slower than the best 4.61s sample but still close enough to treat as normal remote-link variance unless repeated tests prove a regression.
+
 ## Results after TTL 0 directory reuse and small-file read cache
 
 | Operation | Result | Wall time |
