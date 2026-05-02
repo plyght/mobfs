@@ -39,6 +39,8 @@ pub enum Command {
     #[command(about = "Run a command on the remote in the workspace root  [alias: r]")]
     #[command(visible_alias = "r")]
     Run(RunArgs),
+    #[command(about = "Build on a separate SSH builder that does not own the codebase")]
+    Build(BuildArgs),
     #[command(about = "Run git on the remote after syncing local edits  [alias: g]")]
     #[command(visible_alias = "g")]
     Git(GitArgs),
@@ -190,6 +192,32 @@ pub struct RunArgs {
         required = true,
         trailing_var_arg = true,
         help = "Command and arguments to run remotely"
+    )]
+    pub command: Vec<String>,
+}
+
+#[derive(Args)]
+pub struct BuildArgs {
+    #[arg(long = "on", help = "SSH builder target like user@host")]
+    pub builder: String,
+    #[arg(
+        long,
+        help = "Use an ephemeral mirror on the builder instead of a FUSE mount"
+    )]
+    pub mirror: bool,
+    #[arg(long, help = "Run without syncing local mirror edits first")]
+    pub no_sync: bool,
+    #[arg(
+        long,
+        help = "Path to an artifact inside the builder workspace to copy back"
+    )]
+    pub artifact: Option<PathBuf>,
+    #[arg(long, help = "Local destination for --artifact")]
+    pub out: Option<PathBuf>,
+    #[arg(
+        required = true,
+        trailing_var_arg = true,
+        help = "Build command and arguments to run on the builder"
     )]
     pub command: Vec<String>,
 }

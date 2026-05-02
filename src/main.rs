@@ -31,6 +31,7 @@ fn main() -> Result<()> {
         Command::Sync(args) => sync::sync(args),
         Command::Status => sync::status(),
         Command::Run(args) => sync::run(args),
+        Command::Build(args) => sync::build(args),
         Command::Git(args) => sync::git(args),
         Command::Watch(args) => sync::watch(args),
         Command::Serve(args) => sync::serve(args),

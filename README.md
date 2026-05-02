@@ -167,6 +167,8 @@ mobfs watch
 # Remote commands
 mobfs run <command> [args...]
 mobfs git <args...>
+mobfs build --on builder@example.com -- cargo build --release
+mobfs build --on builder@example.com --artifact target/release/app --out ./app -- cargo build --release
 
 # Daemon, setup, security, and FUSE UX
 mobfs token
@@ -185,6 +187,8 @@ mobfs bench --scale-files 50000 --iterations 3
 ```
 
 Useful aliases: `start` as `up`, `pull` as `get`, `push` as `put`, `sync` as `s`, `status` as `st`, `run` as `r`, `git` as `g`, and `open` as `o`.
+
+`mobfs build --on <builder>` is for the case where the code-owning machine is not the fast machine. The builder connects back to the configured MobFS daemon, mounts the workspace into a temporary directory, runs the build command there, and cleans up afterward. Add `--mirror` to use an ephemeral mirror on the builder when a build tool needs native local filesystem behavior. Add `--artifact <path> --out <path>` to copy a build output back after the command succeeds.
 
 ## No-Local-Code Semantics
 

@@ -1,7 +1,7 @@
 use crate::cli::{
-    BenchArgs, GitArgs, InitArgs, MountArgs, MountDoctorArgs, MountFsArgs, PullArgs, PushArgs,
-    RemoteArgs, RemoteCommand, RemoteHostArgs, RemoteStatusArgs, RunArgs, ServeArgs, SetupArgs,
-    SetupRemoteArgs, StartArgs, SyncArgs, UnmountArgs, WatchArgs,
+    BenchArgs, BuildArgs, GitArgs, InitArgs, MountArgs, MountDoctorArgs, MountFsArgs, PullArgs,
+    PushArgs, RemoteArgs, RemoteCommand, RemoteHostArgs, RemoteStatusArgs, RunArgs, ServeArgs,
+    SetupArgs, SetupRemoteArgs, StartArgs, SyncArgs, UnmountArgs, WatchArgs,
 };
 use crate::config::{
     AppConfig, DEFAULT_CONNECT_RETRIES, DEFAULT_OP_RETRIES, LocalConfig, RemoteConfig, STATE_DIR,
@@ -17,9 +17,10 @@ use crate::ui;
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::path::Path;
 use std::process::Command;
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub fn init(args: InitArgs) -> Result<()> {
     let target = parse_remote(&args.remote)?;
@@ -361,6 +362,17 @@ pub fn run(args: RunArgs) -> Result<()> {
     run_remote(args.command, !args.no_sync)
 }
 
+pub fn build(args: BuildArgs) -> Result<()> {
+    let (config, mirror_workspace) = load_command_config()?;
+    if !args.no_sync && mirror_workspace {
+        sync(SyncArgs {
+            delete: false,
+            dry_run: false,
+        })?;
+    }
+    run_builder_build(args, config)
+}
+
 pub fn git(args: GitArgs) -> Result<()> {
     let mut command = Vec::with_capacity(args.args.len() + 1);
     command.push("git".to_string());
@@ -387,6 +399,128 @@ fn run_remote(command: Vec<String>, sync_first: bool) -> Result<()> {
             "remote command exited with {}",
             code.map(|value| value.to_string())
                 .unwrap_or_else(|| "signal".to_string())
+        )))
+    }
+}
+
+fn run_builder_build(args: BuildArgs, config: AppConfig) -> Result<()> {
+    if args.artifact.is_some() && args.out.is_none() {
+        return Err(MobfsError::Config(
+            "--artifact requires --out so mobfs knows where to copy the build output".to_string(),
+        ));
+    }
+    let token = config.remote.token.clone().ok_or_else(|| {
+        MobfsError::Config(
+            "builder builds require a mobfs token in config or MOBFS_TOKEN".to_string(),
+        )
+    })?;
+    let source = remote_source_spec(&config);
+    let tunnel_flag = if config.remote.ssh_tunnel {
+        " --ssh-tunnel"
+    } else {
+        ""
+    };
+    let command = shell_words(&args.command);
+    let build_id = format!(
+        "{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    );
+    let artifact_copy = args.artifact.as_ref().map(|artifact| {
+        let file_name = artifact
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("artifact");
+        format!(
+            "mkdir -p ~/.mobfs-build-artifacts/{id}; cp {artifact} ~/.mobfs-build-artifacts/{id}/{file_name};",
+            id = build_id,
+            artifact = shell_path_quote(&artifact.display().to_string()),
+            file_name = shell_quote(file_name),
+        )
+    });
+    let workspace_setup = if args.mirror {
+        format!(
+            "mobfs mirror {source} --local \"$work/src\"{tunnel_flag} --token \"$MOBFS_TOKEN\" --no-open >/dev/null; cd \"$work/src\"; mobfs pull >/dev/null;",
+            source = shell_quote(&source),
+            tunnel_flag = tunnel_flag,
+        )
+    } else {
+        format!(
+            "mkdir -p \"$work/src\"; mobfs mount {source} --local \"$work/src\"{tunnel_flag} --token \"$MOBFS_TOKEN\" --no-open >/dev/null; cd \"$work/src\";",
+            source = shell_quote(&source),
+            tunnel_flag = tunnel_flag,
+        )
+    };
+    let cleanup = if args.mirror {
+        "rm -rf \"$work\"".to_string()
+    } else {
+        "mobfs unmount \"$work/src\" >/dev/null 2>&1 || true; rm -rf \"$work\"".to_string()
+    };
+    let remote_command = format!(
+        "set -e; command -v mobfs >/dev/null || {{ echo 'mobfs not found in PATH on builder' >&2; exit 127; }}; export MOBFS_TOKEN={token}; work=$(mktemp -d /tmp/mobfs-build.XXXXXX); trap '{cleanup}' EXIT; {workspace_setup} {command}; {artifact_copy}",
+        token = shell_quote(&token),
+        cleanup = cleanup.replace('\'', "'\\''"),
+        workspace_setup = workspace_setup,
+        command = command,
+        artifact_copy = artifact_copy.unwrap_or_default(),
+    );
+    ui::info("builder", &args.builder);
+    ui::info("source", &source);
+    ui::info("build", args.command.join(" "));
+    let status = Command::new("ssh")
+        .arg(&args.builder)
+        .arg(remote_command)
+        .status()?;
+    if !status.success() {
+        return Err(MobfsError::Remote(format!(
+            "builder command failed with {status}"
+        )));
+    }
+    if let (Some(artifact), Some(out)) = (args.artifact.as_ref(), args.out.as_ref()) {
+        copy_builder_artifact(&args.builder, &build_id, artifact, out)?;
+    }
+    Ok(())
+}
+
+fn remote_source_spec(config: &AppConfig) -> String {
+    let host = if config.remote.user.is_empty() {
+        config.remote.host.clone()
+    } else {
+        format!("{}@{}", config.remote.user, config.remote.host)
+    };
+    format!("{}:{}", host, config.remote.path)
+}
+
+fn shell_words(words: &[String]) -> String {
+    words
+        .iter()
+        .map(|word| shell_quote(word))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn copy_builder_artifact(builder: &str, build_id: &str, artifact: &Path, out: &Path) -> Result<()> {
+    let file_name = artifact
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("artifact");
+    if let Some(parent) = out.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let remote_path = format!(
+        "{}:~/.mobfs-build-artifacts/{}/{}",
+        builder, build_id, file_name
+    );
+    let status = Command::new("scp").arg(remote_path).arg(out).status()?;
+    if status.success() {
+        ui::ok(format!("artifact copied to {}", out.display()));
+        Ok(())
+    } else {
+        Err(MobfsError::Remote(format!(
+            "artifact copy failed with {status}"
         )))
     }
 }
