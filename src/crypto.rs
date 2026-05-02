@@ -117,6 +117,7 @@ impl SecureStream {
     }
 
     fn new(stream: TcpStream, send_key: [u8; 32], recv_key: [u8; 32]) -> Self {
+        let _ = stream.set_nodelay(true);
         Self {
             stream,
             send_cipher: ChaCha20Poly1305::new(Key::from_slice(&send_key)),
@@ -222,8 +223,9 @@ fn read_raw(stream: &mut TcpStream) -> Result<Vec<u8>> {
 fn write_raw(stream: &mut TcpStream, data: &[u8]) -> Result<()> {
     let len = u32::try_from(data.len())
         .map_err(|_| MobfsError::Remote("protocol frame too large".to_string()))?;
-    stream.write_all(&len.to_be_bytes())?;
-    stream.write_all(data)?;
-    stream.flush()?;
+    let mut frame = Vec::with_capacity(4 + data.len());
+    frame.extend_from_slice(&len.to_be_bytes());
+    frame.extend_from_slice(data);
+    stream.write_all(&frame)?;
     Ok(())
 }

@@ -119,6 +119,22 @@ The next pass added `WriteFileAtStream`. The client sends one encrypted JSON con
 
 This is roughly 1.91x faster than the binary request/response write path, 2.64x faster than the buffered JSON path, and 33.9x faster than the initial 156.49s remote baseline. Large sequential writes over the real SSH-tunneled remote link are now in the usable range, though still slower than local TCP. Raw metadata-heavy Git over FUSE remains slow; remote-native `mobfs git` is still the right path for Git.
 
+## Remote-network transport comparison after streaming writes
+
+A direct daemon bind on the private mesh VPN address was tested to isolate SSH tunnel overhead. This exposes `mobfsd` on the private VPN interface rather than listening only on localhost behind `ssh -L`, so it is a performance experiment rather than the default security posture.
+
+| Operation | Transport | Result | Wall time |
+| --- | --- | ---: | ---: |
+| 32 MiB streaming FUSE write | SSH tunnel | success | 4.61s |
+| 32 MiB streaming FUSE write | direct private VPN TCP | success | 6.74s |
+| 32 MiB streaming FUSE write with 64 MiB FUSE buffer | direct private VPN TCP | success | 8.58s |
+| 32 MiB streaming FUSE write with TCP_NODELAY | direct private VPN TCP | success | 7.30s |
+| 32 MiB streaming FUSE write with frame flush removed | direct private VPN TCP | success | 7.24s |
+
+The SSH tunnel was faster than direct private VPN TCP in this run. That means the current bottleneck is not simply SSH tunnel overhead; link route selection, VPN TCP behavior, userspace copies, encryption framing, and FUSE/macOS behavior all matter. The 32 MiB FUSE buffer remains better than 64 MiB, and TCP_NODELAY/frame-flush tuning did not improve this bulk-write case.
+
+WebSockets are not a good fit for the hot filesystem path. They are useful for browser clients and HTTP infrastructure, but MobFS is a native daemon moving encrypted binary filesystem frames. Raw TCP avoids WebSocket HTTP framing/masking/upgrade overhead and keeps the protocol simpler. WebSockets may be useful later for a browser dashboard or hosted control plane, not for the mount data plane.
+
 ## Results after TTL 0 directory reuse and small-file read cache
 
 | Operation | Result | Wall time |
