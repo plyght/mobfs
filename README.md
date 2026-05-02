@@ -9,6 +9,23 @@ MobFS is FUSE-first. The primary product path is a no-local-code, on-demand file
 
 A durable local mirror still exists as `mobfs mirror` for explicit offline/cache workflows, but it is not the default.
 
+## When to use MobFS instead of cloud storage, SSH, or SSHFS
+
+Use MobFS when you want local filesystem UX for a remote-owned codebase: local editors, GUI tools, and coding agents can open a normal path, while Git, dependencies, builds, tests, secrets, and heavyweight compute stay on the remote machine.
+
+MobFS is not trying to replace every remote-file tool:
+
+| If you need | Use | Why |
+| --- | --- | --- |
+| Backup, blobs, artifacts, or sharing finished files | Cloud storage, R2, or S3 | Object stores are excellent for durable blobs, but poor as live source trees with atomic editor saves, symlinks, chmod/mtime, Git metadata access, and remote command execution. |
+| Terminal-only remote development | SSH | SSH is simpler when you do not need local apps to see a mounted workspace path. |
+| A generic remote folder mount | SSHFS | SSHFS is mature and simple for normal file browsing/editing. |
+| Local editor/agent access with remote source ownership and remote-native commands | MobFS | MobFS adds source-tree-oriented caching, ignored heavy directories, `mobfs run`, `mobfs git`, mount registry lookup, and recovery behavior aimed at coding workflows. |
+
+Good MobFS fits include editing Linux code from macOS, keeping client or proprietary source off a laptop disk, using local AI tools against a remote repo, avoiding local dependency/build-cache setup, and building on a faster or architecture-specific host.
+
+Avoid MobFS when you need a backup system, arbitrary high-throughput bulk file transfer, a fully offline local copy by default, or the lowest-friction generic network filesystem.
+
 ## Features
 
 - **No-local-code Mount**: `mobfs mount` creates a read-write FUSE filesystem without pulling the project into a local mirror
@@ -169,6 +186,7 @@ mobfs run <command> [args...]
 mobfs git <args...>
 mobfs build --on builder@example.com -- cargo build --release
 mobfs build --on builder@example.com --artifact target/release/app --out ./app -- cargo build --release
+mobfs build --here --artifact build/App.app --remote-artifact artifacts/App.app -- brisk build
 
 # Daemon, setup, security, and FUSE UX
 mobfs token
@@ -189,6 +207,8 @@ mobfs bench --scale-files 50000 --iterations 3
 Useful aliases: `start` as `up`, `pull` as `get`, `push` as `put`, `sync` as `s`, `status` as `st`, `run` as `r`, `git` as `g`, and `open` as `o`.
 
 `mobfs build --on <builder>` is for the case where the code-owning machine is not the fast machine. The builder connects back to the configured MobFS daemon, mounts the workspace into a temporary directory, runs the build command there, and cleans up afterward. Add `--mirror` to use an ephemeral mirror on the builder when a build tool needs native local filesystem behavior. Add `--artifact <path> --out <path>` to copy a build output back after the command succeeds.
+
+`mobfs build --here` is for the common laptop-builder case: stage the remote workspace into a native local cache directory, run a local command on the fast machine, then publish only a selected artifact back to the remote. This is the recommended path for macOS app builds, Xcode/Brisk workflows, and other metadata-heavy build systems that should not write intermediates through FUSE. Use `--workdir <path>` for a persistent local staging directory, `--keep` to inspect the generated staging directory, `--artifact <path>` to publish a file or directory, and `--remote-artifact <path>` when the remote artifact path should differ.
 
 ## No-Local-Code Semantics
 

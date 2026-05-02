@@ -21,6 +21,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use walkdir::WalkDir;
 
 pub fn init(args: InitArgs) -> Result<()> {
     let target = parse_remote(&args.remote)?;
@@ -364,6 +365,9 @@ pub fn run(args: RunArgs) -> Result<()> {
 
 pub fn build(args: BuildArgs) -> Result<()> {
     let (config, mirror_workspace) = load_command_config()?;
+    if args.here {
+        return run_here_build(args, config, mirror_workspace);
+    }
     if !args.no_sync && mirror_workspace {
         sync(SyncArgs {
             delete: false,
@@ -404,6 +408,9 @@ fn run_remote(command: Vec<String>, sync_first: bool) -> Result<()> {
 }
 
 fn run_builder_build(args: BuildArgs, config: AppConfig) -> Result<()> {
+    let builder = args.builder.as_ref().ok_or_else(|| {
+        MobfsError::Config("choose where to build: use `mobfs build --here -- <cmd>` or `mobfs build --on user@host -- <cmd>`".to_string())
+    })?;
     if args.artifact.is_some() && args.out.is_none() {
         return Err(MobfsError::Config(
             "--artifact requires --out so mobfs knows where to copy the build output".to_string(),
@@ -467,11 +474,11 @@ fn run_builder_build(args: BuildArgs, config: AppConfig) -> Result<()> {
         command = command,
         artifact_copy = artifact_copy.unwrap_or_default(),
     );
-    ui::info("builder", &args.builder);
+    ui::info("builder", builder);
     ui::info("source", &source);
     ui::info("build", args.command.join(" "));
     let status = Command::new("ssh")
-        .arg(&args.builder)
+        .arg(builder)
         .arg(remote_command)
         .status()?;
     if !status.success() {
@@ -480,8 +487,63 @@ fn run_builder_build(args: BuildArgs, config: AppConfig) -> Result<()> {
         )));
     }
     if let (Some(artifact), Some(out)) = (args.artifact.as_ref(), args.out.as_ref()) {
-        copy_builder_artifact(&args.builder, &build_id, artifact, out)?;
+        copy_builder_artifact(builder, &build_id, artifact, out)?;
     }
+    Ok(())
+}
+
+fn run_here_build(args: BuildArgs, source_config: AppConfig, mirror_workspace: bool) -> Result<()> {
+    if !args.no_sync && mirror_workspace {
+        sync(SyncArgs {
+            delete: false,
+            dry_run: false,
+        })?;
+    }
+    let generated_workdir = args.workdir.is_none();
+    let stage_root = args
+        .workdir
+        .clone()
+        .unwrap_or(default_local_build_root(&source_config)?);
+    let mut build_config = source_config.clone();
+    build_config.local.root = stage_root.clone();
+    let spinner = ui::spinner("staging remote workspace");
+    fs::create_dir_all(&stage_root)?;
+    let mut client = StorageClient::connect(build_config.clone())?;
+    let remote = client.snapshot()?;
+    ensure_local_dirs(&build_config, &remote)?;
+    let local_snapshot = local::snapshot(&build_config)?;
+    let plan = pull_items(&local_snapshot, &remote, false);
+    apply_plan(&mut client, &build_config, &remote, &plan)?;
+    local::save_snapshot(&build_config, &remote)?;
+    spinner.finish_and_clear();
+    ui::info("staged", stage_root.display().to_string());
+    ui::info("build", args.command.join(" "));
+    let status = Command::new(&args.command[0])
+        .args(&args.command[1..])
+        .current_dir(&stage_root)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()?;
+    if !status.success() {
+        return Err(MobfsError::Remote(format!(
+            "local build failed with {status}; staged workspace left at {}",
+            stage_root.display()
+        )));
+    }
+    if let Some(artifact) = args.artifact {
+        let remote_artifact = args.remote_artifact.as_deref().unwrap_or(&artifact);
+        let spinner = ui::spinner("publishing artifact");
+        publish_local_artifact(&mut client, &build_config, &artifact, remote_artifact)?;
+        spinner.finish_and_clear();
+        ui::ok(format!("published {}", remote_artifact.display()));
+    }
+    if args.keep || !generated_workdir {
+        ui::info("kept", stage_root.display().to_string());
+    } else {
+        fs::remove_dir_all(&stage_root)?;
+    }
+    ui::ok("local build complete");
     Ok(())
 }
 
@@ -523,6 +585,88 @@ fn copy_builder_artifact(builder: &str, build_id: &str, artifact: &Path, out: &P
             "artifact copy failed with {status}"
         )))
     }
+}
+
+fn default_local_build_root(config: &AppConfig) -> Result<std::path::PathBuf> {
+    let base = dirs::cache_dir().ok_or_else(|| {
+        MobfsError::Config("could not determine user cache directory for local build".to_string())
+    })?;
+    let name = default_workspace_name(None, &config.remote.host, &config.remote.path);
+    let id = format!("{}-{}", unix_timestamp(), std::process::id());
+    Ok(base.join("mobfs").join("local-builds").join(name).join(id))
+}
+
+fn publish_local_artifact(
+    client: &mut StorageClient,
+    config: &AppConfig,
+    artifact: &Path,
+    remote_artifact: &Path,
+) -> Result<()> {
+    let src = config.local.root.join(artifact);
+    if !src.exists() {
+        return Err(MobfsError::InvalidPath(format!(
+            "artifact {} does not exist",
+            src.display()
+        )));
+    }
+    if src.is_dir() {
+        for entry in WalkDir::new(&src).into_iter() {
+            let entry = entry?;
+            let path = entry.path();
+            let rel_inside = path.strip_prefix(&src).map_err(|_| {
+                MobfsError::InvalidPath(format!("invalid artifact path {}", path.display()))
+            })?;
+            let remote_rel = remote_artifact.join(rel_inside);
+            let remote_rel = path_to_rel(&remote_rel)?;
+            if entry.file_type().is_dir() {
+                client.mkdir_p(&remote_rel)?;
+            } else {
+                let stage_rel = path_to_rel(&artifact.join(rel_inside))?;
+                if stage_rel == remote_rel {
+                    client.upload_file(&stage_rel)?;
+                } else {
+                    upload_artifact_alias(client, config, path, &remote_rel)?;
+                }
+            }
+        }
+    } else {
+        let stage_rel = path_to_rel(artifact)?;
+        let remote_rel = path_to_rel(remote_artifact)?;
+        if stage_rel == remote_rel {
+            client.upload_file(&stage_rel)?;
+        } else {
+            upload_artifact_alias(client, config, &src, &remote_rel)?;
+        }
+    }
+    Ok(())
+}
+
+fn upload_artifact_alias(
+    client: &mut StorageClient,
+    config: &AppConfig,
+    src: &Path,
+    remote_rel: &str,
+) -> Result<()> {
+    let dst = config.local.root.join(remote_rel);
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(src, &dst)?;
+    client.upload_file(remote_rel)
+}
+
+fn path_to_rel(path: &Path) -> Result<String> {
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err(MobfsError::InvalidPath(format!(
+            "expected relative path, got {}",
+            path.display()
+        )));
+    }
+    Ok(path.to_string_lossy().trim_start_matches('/').to_string())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -602,7 +746,7 @@ pub fn token() -> Result<()> {
 pub fn unmount(args: UnmountArgs) -> Result<()> {
     let mountpoint = match args.mountpoint {
         Some(path) => path,
-        None => AppConfig::load()?.local.root,
+        None => load_command_config()?.0.local.root,
     };
     let status = if cfg!(target_os = "macos") {
         Command::new("diskutil")
@@ -905,8 +1049,9 @@ fn create_scale_fixture(config: &AppConfig, files: u32, files_per_dir: u32) -> R
 }
 
 pub fn doctor() -> Result<()> {
-    let config = AppConfig::load()?;
+    let (config, mirror_workspace) = load_command_config()?;
     ui::info("local", config.local.root.display().to_string());
+    ui::info("mode", if mirror_workspace { "mirror" } else { "mount" });
     ui::info(
         "remote",
         format!("{}:{}", config.remote.host, config.remote.path),

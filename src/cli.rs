@@ -39,7 +39,7 @@ pub enum Command {
     #[command(about = "Run a command on the remote in the workspace root  [alias: r]")]
     #[command(visible_alias = "r")]
     Run(RunArgs),
-    #[command(about = "Build on a separate SSH builder that does not own the codebase")]
+    #[command(about = "Build somewhere fast, while the remote keeps source and artifacts")]
     Build(BuildArgs),
     #[command(about = "Run git on the remote after syncing local edits  [alias: g]")]
     #[command(visible_alias = "g")]
@@ -198,26 +198,46 @@ pub struct RunArgs {
 
 #[derive(Args)]
 pub struct BuildArgs {
-    #[arg(long = "on", help = "SSH builder target like user@host")]
-    pub builder: String,
+    #[arg(
+        long = "on",
+        conflicts_with = "here",
+        help = "SSH builder target like user@host"
+    )]
+    pub builder: Option<String>,
     #[arg(
         long,
-        help = "Use an ephemeral mirror on the builder instead of a FUSE mount"
+        alias = "local",
+        conflicts_with = "builder",
+        help = "Build on this machine in a staged local workspace"
+    )]
+    pub here: bool,
+    #[arg(
+        long,
+        help = "Use an ephemeral mirror on the SSH builder instead of a FUSE mount"
     )]
     pub mirror: bool,
     #[arg(long, help = "Run without syncing local mirror edits first")]
     pub no_sync: bool,
+    #[arg(long, help = "Path to an artifact inside the build workspace")]
+    pub artifact: Option<PathBuf>,
+    #[arg(long, help = "Local destination for --artifact when using --on")]
+    pub out: Option<PathBuf>,
+    #[arg(long, help = "Remote destination for --artifact when using --here")]
+    pub remote_artifact: Option<PathBuf>,
     #[arg(
         long,
-        help = "Path to an artifact inside the builder workspace to copy back"
+        help = "Persistent local staging directory for --here; defaults to a MobFS cache directory"
     )]
-    pub artifact: Option<PathBuf>,
-    #[arg(long, help = "Local destination for --artifact")]
-    pub out: Option<PathBuf>,
+    pub workdir: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Keep the generated --here staging directory after the build"
+    )]
+    pub keep: bool,
     #[arg(
         required = true,
         trailing_var_arg = true,
-        help = "Build command and arguments to run on the builder"
+        help = "Build command and arguments"
     )]
     pub command: Vec<String>,
 }
