@@ -111,6 +111,46 @@ fn handle_client(stream: TcpStream, token: &str, policy: &RootPolicy) -> Result<
             }
             continue;
         }
+        if let Request::WriteFileAtBinary {
+            root,
+            rel,
+            offset,
+            len,
+        } = request
+        {
+            let response = match stream.read_encrypted() {
+                Ok(data) if data.len() as u64 == len => {
+                    handle_write_file_at_bytes(root, rel, offset, &data, policy)
+                        .map(|()| Response::Ok)
+                        .unwrap_or_else(|error| Response::Error {
+                            message: error.to_string(),
+                        })
+                }
+                Ok(_) => Response::Error {
+                    message: "binary write length mismatch".to_string(),
+                },
+                Err(error) => Response::Error {
+                    message: error.to_string(),
+                },
+            };
+            protocol::write_frame(&mut stream, &response)?;
+            continue;
+        }
+        if let Request::WriteFileAtStream {
+            root,
+            rel,
+            offset,
+            len,
+        } = request
+        {
+            let response = handle_write_file_at_stream(root, rel, offset, len, policy, &mut stream)
+                .map(|()| Response::Ok)
+                .unwrap_or_else(|error| Response::Error {
+                    message: error.to_string(),
+                });
+            protocol::write_frame(&mut stream, &response)?;
+            continue;
+        }
         let response = handle_request(request, policy).unwrap_or_else(|error| Response::Error {
             message: error.to_string(),
         });
@@ -142,6 +182,8 @@ fn request_label(request: &Request) -> &'static str {
         Request::WriteFileChunk { .. } => "WriteFileChunk",
         Request::WriteFileOffset { .. } => "WriteFileOffset",
         Request::WriteFileAt { .. } => "WriteFileAt",
+        Request::WriteFileAtBinary { .. } => "WriteFileAtBinary",
+        Request::WriteFileAtStream { .. } => "WriteFileAtStream",
         Request::Truncate { .. } => "Truncate",
         Request::Fsync { .. } => "Fsync",
         Request::Rename { .. } => "Rename",
@@ -288,6 +330,9 @@ fn handle_request(request: Request, policy: &RootPolicy) -> Result<Response> {
             file.write_all(&data)?;
             Ok(Response::Ok)
         }
+        Request::WriteFileAtBinary { .. } | Request::WriteFileAtStream { .. } => Err(MobfsError::Remote(
+            "binary write requests are streamed".to_string(),
+        )),
         Request::Truncate { root, rel, size } => {
             let root = policy.check(&root)?;
             let path = safe_join(&root, &rel)?;
@@ -387,6 +432,59 @@ fn handle_request(request: Request, policy: &RootPolicy) -> Result<Response> {
         }
         Request::Run { .. } => Err(MobfsError::Remote("run requests are streamed".to_string())),
     }
+}
+
+fn handle_write_file_at_bytes(
+    root: String,
+    rel: String,
+    offset: u64,
+    data: &[u8],
+    policy: &RootPolicy,
+) -> Result<()> {
+    let root = policy.check(&root)?;
+    let path = safe_join(&root, &rel)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    file.write_all(data)?;
+    Ok(())
+}
+
+fn handle_write_file_at_stream(
+    root: String,
+    rel: String,
+    offset: u64,
+    len: u64,
+    policy: &RootPolicy,
+    stream: &mut SecureStream,
+) -> Result<()> {
+    let root = policy.check(&root)?;
+    let path = safe_join(&root, &rel)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut written = 0_u64;
+    while written < len {
+        let data = stream.read_encrypted()?;
+        written = written.saturating_add(data.len() as u64);
+        if written > len {
+            return Err(MobfsError::Remote("binary write length mismatch".to_string()));
+        }
+        file.write_all(&data)?;
+    }
+    Ok(())
 }
 
 fn handle_run(

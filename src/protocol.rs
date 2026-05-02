@@ -3,7 +3,7 @@ use crate::error::{MobfsError, Result};
 use crate::snapshot::Snapshot;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
@@ -58,6 +58,18 @@ pub enum Request {
         rel: String,
         offset: u64,
         data: Vec<u8>,
+    },
+    WriteFileAtBinary {
+        root: String,
+        rel: String,
+        offset: u64,
+        len: u64,
+    },
+    WriteFileAtStream {
+        root: String,
+        rel: String,
+        offset: u64,
+        len: u64,
     },
     Truncate {
         root: String,
@@ -145,6 +157,23 @@ pub enum RunStream {
 
 pub fn send(stream: &mut SecureStream, request: &Request) -> Result<Response> {
     write_frame(stream, request)?;
+    read_response(stream)
+}
+
+pub fn send_with_byte_stream(
+    stream: &mut SecureStream,
+    request: &Request,
+    data: &[u8],
+    chunk_size: usize,
+) -> Result<Response> {
+    write_frame(stream, request)?;
+    for chunk in data.chunks(chunk_size) {
+        stream.write_encrypted(chunk)?;
+    }
+    read_response(stream)
+}
+
+fn read_response(stream: &mut SecureStream) -> Result<Response> {
     let response: Response = read_frame(stream)?;
     if let Response::Error { message } = response {
         Err(MobfsError::Remote(message))

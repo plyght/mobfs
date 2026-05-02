@@ -112,6 +112,13 @@ pub fn config_from_remote(
 
 type DirEntries = Vec<(String, EntryMeta)>;
 type DirCache = BTreeMap<String, (Instant, DirEntries)>;
+const WRITE_BUFFER_LIMIT: usize = 32 * 1024 * 1024;
+
+struct PendingWrite {
+    path: String,
+    offset: u64,
+    data: Vec<u8>,
+}
 
 struct MobfsFuse {
     client: Mutex<RemoteClient>,
@@ -122,6 +129,7 @@ struct MobfsFuse {
     file_cache: Mutex<BTreeMap<String, Vec<u8>>>,
     dir_cache: Mutex<DirCache>,
     handle_to_path: Mutex<BTreeMap<u64, String>>,
+    write_buffers: Mutex<BTreeMap<u64, PendingWrite>>,
     journal: PathBuf,
     ttl: Duration,
     ignore: Vec<String>,
@@ -187,6 +195,7 @@ impl MobfsFuse {
             file_cache: Mutex::new(BTreeMap::new()),
             dir_cache: Mutex::new(dir_cache),
             handle_to_path: Mutex::new(BTreeMap::new()),
+            write_buffers: Mutex::new(BTreeMap::new()),
             journal,
             ttl,
         })
@@ -214,6 +223,20 @@ impl MobfsFuse {
 
     fn clear_record(&self) -> std::result::Result<(), Errno> {
         clear_journal(&self.journal).map_err(|_| Errno::EIO)
+    }
+
+    fn flush_write_buffer(&self, fh: u64) -> std::result::Result<(), Errno> {
+        let pending = self.write_buffers.lock().unwrap().remove(&fh);
+        if let Some(pending) = pending {
+            self.client
+                .lock()
+                .unwrap()
+                .write_file_at(&pending.path, pending.offset, pending.data.clone())
+                .map_err(|_| Errno::EIO)?;
+            self.invalidate_path_cache(&pending.path);
+            self.update_file_write(&pending.path, pending.offset, pending.data.len());
+        }
+        Ok(())
     }
 
     fn update_entry(&self, path: &str, meta: EntryMeta) {
@@ -714,35 +737,50 @@ impl Filesystem for MobfsFuse {
             reply.error(Errno::EACCES);
             return;
         }
+        let fh = u64::from(fh);
         let data = data.to_vec();
-        if self
-            .record(&JournalOp::WriteAt {
-                path: path.clone(),
-                offset,
-                data: data.clone(),
-            })
-            .is_err()
-        {
-            reply.error(Errno::EIO);
-            return;
-        }
-        let write_result = {
-            self.client
-                .lock()
-                .unwrap()
-                .write_file_at(&path, offset, data.clone())
-        };
-        match write_result {
-            Ok(()) => {
-                self.invalidate_path_cache(&path);
-                self.update_file_write(&path, offset, data.len());
-                match self.clear_record() {
-                    Ok(()) => reply.written(data.len() as u32),
-                    Err(errno) => reply.error(errno),
+        let data_len = data.len();
+        let flush_needed = {
+            let mut buffers = self.write_buffers.lock().unwrap();
+            match buffers.get_mut(&fh) {
+                Some(pending)
+                    if pending.path == path
+                        && pending.offset.saturating_add(pending.data.len() as u64) == offset
+                        && pending.data.len().saturating_add(data_len) <= WRITE_BUFFER_LIMIT =>
+                {
+                    pending.data.extend_from_slice(&data);
+                    false
+                }
+                Some(_) => true,
+                None => {
+                    buffers.insert(
+                        fh,
+                        PendingWrite {
+                            path: path.clone(),
+                            offset,
+                            data: data.clone(),
+                        },
+                    );
+                    false
                 }
             }
-            Err(_) => reply.error(Errno::EIO),
+        };
+        if flush_needed {
+            if self.flush_write_buffer(fh).is_err() {
+                reply.error(Errno::EIO);
+                return;
+            }
+            self.write_buffers.lock().unwrap().insert(
+                fh,
+                PendingWrite {
+                    path: path.clone(),
+                    offset,
+                    data,
+                },
+            );
         }
+        self.update_file_write(&path, offset, data_len);
+        reply.written(data_len as u32);
     }
 
     fn flush(
@@ -754,7 +792,10 @@ impl Filesystem for MobfsFuse {
         reply: ReplyEmpty,
     ) {
         match self.path_for_handle(ino, fh) {
-            Some(_) => reply.ok(),
+            Some(_) => match self.flush_write_buffer(u64::from(fh)) {
+                Ok(()) => reply.ok(),
+                Err(errno) => reply.error(errno),
+            },
             None => reply.error(Errno::ENOENT),
         }
     }
@@ -768,10 +809,16 @@ impl Filesystem for MobfsFuse {
         reply: ReplyEmpty,
     ) {
         match self.path_for_handle(ino, fh) {
-            Some(path) => match self.client.lock().unwrap().fsync(&path) {
-                Ok(()) => reply.ok(),
-                Err(_) => reply.error(Errno::EIO),
-            },
+            Some(path) => {
+                if let Err(errno) = self.flush_write_buffer(u64::from(fh)) {
+                    reply.error(errno);
+                    return;
+                }
+                match self.client.lock().unwrap().fsync(&path) {
+                    Ok(()) => reply.ok(),
+                    Err(_) => reply.error(Errno::EIO),
+                }
+            }
             None => reply.error(Errno::ENOENT),
         }
     }

@@ -52,6 +52,73 @@ Fixture: `/Users/nicojaffer/wax`
 | Clean `du -sh /tmp/mobfs-wax-proof` with `--cache-ttl-secs 0` | 61M | 0.23s |
 | 32 MiB zero-filled write through FUSE mount | success | 0.84s |
 
+## Remote-network proof over private mesh VPN
+
+An anonymized Raspberry Pi 5 class ARM Linux host was tested over a private mesh VPN from macOS on a low-latency Wi-Fi link. The daemon listened only on localhost on the remote host and the client connected through `mobfs mount --ssh-tunnel`. The test workspace was a small Git repository created only for this proof.
+
+| Operation | Result | Wall time |
+| --- | ---: | ---: |
+| ICMP round trip before test | reachable | roughly 20-36ms |
+| Remote release build on ARM Linux | success | 2m56s |
+| No-local-code mount over SSH tunnel | success | mounted locally |
+| Read small README through mount | success | 0.01s |
+| `rg` through mount on tiny repo | 2 matches | 0.83s |
+| Raw FUSE `git status --short` | success | 3.88s |
+| Agent temp-write plus rename | success | 0.83s |
+| 32 MiB write through FUSE | success | 156.49s |
+| `find` over tiny repo through mount | 32 files | 1.19s |
+| `mobfs run pwd` from mount | remote workspace path | 0.37s |
+| `mobfs git status --short` from mount | success | 0.36s |
+
+Interpretation: remote command offload is already responsive over the real remote link, but the raw FUSE write path was not acceptable for large writes over network latency. The local proof fixture had 32 MiB writes under one second, while the remote SSH-tunneled path took over two minutes. The likely bottleneck was per-write-chunk synchronous local journaling, short socket timeouts, and request/response round trips rather than raw link bandwidth alone. This result should be treated as the first remote-network baseline, not a product claim.
+
+## Remote-network proof after write buffering and timeout tuning
+
+The first optimization pass removed per-chunk durable mount journaling for successful write calls, buffered contiguous FUSE writes per open handle up to 4 MiB, flushed buffered data on `flush`/`fsync`, and increased daemon socket read/write timeouts from 1s to 15s. A 1s timeout preserved fast failure during earlier local chaos tests, but was too low for multi-megabyte encrypted frames over a real SSH-tunneled remote link.
+
+| Operation | Result | Wall time |
+| --- | ---: | ---: |
+| 32 MiB write through FUSE before timeout tuning | failed at 8 MiB | 4.06s |
+| 32 MiB write through FUSE after timeout tuning | success | 12.15s |
+| `rg` through mount on tiny repo | 2 matches | 0.93s |
+| Raw FUSE `git status --short` | success | 3.79s |
+| Agent temp-write plus rename | success | 0.84s |
+| `find` over tiny repo through mount | 34 files | 1.26s |
+| `mobfs git status --short` from mount | success | 0.29s |
+
+This is a roughly 12.9x improvement for the 32 MiB remote write path versus the initial 156.49s baseline, but it is still much slower than the local-TCP fixture. Remote command offload remains the recommended path for Git and build/test workloads over real links. The next write-path target is reducing request/response serialization and encryption overhead for large writes without weakening recovery semantics too much.
+
+A follow-up test raised the FUSE write buffer from 4 MiB to 16 MiB. The same 32 MiB write slowed to 16.84s, so 4 MiB remains the better measured buffer size on this link. Larger encrypted JSON frames appear to add enough serialization/encryption or tunnel overhead to offset fewer round trips.
+
+## Remote-network proof after binary write payloads
+
+The next pass added a `WriteFileAtBinary` request. Metadata still uses the normal encrypted JSON protocol frame, but the file bytes are sent as a separate encrypted binary frame instead of being serialized as a JSON `Vec<u8>`.
+
+| Operation | Result | Wall time |
+| --- | ---: | ---: |
+| 32 MiB write through FUSE with JSON payloads | success | 12.15s |
+| 32 MiB write through FUSE with binary payloads | success | 8.81s |
+| `rg` through mount on tiny repo | 2 matches | 0.91s |
+| Raw FUSE `git status --short` | success | 3.85s |
+| `mobfs git status --short` from mount | success | 0.32s |
+
+This is a roughly 1.38x improvement over the buffered JSON write path and roughly 17.8x faster than the initial 156.49s remote baseline. The remaining overhead is likely encrypted-frame copying, request/response waiting per buffered write, FUSE/macOS writeback behavior, SSH tunnel overhead, and remote filesystem sync/write costs. The next likely improvement is a true streaming bulk-write mode that opens a remote write session and sends multiple binary chunks before waiting for final acknowledgement.
+
+## Remote-network proof after streaming binary writes
+
+The next pass added `WriteFileAtStream`. The client sends one encrypted JSON control frame with path/offset/length, then streams encrypted binary chunks without waiting for per-chunk acknowledgements. The daemon writes chunks as they arrive and sends one final acknowledgement after the full payload is written. The FUSE write buffer was raised to 32 MiB for this streaming path so a 32 MiB sequential write can cross the link as one write session.
+
+| Operation | Result | Wall time |
+| --- | ---: | ---: |
+| 32 MiB write through FUSE with binary request/response payloads | success | 8.81s |
+| 32 MiB write through FUSE with streaming binary chunks | success | 4.61s |
+| Small write plus read-back through mount | success | 0.26s |
+| `rg` through mount on tiny repo | 2 matches | 0.90s |
+| Raw FUSE `git status --short` | success | 3.96s |
+| `mobfs git status --short` from mount | success | 0.41s |
+
+This is roughly 1.91x faster than the binary request/response write path, 2.64x faster than the buffered JSON path, and 33.9x faster than the initial 156.49s remote baseline. Large sequential writes over the real SSH-tunneled remote link are now in the usable range, though still slower than local TCP. Raw metadata-heavy Git over FUSE remains slow; remote-native `mobfs git` is still the right path for Git.
+
 ## Results after TTL 0 directory reuse and small-file read cache
 
 | Operation | Result | Wall time |

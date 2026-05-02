@@ -15,6 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub const TRANSFER_CHUNK_SIZE: usize = 1024 * 1024;
+const STREAM_WRITE_CHUNK_SIZE: usize = 1024 * 1024;
 
 pub struct RemoteClient {
     config: AppConfig,
@@ -52,8 +53,8 @@ impl RemoteClient {
             (config.remote.host.clone(), port, None)
         };
         let stream = TcpStream::connect((host.as_str(), port))?;
-        stream.set_read_timeout(Some(Duration::from_secs(1)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(1)))?;
+        stream.set_read_timeout(Some(Duration::from_secs(15)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(15)))?;
         let token = config
             .remote
             .token
@@ -199,14 +200,16 @@ impl RemoteClient {
         let root = self.config.remote.path.clone();
         let rel = rel.to_string();
         self.op(|stream, _| {
-            protocol::send(
+            protocol::send_with_byte_stream(
                 stream,
-                &Request::WriteFileAt {
+                &Request::WriteFileAtStream {
                     root: root.clone(),
                     rel: rel.clone(),
                     offset,
-                    data: data.clone(),
+                    len: data.len() as u64,
                 },
+                &data,
+                STREAM_WRITE_CHUNK_SIZE,
             )
         })?;
         Ok(())
