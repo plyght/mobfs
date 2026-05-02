@@ -141,13 +141,15 @@ fn handle_client(stream: TcpStream, token: &str, policy: &RootPolicy) -> Result<
             rel,
             offset,
             len,
+            op_id,
         } = request
         {
-            let response = handle_write_file_at_stream(root, rel, offset, len, policy, &mut stream)
-                .map(|()| Response::Ok)
-                .unwrap_or_else(|error| Response::Error {
-                    message: error.to_string(),
-                });
+            let response =
+                handle_write_file_at_stream(root, rel, offset, len, op_id, policy, &mut stream)
+                    .map(|()| Response::Ok)
+                    .unwrap_or_else(|error| Response::Error {
+                        message: error.to_string(),
+                    });
             protocol::write_frame(&mut stream, &response)?;
             continue;
         }
@@ -356,10 +358,15 @@ fn handle_request(request: Request, policy: &RootPolicy) -> Result<Response> {
             file.write_all(&data)?;
             Ok(Response::Ok)
         }
-        Request::WriteFileAtBinary { .. } | Request::WriteFileAtStream { .. } => Err(MobfsError::Remote(
-            "binary write requests are streamed".to_string(),
-        )),
-        Request::Truncate { root, rel, size } => {
+        Request::WriteFileAtBinary { .. } | Request::WriteFileAtStream { .. } => Err(
+            MobfsError::Remote("binary write requests are streamed".to_string()),
+        ),
+        Request::Truncate {
+            root,
+            rel,
+            size,
+            op_id,
+        } => once(policy, &root, op_id.as_deref(), || {
             let root = policy.check(&root)?;
             let path = safe_join(&root, &rel)?;
             if let Some(parent) = path.parent() {
@@ -372,7 +379,7 @@ fn handle_request(request: Request, policy: &RootPolicy) -> Result<Response> {
                 .open(path)?;
             file.set_len(size)?;
             Ok(Response::Ok)
-        }
+        }),
         Request::Fsync { root, rel } => {
             let root = policy.check(&root)?;
             fs::OpenOptions::new()
@@ -381,16 +388,23 @@ fn handle_request(request: Request, policy: &RootPolicy) -> Result<Response> {
                 .sync_all()?;
             Ok(Response::Ok)
         }
-        Request::Rename { root, from, to } => {
+        Request::Rename {
+            root,
+            from,
+            to,
+            op_id,
+        } => once(policy, &root, op_id.as_deref(), || {
             let root = policy.check(&root)?;
             let from = safe_join(&root, &from)?;
             let to = safe_join(&root, &to)?;
             if let Some(parent) = to.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::rename(from, to)?;
+            if from.exists() {
+                fs::rename(from, to)?;
+            }
             Ok(Response::Ok)
-        }
+        }),
         Request::WriteFileFinish {
             root,
             rel,
@@ -410,7 +424,12 @@ fn handle_request(request: Request, policy: &RootPolicy) -> Result<Response> {
             fs::rename(temp, path)?;
             Ok(Response::Ok)
         }
-        Request::Symlink { root, rel, target } => {
+        Request::Symlink {
+            root,
+            rel,
+            target,
+            op_id,
+        } => once(policy, &root, op_id.as_deref(), || {
             let root = policy.check(&root)?;
             let path = safe_join(&root, &rel)?;
             if let Some(parent) = path.parent() {
@@ -424,13 +443,14 @@ fn handle_request(request: Request, policy: &RootPolicy) -> Result<Response> {
                 "symlinks are not supported on this platform".to_string(),
             ));
             Ok(Response::Ok)
-        }
+        }),
         Request::SetMetadata {
             root,
             rel,
             mode,
             modified,
-        } => {
+            op_id,
+        } => once(policy, &root, op_id.as_deref(), || {
             let root = policy.check(&root)?;
             let path = safe_join(&root, &rel)?;
             if let Some(mode) = mode {
@@ -440,13 +460,18 @@ fn handle_request(request: Request, policy: &RootPolicy) -> Result<Response> {
                 set_mtime(&path, modified)?;
             }
             Ok(Response::Ok)
-        }
-        Request::Mkdir { root, rel } => {
+        }),
+        Request::Mkdir { root, rel, op_id } => once(policy, &root, op_id.as_deref(), || {
             let root = policy.check(&root)?;
             fs::create_dir_all(safe_join(&root, &rel)?)?;
             Ok(Response::Ok)
-        }
-        Request::Remove { root, rel, dir } => {
+        }),
+        Request::Remove {
+            root,
+            rel,
+            dir,
+            op_id,
+        } => once(policy, &root, op_id.as_deref(), || {
             let root = policy.check(&root)?;
             let path = safe_join(&root, &rel)?;
             if dir && path.exists() {
@@ -455,7 +480,7 @@ fn handle_request(request: Request, policy: &RootPolicy) -> Result<Response> {
                 fs::remove_file(path)?;
             }
             Ok(Response::Ok)
-        }
+        }),
         Request::Run { .. } => Err(MobfsError::Remote("run requests are streamed".to_string())),
     }
 }
@@ -487,11 +512,18 @@ fn handle_write_file_at_stream(
     rel: String,
     offset: u64,
     len: u64,
+    op_id: Option<String>,
     policy: &RootPolicy,
     stream: &mut SecureStream,
 ) -> Result<()> {
-    let root = policy.check(&root)?;
-    let path = safe_join(&root, &rel)?;
+    if let Some(op_id) = op_id.as_deref()
+        && op_done(policy, &root, op_id)?
+    {
+        drain_stream_bytes(stream, len)?;
+        return Ok(());
+    }
+    let root_path = policy.check(&root)?;
+    let path = safe_join(&root_path, &rel)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -506,11 +538,75 @@ fn handle_write_file_at_stream(
         let data = stream.read_encrypted()?;
         written = written.saturating_add(data.len() as u64);
         if written > len {
-            return Err(MobfsError::Remote("binary write length mismatch".to_string()));
+            return Err(MobfsError::Remote(
+                "binary write length mismatch".to_string(),
+            ));
         }
         file.write_all(&data)?;
     }
+    if let Some(op_id) = op_id.as_deref() {
+        mark_op_done(policy, &root, op_id)?;
+    }
     Ok(())
+}
+
+fn drain_stream_bytes(stream: &mut SecureStream, len: u64) -> Result<()> {
+    let mut read = 0_u64;
+    while read < len {
+        let data = stream.read_encrypted()?;
+        read = read.saturating_add(data.len() as u64);
+        if read > len {
+            return Err(MobfsError::Remote(
+                "binary write length mismatch".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn once(
+    policy: &RootPolicy,
+    root: &str,
+    op_id: Option<&str>,
+    action: impl FnOnce() -> Result<Response>,
+) -> Result<Response> {
+    if let Some(op_id) = op_id
+        && op_done(policy, root, op_id)?
+    {
+        return Ok(Response::Ok);
+    }
+    let value = action()?;
+    if let Some(op_id) = op_id {
+        mark_op_done(policy, root, op_id)?;
+    }
+    Ok(value)
+}
+
+fn op_done(policy: &RootPolicy, root: &str, op_id: &str) -> Result<bool> {
+    Ok(op_marker_path(policy, root, op_id)?.exists())
+}
+
+fn mark_op_done(policy: &RootPolicy, root: &str, op_id: &str) -> Result<()> {
+    let marker = op_marker_path(policy, root, op_id)?;
+    if let Some(parent) = marker.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(marker, b"done")?;
+    Ok(())
+}
+
+fn op_marker_path(policy: &RootPolicy, root: &str, op_id: &str) -> Result<PathBuf> {
+    let root = policy.check(root)?;
+    let root_hash = hex::encode(sha2::Sha256::digest(root.to_string_lossy().as_bytes()));
+    let safe = op_id
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .collect::<String>();
+    Ok(std::env::temp_dir()
+        .join("mobfsd")
+        .join("ops")
+        .join(root_hash)
+        .join(safe))
 }
 
 fn handle_run(

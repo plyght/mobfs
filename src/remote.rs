@@ -177,7 +177,9 @@ impl RemoteClient {
             )
         })? {
             Response::SmallFiles(files) => Ok(files),
-            _ => Err(MobfsError::Remote("invalid small-files response".to_string())),
+            _ => Err(MobfsError::Remote(
+                "invalid small-files response".to_string(),
+            )),
         }
     }
 
@@ -231,6 +233,7 @@ impl RemoteClient {
                     rel: rel.clone(),
                     offset,
                     len: data.len() as u64,
+                    op_id: Some(op_id_for_bytes("write-at", &root, &rel, offset, &data)),
                 },
                 &data,
                 STREAM_WRITE_CHUNK_SIZE,
@@ -250,6 +253,7 @@ impl RemoteClient {
                     root: root.clone(),
                     rel: rel.clone(),
                     size,
+                    op_id: Some(op_id_for("truncate", &[&root, &rel, &size.to_string()])),
                 },
             )
         })?;
@@ -284,6 +288,7 @@ impl RemoteClient {
                     root: root.clone(),
                     from: from.clone(),
                     to: to.clone(),
+                    op_id: Some(op_id_for("rename", &[&root, &from, &to])),
                 },
             )
         })?;
@@ -307,6 +312,7 @@ impl RemoteClient {
                         root: root.clone(),
                         rel: rel.clone(),
                         target: target.clone(),
+                        op_id: Some(op_id_for("symlink", &[&root, &rel, &target])),
                     },
                 )
             })?;
@@ -411,6 +417,7 @@ impl RemoteClient {
                 &Request::Mkdir {
                     root: root.clone(),
                     rel: rel.clone(),
+                    op_id: Some(op_id_for("mkdir", &[&root, &rel])),
                 },
             )
         })?;
@@ -429,6 +436,7 @@ impl RemoteClient {
                     root: root.clone(),
                     rel: rel.clone(),
                     target: target.clone(),
+                    op_id: Some(op_id_for("symlink", &[&root, &rel, &target])),
                 },
             )
         })?;
@@ -452,6 +460,10 @@ impl RemoteClient {
                     rel: rel.clone(),
                     mode,
                     modified,
+                    op_id: Some(op_id_for(
+                        "metadata",
+                        &[&root, &rel, &format!("{mode:?}"), &format!("{modified:?}")],
+                    )),
                 },
             )
         })?;
@@ -469,6 +481,7 @@ impl RemoteClient {
                     root: root.clone(),
                     rel: rel.clone(),
                     dir,
+                    op_id: Some(op_id_for("remove", &[&root, &rel, &dir.to_string()])),
                 },
             )
         })?;
@@ -591,6 +604,30 @@ fn mode(metadata: &fs::Metadata) -> u32 {
         let _ = metadata;
         0
     }
+}
+
+fn op_id_for(kind: &str, parts: &[&str]) -> String {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(kind.as_bytes());
+    for part in parts {
+        hasher.update([0]);
+        hasher.update(part.as_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn op_id_for_bytes(kind: &str, root: &str, rel: &str, offset: u64, data: &[u8]) -> String {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(kind.as_bytes());
+    hasher.update([0]);
+    hasher.update(root.as_bytes());
+    hasher.update([0]);
+    hasher.update(rel.as_bytes());
+    hasher.update([0]);
+    hasher.update(offset.to_le_bytes());
+    hasher.update([0]);
+    hasher.update(data);
+    hex::encode(hasher.finalize())
 }
 
 fn upload_id_for(rel: &str, metadata: &fs::Metadata) -> String {

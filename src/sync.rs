@@ -1,6 +1,6 @@
 use crate::cli::{
     BenchArgs, GitArgs, InitArgs, MountArgs, MountDoctorArgs, MountFsArgs, PullArgs, PushArgs,
-    RunArgs, ServeArgs, SetupArgs, StartArgs, SyncArgs, UnmountArgs, WatchArgs,
+    RunArgs, ServeArgs, SetupArgs, SetupRemoteArgs, StartArgs, SyncArgs, UnmountArgs, WatchArgs,
 };
 use crate::config::{
     AppConfig, DEFAULT_CONNECT_RETRIES, DEFAULT_OP_RETRIES, LocalConfig, RemoteConfig, STATE_DIR,
@@ -178,6 +178,29 @@ fn new_config(
     }
 }
 
+fn unix_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn pending_write_count(config: &AppConfig, mirror_workspace: bool) -> usize {
+    let mirror_pending = if mirror_workspace {
+        crate::journal::pending_count(config).unwrap_or(0)
+    } else {
+        0
+    };
+    #[cfg(feature = "fuse")]
+    {
+        mirror_pending + crate::mountfs::pending_journal_ops(config).unwrap_or(0)
+    }
+    #[cfg(not(feature = "fuse"))]
+    {
+        mirror_pending
+    }
+}
+
 fn write_config(config: &AppConfig) -> Result<()> {
     fs::create_dir_all(config.local.root.join(STATE_DIR))?;
     let previous = std::env::current_dir()?;
@@ -274,12 +297,43 @@ pub fn sync(args: SyncArgs) -> Result<()> {
 }
 
 pub fn status() -> Result<()> {
-    let config = AppConfig::load()?;
+    let (config, mirror_workspace) = load_command_config()?;
+    let pending = pending_write_count(&config, mirror_workspace);
     let spinner = ui::spinner("scanning local and remote");
-    let local_snapshot = local::snapshot(&config)?;
-    let mut client = StorageClient::connect(config)?;
-    let remote = client.snapshot()?;
+    let local_snapshot = if mirror_workspace {
+        local::snapshot(&config)?
+    } else {
+        Snapshot::default()
+    };
+    let mut client = match StorageClient::connect(config.clone()) {
+        Ok(client) => client,
+        Err(error) => {
+            spinner.finish_and_clear();
+            ui::change("connection", "reconnecting");
+            ui::change("pending-writes", pending.to_string());
+            ui::change("last-error", error.to_string());
+            return Ok(());
+        }
+    };
+    let remote = match client.snapshot() {
+        Ok(remote) => remote,
+        Err(error) => {
+            spinner.finish_and_clear();
+            ui::change("connection", "reconnecting");
+            ui::change("pending-writes", pending.to_string());
+            ui::change("last-error", error.to_string());
+            return Ok(());
+        }
+    };
     spinner.finish_and_clear();
+    ui::change("connection", "connected");
+    ui::change("mode", if mirror_workspace { "mirror" } else { "mount" });
+    ui::change("pending-writes", pending.to_string());
+    ui::change("last-synced", unix_timestamp().to_string());
+    if !mirror_workspace {
+        ui::info("remote-entries", remote.entries.len().to_string());
+        return Ok(());
+    }
     let items = status_plan(&local_snapshot, &remote);
     if items.is_empty() {
         ui::ok("clean");
@@ -526,6 +580,72 @@ pub fn setup(args: SetupArgs) -> Result<()> {
     ui::command("mobfs doctor");
     ui::command("mobfs security");
     Ok(())
+}
+
+pub fn setup_remote(args: SetupRemoteArgs) -> Result<()> {
+    let token = args.token.unwrap_or_else(crate::config::generate_token);
+    let root = args.root.display().to_string();
+    let remote_root = shell_path_quote(&root);
+    let remote_command = format!(
+        "mkdir -p {root} ~/.mobfsd && command -v mobfs >/dev/null && MOBFS_TOKEN={token} mobfs daemon --bind 127.0.0.1:{port} --allow-root {root} --token \"$MOBFS_TOKEN\" > ~/.mobfsd/daemon.log 2>&1 &",
+        root = remote_root,
+        token = shell_quote(&token),
+        port = args.port,
+    );
+    let name = args
+        .name
+        .as_ref()
+        .map(|value| format!(" --name {}", shell_quote(value)))
+        .unwrap_or_default();
+    if args.dry_run {
+        ui::section("Remote setup");
+        ui::command(format!(
+            "ssh {} {}",
+            args.ssh_target,
+            shell_quote(&remote_command)
+        ));
+        ui::blank();
+        ui::section("Local mount");
+        ui::command(format!(
+            "MOBFS_TOKEN={} mobfs mount {}:{} --ssh-tunnel{name}",
+            shell_quote(&token),
+            args.ssh_target,
+            args.root.display()
+        ));
+        return Ok(());
+    }
+    let status = Command::new("ssh")
+        .arg(&args.ssh_target)
+        .arg(remote_command)
+        .status()?;
+    if !status.success() {
+        return Err(MobfsError::Remote(format!(
+            "remote setup failed with {status}; ensure mobfs is installed on {} and SSH works",
+            args.ssh_target
+        )));
+    }
+    ui::ok("remote daemon start requested");
+    ui::info("token", token);
+    ui::command(format!(
+        "MOBFS_TOKEN=... mobfs mount {}:{} --ssh-tunnel{name}",
+        args.ssh_target,
+        args.root.display()
+    ));
+    Ok(())
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn shell_path_quote(value: &str) -> String {
+    if value == "~" {
+        return "~".to_string();
+    }
+    if let Some(rest) = value.strip_prefix("~/") {
+        return format!("~/{}", shell_quote(rest));
+    }
+    shell_quote(value)
 }
 
 pub fn bench(args: BenchArgs) -> Result<()> {

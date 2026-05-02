@@ -60,6 +60,9 @@ pub enum Command {
     Token,
     #[command(about = "Print remote daemon setup commands")]
     Setup(SetupArgs),
+    #[command(about = "Install/start mobfsd on a remote host over SSH  [alias: sr]")]
+    #[command(visible_alias = "sr")]
+    SetupRemote(SetupRemoteArgs),
     #[command(about = "Check workspace and daemon connectivity")]
     Doctor,
     #[command(about = "Benchmark snapshot and daemon transfer performance")]
@@ -269,6 +272,22 @@ pub struct SetupArgs {
     pub port: u16,
     #[arg(long, env = "MOBFS_TOKEN", help = "Shared mobfsd token")]
     pub token: Option<String>,
+}
+
+#[derive(Args)]
+pub struct SetupRemoteArgs {
+    #[arg(help = "SSH target like user@host")]
+    pub ssh_target: String,
+    #[arg(long, help = "Remote workspace root to create and allow")]
+    pub root: PathBuf,
+    #[arg(long, default_value_t = 7727, help = "mobfsd port")]
+    pub port: u16,
+    #[arg(long, env = "MOBFS_TOKEN", help = "Shared mobfsd token")]
+    pub token: Option<String>,
+    #[arg(long, help = "Print commands without running SSH")]
+    pub dry_run: bool,
+    #[arg(long, help = "Workspace name to show in the suggested mount command")]
+    pub name: Option<String>,
 }
 
 #[derive(Args)]

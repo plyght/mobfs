@@ -57,6 +57,10 @@ fn save(config: &AppConfig, journal: &Journal) -> Result<()> {
     Ok(())
 }
 
+pub fn pending_count(config: &AppConfig) -> Result<usize> {
+    Ok(load(config)?.pending.len())
+}
+
 fn path(config: &AppConfig) -> PathBuf {
     config.local.root.join(STATE_DIR).join(JOURNAL_FILE)
 }

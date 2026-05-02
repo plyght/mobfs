@@ -96,6 +96,13 @@ For a setup template, run:
 mobfs setup /srv/projects --host example.com
 ```
 
+For one-command SSH setup that creates the remote root and starts `mobfsd` on the remote host:
+
+```bash
+mobfs setup-remote nico@example.com --root ~/code
+mobfs mount nico@example.com:~/code/app --ssh-tunnel
+```
+
 Mirror mode stores workspace configuration in `.mobfs.toml`:
 
 ```toml
@@ -160,6 +167,7 @@ mobfs git <args...>
 # Daemon, setup, security, and FUSE UX
 mobfs token
 mobfs setup /srv/projects --host example.com
+mobfs setup-remote nico@example.com --root ~/code
 mobfs daemon --bind 127.0.0.1:7727 --allow-root /srv/projects --token "$MOBFS_TOKEN"
 mobfs doctor
 mobfs mount-doctor /Volumes/app
@@ -205,6 +213,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 Recommended benchmark fixtures:
 
+- `scripts/chaos.sh /Volumes/app`
 - `mobfs bench --scale-files 50000 --iterations 3`
 - `mobfs bench --scale-files 300000 --files-per-dir 1000 --iterations 3`
 - a Linux-kernel-sized many-file tree

@@ -3,7 +3,7 @@ use crate::error::{MobfsError, Result};
 use crate::snapshot::Snapshot;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 11;
+pub const PROTOCOL_VERSION: u32 = 12;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
@@ -76,11 +76,13 @@ pub enum Request {
         rel: String,
         offset: u64,
         len: u64,
+        op_id: Option<String>,
     },
     Truncate {
         root: String,
         rel: String,
         size: u64,
+        op_id: Option<String>,
     },
     Fsync {
         root: String,
@@ -90,6 +92,7 @@ pub enum Request {
         root: String,
         from: String,
         to: String,
+        op_id: Option<String>,
     },
     WriteFileFinish {
         root: String,
@@ -102,21 +105,25 @@ pub enum Request {
         root: String,
         rel: String,
         target: String,
+        op_id: Option<String>,
     },
     SetMetadata {
         root: String,
         rel: String,
         mode: Option<u32>,
         modified: Option<i64>,
+        op_id: Option<String>,
     },
     Mkdir {
         root: String,
         rel: String,
+        op_id: Option<String>,
     },
     Remove {
         root: String,
         rel: String,
         dir: bool,
+        op_id: Option<String>,
     },
     Run {
         root: String,

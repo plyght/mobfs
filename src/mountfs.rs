@@ -255,11 +255,11 @@ impl MobfsFuse {
                 offset: pending.offset,
                 data: pending.data.clone(),
             })?;
-            let write_result = self
-                .client
-                .lock()
-                .unwrap()
-                .write_file_at(&pending.path, pending.offset, pending.data.clone());
+            let write_result = self.client.lock().unwrap().write_file_at(
+                &pending.path,
+                pending.offset,
+                pending.data.clone(),
+            );
             if write_result.is_err() {
                 self.recover_journal()?;
             }
@@ -278,18 +278,16 @@ impl MobfsFuse {
             }
             let result = {
                 let mut client = self.client.lock().unwrap();
-                client.reconnect().and_then(|_| replay_journal(&self.journal, &mut client))
+                client
+                    .reconnect()
+                    .and_then(|_| replay_journal(&self.journal, &mut client))
             };
             match result {
                 Ok(()) => return Ok(()),
                 Err(_) => last_failed = true,
             }
         }
-        if last_failed {
-            Err(Errno::EIO)
-        } else {
-            Ok(())
-        }
+        if last_failed { Err(Errno::EIO) } else { Ok(()) }
     }
 
     fn update_entry(&self, path: &str, meta: EntryMeta) {
@@ -1377,6 +1375,16 @@ fn dir_cache_from_snapshot(snapshot: &Snapshot) -> DirCache {
     dirs.into_iter()
         .map(|(path, entries)| (path, (now, entries)))
         .collect()
+}
+
+pub fn pending_journal_ops(config: &AppConfig) -> Result<usize> {
+    let path = mountfs_journal_path(config);
+    let data = match std::fs::read_to_string(path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(data.lines().filter(|line| !line.trim().is_empty()).count())
 }
 
 fn mountfs_journal_path(config: &AppConfig) -> PathBuf {
