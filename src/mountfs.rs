@@ -79,7 +79,7 @@ pub fn config_from_remote(
         remote: RemoteConfig {
             backend: target.backend,
             host: target.host,
-            user: String::new(),
+            user: target.user,
             path: target.path,
             port,
             identity: None,
@@ -104,7 +104,7 @@ pub fn config_from_remote(
                 ".mobfs-mountfs-journal.jsonl".to_string(),
             ],
             connect_retries: crate::config::DEFAULT_CONNECT_RETRIES,
-            operation_retries: 0,
+            operation_retries: crate::config::DEFAULT_OP_RETRIES,
             cache_ttl_secs: 1,
         },
     })
@@ -250,15 +250,46 @@ impl MobfsFuse {
     fn flush_write_buffer(&self, fh: u64) -> std::result::Result<(), Errno> {
         let pending = self.write_buffers.lock().unwrap().remove(&fh);
         if let Some(pending) = pending {
-            self.client
+            self.record(&JournalOp::WriteAt {
+                path: pending.path.clone(),
+                offset: pending.offset,
+                data: pending.data.clone(),
+            })?;
+            let write_result = self
+                .client
                 .lock()
                 .unwrap()
-                .write_file_at(&pending.path, pending.offset, pending.data.clone())
-                .map_err(|_| Errno::EIO)?;
+                .write_file_at(&pending.path, pending.offset, pending.data.clone());
+            if write_result.is_err() {
+                self.recover_journal()?;
+            }
             self.invalidate_path_cache(&pending.path);
             self.update_file_write(&pending.path, pending.offset, pending.data.len());
+            self.clear_record()?;
         }
         Ok(())
+    }
+
+    fn recover_journal(&self) -> std::result::Result<(), Errno> {
+        let mut last_failed = false;
+        for attempt in 0..crate::config::DEFAULT_OP_RETRIES {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_millis(100 * u64::from(attempt).min(20)));
+            }
+            let result = {
+                let mut client = self.client.lock().unwrap();
+                client.reconnect().and_then(|_| replay_journal(&self.journal, &mut client))
+            };
+            match result {
+                Ok(()) => return Ok(()),
+                Err(_) => last_failed = true,
+            }
+        }
+        if last_failed {
+            Err(Errno::EIO)
+        } else {
+            Ok(())
+        }
     }
 
     fn update_entry(&self, path: &str, meta: EntryMeta) {
@@ -1054,7 +1085,7 @@ impl Filesystem for MobfsFuse {
                 .truncate(&path, 0)
                 .and_then(|_| client.set_metadata(&path, Some(mode), None))
         };
-        if create_result.is_err() {
+        if create_result.is_err() && self.recover_journal().is_err() {
             reply.error(Errno::EIO);
             return;
         }

@@ -59,14 +59,14 @@ mobfs daemon --bind 127.0.0.1:7727 --allow-root /srv/projects --token "$MOBFS_TO
 Mount a remote workspace locally without mirroring code:
 
 ```bash
-mobfs mount example.com:/srv/projects/app --name app --token "$MOBFS_TOKEN" --ssh-tunnel
+mobfs mount nico@example.com:/srv/projects/app --name app --token "$MOBFS_TOKEN" --ssh-tunnel
 cd /Volumes/app
 ```
 
 On non-macOS systems, the default mount root is `~/MobFSMounts/<name>`. You can choose any mountpoint:
 
 ```bash
-mobfs mount example.com:/srv/projects/app --local ~/mnt/app --token "$MOBFS_TOKEN" --ssh-tunnel
+mobfs mount nico@example.com:/srv/projects/app --local ~/mnt/app --token "$MOBFS_TOKEN" --ssh-tunnel
 ```
 
 Run remote commands from a configured mirror workspace or directly inside a no-local-code mount. Mount mode records a small user-cache registry outside the source tree so these helpers work without creating `.mobfs.toml` in the mount:
@@ -81,7 +81,7 @@ For metadata-heavy commands such as `git status`, prefer `mobfs git` when you wa
 Use mirror mode only when you intentionally want a durable local working tree:
 
 ```bash
-mobfs mirror example.com:/srv/projects/app --name app --token "$MOBFS_TOKEN" --ssh-tunnel
+mobfs mirror nico@example.com:/srv/projects/app --name app --token "$MOBFS_TOKEN" --ssh-tunnel
 cd ~/MobFS/app
 mobfs pull
 mobfs push
@@ -116,11 +116,13 @@ connect_retries = 8
 operation_retries = 5
 ```
 
-Remote targets use one of these forms:
+Remote targets use one of these forms. Include `user@` when the SSH login user differs from the local username:
 
 ```bash
 mobfs mount host:/absolute/path
+mobfs mount user@host:/absolute/path
 mobfs mirror host:/absolute/path
+mobfs mirror user@host:/absolute/path
 ```
 
 Folder-style backends are available for explicit mirror workflows:
@@ -219,7 +221,7 @@ Recommended benchmark fixtures:
 - `crypto.rs`: Authenticated encrypted client/server stream setup
 - `daemon.rs`: Remote filesystem server and root access policy
 - `protocol.rs`: Wire protocol requests, responses, and streaming command output
-- `remote.rs`: Daemon client, retry handling, SSH tunneling, resumable transfers, and remote operations
+- `remote.rs`: Daemon client, retry handling, user-aware SSH tunneling, resumable transfers, and remote operations
 - `storage.rs`: Backend abstraction for daemon and folder-backed remotes
 - `snapshot.rs`: File metadata snapshots, planning, drift detection, and conflict logic
 - `local.rs`: Local tree scanning, ignore handling, and snapshot persistence for mirror mode
@@ -240,9 +242,9 @@ Run `mobfs security` for the short operational checklist.
 
 ## Crash Recovery Dogfooding
 
-Abuse-test the FUSE path before release by killing the client and daemon during large writes, atomic editor saves, renames, `git add`, and `git status`. After restart, remount with `--cache-ttl-secs 0`, verify checksums for large files, verify no `.mobfs-upload-*` temp file replaced a final path, and run the project test suite remotely with `mobfs run`.
+Abuse-test the FUSE path before release by killing the client and daemon during large writes, atomic editor saves, renames, `git add`, and `git status`. After restart, verify checksums for large files, verify no `.mobfs-upload-*` temp file replaced a final path, and run the project test suite remotely with `mobfs run`.
 
-Current local chaos testing confirms mid-write daemon death now fails the writer quickly instead of hanging for over a minute, and remount recovery succeeds. Same-mount seamless recovery after a hard mid-write daemon kill is still future work.
+Current local and Raspberry Pi remote chaos testing confirms daemon restart recovery on an existing mount for normal buffered writes. Mount-mode writes are journaled before remote flush and replayed after reconnect. Hard mid-write daemon death should keep failing quickly instead of hanging, but still needs broader flaky-network and sleep/wake testing before MobFS can honestly claim full mosh-style seamlessness.
 
 ## License
 

@@ -48,7 +48,7 @@ impl RemoteClient {
         }
         let port = config.remote.port;
         let (host, port, tunnel) = if config.remote.ssh_tunnel {
-            start_ssh_tunnel(&config.remote.host, port)?
+            start_ssh_tunnel(&config.remote.host, &config.remote.user, port)?
         } else {
             (config.remote.host.clone(), port, None)
         };
@@ -507,7 +507,7 @@ impl RemoteClient {
         })
     }
 
-    fn reconnect(&mut self) -> Result<()> {
+    pub fn reconnect(&mut self) -> Result<()> {
         let mut next = Self::connect(self.config.clone())?;
         std::mem::swap(&mut self.stream, &mut next.stream);
         std::mem::swap(&mut self.tunnel, &mut next.tunnel);
@@ -536,15 +536,24 @@ impl RemoteClient {
     }
 }
 
-fn start_ssh_tunnel(host: &str, remote_port: u16) -> Result<(String, u16, Option<Child>)> {
+fn start_ssh_tunnel(
+    host: &str,
+    user: &str,
+    remote_port: u16,
+) -> Result<(String, u16, Option<Child>)> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let local_port = listener.local_addr()?.port();
     drop(listener);
+    let ssh_target = if user.is_empty() {
+        host.to_string()
+    } else {
+        format!("{user}@{host}")
+    };
     let mut child = Command::new("ssh")
         .arg("-N")
         .arg("-L")
         .arg(format!("127.0.0.1:{local_port}:127.0.0.1:{remote_port}"))
-        .arg(host)
+        .arg(ssh_target)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

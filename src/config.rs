@@ -67,6 +67,7 @@ fn default_cache_ttl_secs() -> u64 {
 pub struct RemoteTarget {
     pub backend: StorageBackend,
     pub host: String,
+    pub user: String,
     pub path: String,
 }
 
@@ -146,23 +147,31 @@ pub fn parse_remote(input: &str) -> Result<RemoteTarget> {
         return Ok(RemoteTarget {
             backend,
             host: scheme.to_string(),
+            user: String::new(),
             path: expand_home(&path),
         });
     }
 
-    let (host, path) = input.split_once(':').ok_or_else(|| {
+    let (host_part, path) = input.split_once(':').ok_or_else(|| {
         MobfsError::InvalidRemote(
-            "expected host:/absolute/path or backend:///absolute/path".to_string(),
+            "expected [user@]host:/absolute/path or backend:///absolute/path".to_string(),
         )
     })?;
-    if host.is_empty() || path.is_empty() || !path.starts_with('/') {
+    if host_part.is_empty() || path.is_empty() || !path.starts_with('/') {
         return Err(MobfsError::InvalidRemote(
-            "expected host:/absolute/path or backend:///absolute/path".to_string(),
+            "expected [user@]host:/absolute/path or backend:///absolute/path".to_string(),
         ));
     }
+    let (user, host) = match host_part.rsplit_once('@') {
+        Some((user, host)) if !user.is_empty() && !host.is_empty() => {
+            (user.to_string(), host.to_string())
+        }
+        _ => (String::new(), host_part.to_string()),
+    };
     Ok(RemoteTarget {
         backend: StorageBackend::Daemon,
-        host: host.to_string(),
+        host,
+        user,
         path: path.trim_end_matches('/').to_string(),
     })
 }

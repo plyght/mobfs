@@ -119,6 +119,12 @@ The next pass added `WriteFileAtStream`. The client sends one encrypted JSON con
 
 This is roughly 1.91x faster than the binary request/response write path, 2.64x faster than the buffered JSON path, and 33.9x faster than the initial 156.49s remote baseline. Large sequential writes over the real SSH-tunneled remote link are now in the usable range, though still slower than local TCP. Raw metadata-heavy Git over FUSE remains slow; remote-native `mobfs git` is still the right path for Git.
 
+## Remote-network proof after same-mount recovery fix
+
+A later Raspberry Pi remote proof used `nico@100.74.238.62:/home/nico/wax` over `--ssh-tunnel` after adding `user@host` parsing and restoring mount operation retries. The daemon was killed and restarted while the mount stayed active. A normal buffered write through the existing mount completed in `0.80s` and read back successfully.
+
+Interpretation: same-mount daemon restart recovery now works for normal buffered writes on the real remote link. This is closer to the mosh-style goal, but it is not yet a complete spotty-network claim; sleep/wake, IP changes, long partitions, and hard mid-stream large-write failures still need dedicated chaos tests.
+
 ## Remote-network transport comparison after streaming writes
 
 A direct daemon bind on the private mesh VPN address was tested to isolate SSH tunnel overhead. This exposes `mobfsd` on the private VPN interface rather than listening only on localhost behind `ssh -L`, so it is a performance experiment rather than the default security posture.

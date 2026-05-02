@@ -148,6 +148,18 @@ mobfs git status --short
 
 `mobfs git status --short` reported the existing modified `README.md` in `0.72s`.
 
+## Latest Raspberry Pi remote proof after recovery fix
+
+A follow-up proof used `nico@100.74.238.62:/home/nico/wax` to validate user-aware SSH targets and same-mount daemon restart recovery.
+
+What passed:
+
+- `mobfs mount nico@100.74.238.62:/home/nico/wax --ssh-tunnel` mounted successfully without a manual tunnel
+- killing and restarting the remote daemon no longer required unmount/remount for a normal buffered write
+- post-restart write through the existing mount completed in `0.80s` and read back `recovery-ok`
+
+This verifies the immediate blocker found in the first Raspberry Pi run: same-mount recovery after daemon restart for normal writes. Broader flaky-network, sleep/wake, and mid-stream large-write chaos testing is still needed before claiming full mosh-style behavior.
+
 ## What is still not ready
 
 ### Near-native filesystem performance
