@@ -6,7 +6,7 @@ Host: macOS 26.5 Beta (25F5058e), Darwin 25.5.0 arm64 on `MacBook-Pro-2.local`
 
 MobFS build: `target/release/mobfs` from this checkout.
 
-Fixture: `/Users/nicojaffer/wax`
+Fixture: `/Users/plyght/wax`
 
 - Apparent fixture size: `11G`
 - Mounted traversal size after default ignores: `61M`
@@ -15,7 +15,7 @@ Fixture: `/Users/nicojaffer/wax`
 - Git state before testing: `README.md` modified
 - Daemon: local TCP daemon bound to `127.0.0.1:7727`
 - Mountpoint: `/tmp/mobfs-wax-proof`
-- Mount command: `mobfs mount 127.0.0.1:/Users/nicojaffer/wax --local /tmp/mobfs-wax-proof --port 7727 --no-open --cache-ttl-secs 0`
+- Mount command: `mobfs mount 127.0.0.1:/Users/plyght/wax --local /tmp/mobfs-wax-proof --port 7727 --no-open --cache-ttl-secs 0`
 - Token: local throwaway token
 
 ## Results after FUSE write/traversal optimization
@@ -32,9 +32,9 @@ Fixture: `/Users/nicojaffer/wax`
 | 32 MiB zero-filled write through FUSE mount | success | 1.37s |
 | `find /tmp/mobfs-wax-proof -type f \| wc -l` with `--cache-ttl-secs 1` | 1057 files | 0.21-0.25s |
 | `du -sh /tmp/mobfs-wax-proof` | 61M | 0.11s |
-| `mobfs run pwd` from mirror workspace | `/Users/nicojaffer/wax` | 0.61s |
+| `mobfs run pwd` from mirror workspace | `/Users/plyght/wax` | 0.61s |
 | `mobfs git status --short` from mirror workspace | showed `M README.md` | 0.72s |
-| `mobfs run pwd` directly from no-local-code mount root | `/Users/nicojaffer/wax` | 0.31s |
+| `mobfs run pwd` directly from no-local-code mount root | `/Users/plyght/wax` | 0.31s |
 | `mobfs git status --short` directly from no-local-code mount root | showed `M README.md` | 0.13s |
 | Temporary branch checkout cycle through raw FUSE | success | 1.11s |
 | `mobfs run cargo check` directly from no-local-code mount root | success | 8.51s including crate downloads |
@@ -121,7 +121,7 @@ This is roughly 1.91x faster than the binary request/response write path, 2.64x 
 
 ## Remote-network proof after same-mount recovery fix
 
-A later Raspberry Pi remote proof used `nico@100.74.238.62:/home/nico/wax` over `--ssh-tunnel` after adding `user@host` parsing and restoring mount operation retries. The daemon was killed and restarted while the mount stayed active. A normal buffered write through the existing mount completed in `0.80s` and read back successfully.
+A later Raspberry Pi remote proof used `plyght@100.74.238.62:/home/plyght/wax` over `--ssh-tunnel` after adding `user@host` parsing and restoring mount operation retries. The daemon was killed and restarted while the mount stayed active. A normal buffered write through the existing mount completed in `0.80s` and read back successfully.
 
 Interpretation: same-mount daemon restart recovery now works for normal buffered writes on the real remote link. This is closer to the mosh-style goal, but it is not yet a complete spotty-network claim; sleep/wake, IP changes, long partitions, and hard mid-stream large-write failures still need dedicated chaos tests.
 
@@ -166,15 +166,15 @@ The metadata-heavy path improved substantially because Git and search avoid many
 
 ## Native baseline on same fixture
 
-These commands ran directly against `/Users/nicojaffer/wax` on the same machine. The `find` and `du` comparisons pruned/ignored `target` to match the mount's default heavy-directory ignore behavior.
+These commands ran directly against `/Users/plyght/wax` on the same machine. The `find` and `du` comparisons pruned/ignored `target` to match the mount's default heavy-directory ignore behavior.
 
 | Operation | Result | Wall time |
 | --- | ---: | ---: |
-| `rg -n "struct\|enum\|impl" /Users/nicojaffer/wax/src` | 147 lines | 0.01-0.02s |
+| `rg -n "struct\|enum\|impl" /Users/plyght/wax/src` | 147 lines | 0.01-0.02s |
 | `git status --short` | showed `M README.md` | 0.02-0.04s |
 | `git diff -- README.md` | 248 bytes | 0.01s |
-| `find /Users/nicojaffer/wax -path /Users/nicojaffer/wax/target -prune -o -type f -print \| wc -l` | completed | 0.01-0.04s |
-| `du -sh -I target /Users/nicojaffer/wax` | completed | 0.00s |
+| `find /Users/plyght/wax -path /Users/plyght/wax/target -prune -o -type f -print \| wc -l` | completed | 0.01-0.04s |
+| `du -sh -I target /Users/plyght/wax` | completed | 0.00s |
 
 ## Before/after summary
 

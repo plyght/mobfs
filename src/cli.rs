@@ -17,6 +17,9 @@ pub enum Command {
     #[command(about = "Mount if needed, then run the resilient sync loop  [alias: up]")]
     #[command(visible_alias = "up")]
     Start(StartArgs),
+    #[command(about = "Start the remote daemon over SSH, then mount the workspace  [alias: c]")]
+    #[command(visible_alias = "c")]
+    Connect(ConnectArgs),
     #[command(about = "Mount a no-local-code on-demand read-write filesystem  [alias: add]")]
     #[command(visible_alias = "add")]
     Mount(MountArgs),
@@ -119,6 +122,33 @@ pub struct StartArgs {
     pub delete: bool,
     #[arg(long, help = "Do not open Finder after mounting")]
     pub no_open: bool,
+}
+
+#[derive(Args)]
+pub struct ConnectArgs {
+    #[arg(help = "Remote root like user@host:/absolute/path")]
+    pub remote: String,
+    #[arg(
+        long,
+        help = "Workspace name under /Volumes on macOS or ~/MobFSMounts elsewhere"
+    )]
+    pub name: Option<String>,
+    #[arg(long, help = "Local mountpoint")]
+    pub local: Option<PathBuf>,
+    #[arg(long, default_value_t = 7727, help = "mobfsd port")]
+    pub port: u16,
+    #[arg(long, env = "MOBFS_TOKEN", help = "Shared mobfsd token")]
+    pub token: Option<String>,
+    #[arg(
+        long,
+        default_value_t = 1,
+        help = "Kernel attribute/entry cache TTL in seconds"
+    )]
+    pub cache_ttl_secs: u64,
+    #[arg(long, help = "Do not open Finder after mounting")]
+    pub no_open: bool,
+    #[arg(long, help = "Stop any running ~/.mobfsd daemon before starting")]
+    pub restart: bool,
 }
 
 #[derive(Args)]

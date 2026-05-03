@@ -42,17 +42,10 @@ mobfs mount-doctor /Volumes/app
 
 ## Usage
 
-Start a daemon on the machine that owns the workspace:
+Start the remote daemon and mount the workspace with one command:
 
 ```bash
-export MOBFS_TOKEN="$(mobfs token)"
-mobfs daemon --bind 127.0.0.1:7727 --allow-root /srv/projects --token "$MOBFS_TOKEN"
-```
-
-Mount the workspace locally through SSH:
-
-```bash
-mobfs mount nico@example.com:/srv/projects/app --name app --token "$MOBFS_TOKEN" --ssh-tunnel
+mobfs connect plyght@example.com:/srv/projects/app --name app
 cd /Volumes/app
 ```
 
@@ -76,7 +69,7 @@ Running `git` directly through the FUSE mount works for normal cases, but metada
 Use mirror mode only when you intentionally want a durable local working tree:
 
 ```bash
-mobfs mirror nico@example.com:/srv/projects/app --name app --token "$MOBFS_TOKEN" --ssh-tunnel
+mobfs mirror plyght@example.com:/srv/projects/app --name app --token "$MOBFS_TOKEN" --ssh-tunnel
 cd ~/MobFS/app
 mobfs pull
 mobfs push
@@ -87,6 +80,7 @@ mobfs sync
 
 ```bash
 # No-local-code mount path
+mobfs connect user@host:/absolute/path --name app
 mobfs mount host:/absolute/path --name app
 mobfs mount user@host:/absolute/path --local ~/mnt/app --ssh-tunnel
 mobfs unmount /Volumes/app
@@ -107,10 +101,11 @@ mobfs watch
 
 # Daemon and setup
 mobfs token
+mobfs connect plyght@example.com:/srv/projects/app --name app
 mobfs setup /srv/projects --host example.com
-mobfs remote start nico@example.com --root ~/code
-mobfs remote status nico@example.com
-mobfs remote restart nico@example.com --root ~/code
+mobfs remote start plyght@example.com --root ~/code
+mobfs remote status plyght@example.com
+mobfs remote restart plyght@example.com --root ~/code
 mobfs daemon --bind 127.0.0.1:7727 --allow-root /srv/projects --token "$MOBFS_TOKEN"
 mobfs doctor
 mobfs security
@@ -121,11 +116,18 @@ Useful aliases: `start` as `up`, `pull` as `get`, `push` as `put`, `sync` as `s`
 
 ## Configuration
 
-For one-command SSH setup that creates the remote root and starts `mobfsd` on the remote host:
+For one-command SSH setup that creates the remote root, starts `mobfsd`, creates a token, opens an SSH tunnel, and mounts the workspace:
 
 ```bash
-mobfs remote start nico@example.com --root ~/code
-mobfs mount nico@example.com:~/code/app --ssh-tunnel
+mobfs connect plyght@example.com:/srv/projects/app --name app
+```
+
+If you want to manage the daemon separately:
+
+```bash
+export MOBFS_TOKEN="$(mobfs token)"
+mobfs remote start plyght@example.com --root /srv/projects --token "$MOBFS_TOKEN"
+mobfs mount plyght@example.com:/srv/projects/app --name app --token "$MOBFS_TOKEN" --ssh-tunnel
 ```
 
 Mirror mode stores workspace configuration in `.mobfs.toml`:

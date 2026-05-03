@@ -8,9 +8,9 @@ This document records manual proof testing. The first pass intentionally avoided
 
 - OS: macOS 26.5 Beta (25F5058e), Darwin 25.5.0 arm64
 - macFUSE: installed
-- Repo under test: `/Users/nicojaffer/wax`
+- Repo under test: `/Users/plyght/wax`
 - MobFS binary: `target/release/mobfs`
-- Daemon root allowlist: `/Users/nicojaffer`
+- Daemon root allowlist: `/Users/plyght`
 - Daemon bind: `127.0.0.1:7727`
 - Mountpoint: `/tmp/mobfs-wax-proof`
 
@@ -21,11 +21,11 @@ cargo build --release
 
 MOBFS_TOKEN=local-proof-token target/release/mobfs daemon \
   --bind 127.0.0.1:7727 \
-  --allow-root /Users/nicojaffer \
+  --allow-root /Users/plyght \
   --token local-proof-token
 
 MOBFS_TOKEN=local-proof-token target/release/mobfs mount \
-  127.0.0.1:/Users/nicojaffer/wax \
+  127.0.0.1:/Users/plyght/wax \
   --local /tmp/mobfs-wax-proof \
   --port 7727 \
   --no-open \
@@ -51,7 +51,7 @@ du -sh /tmp/mobfs-wax-proof
 
 ### Mount startup
 
-The mount came up and listed `/Users/nicojaffer/wax` contents through `/tmp/mobfs-wax-proof`.
+The mount came up and listed `/Users/plyght/wax` contents through `/tmp/mobfs-wax-proof`.
 
 Observed top-level entries included:
 
@@ -90,7 +90,7 @@ This passed through the FUSE mount. The latest measured flow, including symlink 
 2. Write `.agent.tmp`.
 3. Rename `.agent.tmp` to `agent.txt`.
 4. Read back `agent.txt`.
-5. Verify the remote-side file in `/Users/nicojaffer/wax` contained the same content.
+5. Verify the remote-side file in `/Users/plyght/wax` contained the same content.
 
 ### Metadata and namespace operations
 
@@ -103,7 +103,7 @@ The following worked through the mount and were reflected in the remote tree:
 
 ### Daemon restart recovery
 
-After intentionally killing the daemon and starting it again on the same port, the existing mount recovered on the next write. Writing `mobfs-recovery-proof.txt` through the mount succeeded in `0.58s` in the earlier pass and `0.06s` in the latest pass, and appeared in `/Users/nicojaffer/wax`.
+After intentionally killing the daemon and starting it again on the same port, the existing mount recovered on the next write. Writing `mobfs-recovery-proof.txt` through the mount succeeded in `0.58s` in the earlier pass and `0.06s` in the latest pass, and appeared in `/Users/plyght/wax`.
 
 ### Large writes over FUSE
 
@@ -144,17 +144,17 @@ mobfs run pwd
 mobfs git status --short
 ```
 
-`mobfs run pwd` executed in `/Users/nicojaffer/wax` in `0.61s`.
+`mobfs run pwd` executed in `/Users/plyght/wax` in `0.61s`.
 
 `mobfs git status --short` reported the existing modified `README.md` in `0.72s`.
 
 ## Latest Raspberry Pi remote proof after recovery fix
 
-A follow-up proof used `nico@100.74.238.62:/home/nico/wax` to validate user-aware SSH targets and same-mount daemon restart recovery.
+A follow-up proof used `plyght@100.74.238.62:/home/plyght/wax` to validate user-aware SSH targets and same-mount daemon restart recovery.
 
 What passed:
 
-- `mobfs mount nico@100.74.238.62:/home/nico/wax --ssh-tunnel` mounted successfully without a manual tunnel
+- `mobfs mount plyght@100.74.238.62:/home/plyght/wax --ssh-tunnel` mounted successfully without a manual tunnel
 - killing and restarting the remote daemon no longer required unmount/remount for a normal buffered write
 - post-restart write through the existing mount completed in `0.80s` and read back `recovery-ok`
 
@@ -185,7 +185,7 @@ mobfs run pwd
 mobfs git status --short
 ```
 
-`mobfs run pwd` executed in `/Users/nicojaffer/wax` in `0.02-0.31s`.
+`mobfs run pwd` executed in `/Users/plyght/wax` in `0.02-0.31s`.
 
 `mobfs git status --short` reported the existing modified `README.md` in `0.12-0.13s`.
 
@@ -193,7 +193,7 @@ The mount root still did not contain `.mobfs`, `.mobfs.toml`, or similar project
 
 ## Cleanup performed
 
-- Removed proof files/directories from `/Users/nicojaffer/wax`.
+- Removed proof files/directories from `/Users/plyght/wax`.
 - Removed `/tmp/mobfs-mirror-proof`.
 - Force-unmounted `/tmp/mobfs-wax-proof`.
 - Stopped the local daemon.

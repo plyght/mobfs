@@ -1,7 +1,7 @@
 use crate::cli::{
-    BenchArgs, BuildArgs, GitArgs, InitArgs, MountArgs, MountDoctorArgs, MountFsArgs, PullArgs,
-    PushArgs, RemoteArgs, RemoteCommand, RemoteHostArgs, RemoteStatusArgs, RunArgs, ServeArgs,
-    SetupArgs, SetupRemoteArgs, StartArgs, SyncArgs, UnmountArgs, WatchArgs,
+    BenchArgs, BuildArgs, ConnectArgs, GitArgs, InitArgs, MountArgs, MountDoctorArgs, MountFsArgs,
+    PullArgs, PushArgs, RemoteArgs, RemoteCommand, RemoteHostArgs, RemoteStatusArgs, RunArgs,
+    ServeArgs, SetupArgs, SetupRemoteArgs, StartArgs, SyncArgs, UnmountArgs, WatchArgs,
 };
 use crate::config::{
     AppConfig, DEFAULT_CONNECT_RETRIES, DEFAULT_OP_RETRIES, LocalConfig, RemoteConfig, STATE_DIR,
@@ -49,6 +49,41 @@ pub fn start(args: StartArgs) -> Result<()> {
         debounce_ms: args.debounce_ms,
         remote_interval: args.remote_interval,
         delete: args.delete,
+    })
+}
+
+pub fn connect(args: ConnectArgs) -> Result<()> {
+    let target = parse_remote(&args.remote)?;
+    if target.backend != crate::config::StorageBackend::Daemon {
+        return Err(MobfsError::InvalidRemote(
+            "mobfs connect requires an SSH remote like user@host:/absolute/path".to_string(),
+        ));
+    }
+    let token = args.token.unwrap_or_else(crate::config::generate_token);
+    let ssh_target = if target.user.is_empty() {
+        target.host.clone()
+    } else {
+        format!("{}@{}", target.user, target.host)
+    };
+    setup_remote(SetupRemoteArgs {
+        ssh_target,
+        root: std::path::PathBuf::from(&target.path),
+        port: args.port,
+        token: Some(token.clone()),
+        dry_run: false,
+        restart: args.restart,
+        status: false,
+        name: args.name.clone(),
+    })?;
+    mount(MountArgs {
+        remote: args.remote,
+        name: args.name,
+        local: args.local,
+        port: args.port,
+        token: Some(token),
+        ssh_tunnel: true,
+        cache_ttl_secs: args.cache_ttl_secs,
+        no_open: args.no_open,
     })
 }
 

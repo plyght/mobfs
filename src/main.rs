@@ -23,6 +23,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Init(args) => sync::init(args),
         Command::Start(args) => sync::start(args),
+        Command::Connect(args) => sync::connect(args),
         Command::Mount(args) => sync::mount(args),
         Command::Mirror(args) => sync::mirror(args),
         Command::Mountfs(args) => sync::mountfs(args),
