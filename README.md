@@ -1,99 +1,77 @@
 <div align='center'>
     <h3>MobFS</h3>
-    <p>A no-local-code, mosh-like filesystem for remote workspaces</p>
+    <p>A no-local-code filesystem for remote-owned development workspaces</p>
     <br/>
     <br/>
 </div>
 
-MobFS is FUSE-first. The primary product path is a no-local-code, on-demand filesystem mount backed by a remote `mobfsd` daemon. Source files are read and written through the mount and are not mirrored into a durable local working tree. The local machine provides UI, editors, agents, and command entry; the remote machine owns the code and can run builds, tests, git, and other compute-heavy commands.
+MobFS gives local editors, GUI tools, and coding agents a normal filesystem path for code that still lives on a remote machine. The mount is the interface; the remote host owns the source tree, dependencies, secrets, builds, tests, and Git state.
 
-A durable local mirror still exists as `mobfs mirror` for explicit offline/cache workflows, but it is not the default.
-
-## When to use MobFS instead of cloud storage, SSH, or SSHFS
-
-Use MobFS when you want local filesystem UX for a remote-owned codebase: local editors, GUI tools, and coding agents can open a normal path, while Git, dependencies, builds, tests, secrets, and heavyweight compute stay on the remote machine.
-
-MobFS is not trying to replace every remote-file tool:
-
-| If you need | Use | Why |
-| --- | --- | --- |
-| Backup, blobs, artifacts, or sharing finished files | Cloud storage, R2, or S3 | Object stores are excellent for durable blobs, but poor as live source trees with atomic editor saves, symlinks, chmod/mtime, Git metadata access, and remote command execution. |
-| Terminal-only remote development | SSH | SSH is simpler when you do not need local apps to see a mounted workspace path. |
-| A generic remote folder mount | SSHFS | SSHFS is mature and simple for normal file browsing/editing. |
-| Local editor/agent access with remote source ownership and remote-native commands | MobFS | MobFS adds source-tree-oriented caching, ignored heavy directories, `mobfs run`, `mobfs git`, mount registry lookup, and recovery behavior aimed at coding workflows. |
-
-Good MobFS fits include editing Linux code from macOS, keeping client or proprietary source off a laptop disk, using local AI tools against a remote repo, avoiding local dependency/build-cache setup, and building on a faster or architecture-specific host.
-
-Avoid MobFS when you need a backup system, arbitrary high-throughput bulk file transfer, a fully offline local copy by default, or the lowest-friction generic network filesystem.
+It is not a generic SSHFS replacement. SSHFS is the better tool for a simple remote folder mount. MobFS is for development workspaces where raw file access is only half the workflow: source files should open locally, but repository commands and compute-heavy tasks should run where the code actually lives.
 
 ## Features
 
-- **No-local-code Mount**: `mobfs mount` creates a read-write FUSE filesystem without pulling the project into a local mirror
-- **Remote-Owned Workspaces**: Remote source stays under the daemon root; local paths are mountpoints only
-- **Resilient Operations**: Reconnects with retry/backoff, journals mutating FUSE metadata operations and write chunks, and replays them after remounts
-- **Developer Tool Support**: Handles reads, writes, creates, truncates, renames, deletes, symlinks, chmod/mtime, flush, and fsync
-- **macOS Noise Filtering**: Mount and mirror workflows ignore `.DS_Store` and AppleDouble `._*` sidecar files by default
-- **Git and Agent Friendly**: Supports editor temp-file save patterns, agent-style temp writes, and git operations through mounted filesystems or `mobfs git`
-- **Remote Command Execution**: `mobfs run` and `mobfs git` run on the remote workspace after syncing explicit mirror edits when used from mirror mode
-- **Daemon Backend**: Uses an authenticated encrypted TCP protocol between `mobfs` and `mobfsd`
-- **SSH Tunnel Mode**: Can connect to a daemon through `ssh -L` instead of exposing mobfsd directly
-- **Safe Root Policy**: The daemon requires explicit `--allow-root` paths unless unsafe local testing is requested
-- **Secret File Storage for Mirrors**: Mirror mode stores daemon tokens in `.mobfs/token` with `0600` permissions instead of plain `.mobfs.toml`
-- **Benchmark Command**: Measures snapshot and daemon transfer throughput for real workspaces
+- **No-Local-Code Mount**: Mounts a remote workspace without creating a durable local checkout
+- **Remote-Owned Commands**: Runs `mobfs run` and `mobfs git` on the code-owning machine from inside the mount
+- **Developer-First FUSE Path**: Supports editor atomic saves, temp writes, renames, deletes, symlinks, chmod/mtime, flush, and fsync
+- **Source-Tree-Aware Caching**: Prefetches small files, reuses directory metadata, and ignores heavy generated trees such as `target` and `node_modules`
+- **Recovery-Oriented Writes**: Buffers sequential writes, streams large binary payloads, retries reconnectable operations, and journals mutating metadata operations
+- **Encrypted Daemon Protocol**: Uses an authenticated encrypted TCP protocol between `mobfs` and `mobfsd`
+- **SSH Tunnel Mode**: Connects through `ssh -L` so `mobfsd` can stay bound to localhost on the remote host
+- **Mirror Mode**: Provides explicit `pull`, `push`, and `sync` workflows when a durable local copy is actually wanted
+- **Operational Guardrails**: Requires allowed daemon roots, blocks unsafe relative paths, stores mirror tokens with `0600` permissions, and includes doctor/security checks
 
 ## Install
 
 ```bash
+# From source
 git clone https://github.com/plyght/mobfs.git
 cd mobfs
 cargo build --release
 sudo cp target/release/mobfs /usr/local/bin/
-```
 
-The default build enables FUSE support. On macOS, install macFUSE before using `mobfs mount`. If macFUSE was just installed, approve the system extension in System Settings and reboot if macOS asks. If your system does not have FUSE libraries available, build mirror-only mode:
-
-```bash
+# Mirror-only build for systems without FUSE libraries
 cargo build --release --no-default-features
 ```
 
-Before dogfooding the mount path on macOS, run:
+The default build enables FUSE support. On macOS, install macFUSE before using `mobfs mount`, approve the system extension if prompted, and run a mount doctor before first dogfooding:
 
 ```bash
 mobfs mount-doctor /Volumes/app
 ```
 
-Use `mobfs unmount /Volumes/app` to unmount and remove a clean mountpoint after testing.
+## Usage
 
-## Quick Start
-
-Start a daemon on the machine that owns the remote workspace:
+Start a daemon on the machine that owns the workspace:
 
 ```bash
 export MOBFS_TOKEN="$(mobfs token)"
 mobfs daemon --bind 127.0.0.1:7727 --allow-root /srv/projects --token "$MOBFS_TOKEN"
 ```
 
-Mount a remote workspace locally without mirroring code:
+Mount the workspace locally through SSH:
 
 ```bash
 mobfs mount nico@example.com:/srv/projects/app --name app --token "$MOBFS_TOKEN" --ssh-tunnel
 cd /Volumes/app
 ```
 
-On non-macOS systems, the default mount root is `~/MobFSMounts/<name>`. You can choose any mountpoint:
+Use the mounted path for editors, search, agents, and focused file edits:
 
 ```bash
-mobfs mount nico@example.com:/srv/projects/app --local ~/mnt/app --token "$MOBFS_TOKEN" --ssh-tunnel
+code .
+rg "struct|enum|impl" src
 ```
 
-Run remote commands from a configured mirror workspace or directly inside a no-local-code mount. Mount mode records a small user-cache registry outside the source tree so these helpers work without creating `.mobfs.toml` in the mount:
+Use MobFS commands for repository and build/test work:
 
 ```bash
-mobfs run cargo test
 mobfs git status
+mobfs git diff
+mobfs run cargo test
 ```
 
-For metadata-heavy commands such as `git status`, prefer `mobfs git` when you want remote-native behavior. Running `git` directly through FUSE works, but it is still slower than executing git on the machine that owns the repository.
+Running `git` directly through the FUSE mount works for normal cases, but metadata-heavy commands are faster and more reliable when executed with `mobfs git` on the remote host.
 
 Use mirror mode only when you intentionally want a durable local working tree:
 
@@ -105,23 +83,50 @@ mobfs push
 mobfs sync
 ```
 
-## Configuration
-
-For a setup template, run:
+## Commands
 
 ```bash
+# No-local-code mount path
+mobfs mount host:/absolute/path --name app
+mobfs mount user@host:/absolute/path --local ~/mnt/app --ssh-tunnel
+mobfs unmount /Volumes/app
+
+# Remote commands
+mobfs run <command> [args...]
+mobfs git <args...>
+mobfs build --on builder@example.com -- cargo build --release
+mobfs build --here --artifact build/App.app --remote-artifact artifacts/App.app -- brisk build
+
+# Mirror mode
+mobfs mirror host:/absolute/path --name app
+mobfs pull
+mobfs push
+mobfs sync
+mobfs status
+mobfs watch
+
+# Daemon and setup
+mobfs token
 mobfs setup /srv/projects --host example.com
+mobfs remote start nico@example.com --root ~/code
+mobfs remote status nico@example.com
+mobfs remote restart nico@example.com --root ~/code
+mobfs daemon --bind 127.0.0.1:7727 --allow-root /srv/projects --token "$MOBFS_TOKEN"
+mobfs doctor
+mobfs security
+mobfs bench --iterations 5 --mib 64
 ```
+
+Useful aliases: `start` as `up`, `pull` as `get`, `push` as `put`, `sync` as `s`, `status` as `st`, `run` as `r`, `git` as `g`, and `open` as `o`.
+
+## Configuration
 
 For one-command SSH setup that creates the remote root and starts `mobfsd` on the remote host:
 
 ```bash
 mobfs remote start nico@example.com --root ~/code
-mobfs remote status nico@example.com
 mobfs mount nico@example.com:~/code/app --ssh-tunnel
 ```
-
-`remote start` records the remote daemon pid in `~/.mobfsd/daemon.pid` and logs to `~/.mobfsd/daemon.log`. Re-run it safely if the daemon is already up; use `mobfs remote restart ...` to stop the recorded pid and start a fresh daemon.
 
 Mirror mode stores workspace configuration in `.mobfs.toml`:
 
@@ -141,107 +146,68 @@ root = "/Users/alex/MobFS/app"
 ignore = [".mobfs", "target", "node_modules", ".mobfs.toml", ".DS_Store", "._*", ".mobfs-mountfs-journal.jsonl"]
 connect_retries = 8
 operation_retries = 5
+cache_ttl_secs = 1
 ```
 
-Remote targets use one of these forms. Include `user@` when the SSH login user differs from the local username:
+Remote targets use `host:/absolute/path` or `user@host:/absolute/path`. Folder-style backends are available for explicit mirror workflows with `icloud://` and `gdrive://`. R2 and S3 are represented in configuration but are not implemented yet.
 
-```bash
-mobfs mount host:/absolute/path
-mobfs mount user@host:/absolute/path
-mobfs mirror host:/absolute/path
-mobfs mirror user@host:/absolute/path
-```
+## Usage Model
 
-Folder-style backends are available for explicit mirror workflows:
+MobFS should be treated as a remote development mount, not as a backup system or a full local filesystem replacement. Keep authoritative code in Git on the remote machine, commit before risky bulk edits, and keep generated directories ignored.
 
-```bash
-mobfs mirror icloud:///absolute/path
-mobfs mirror gdrive:///absolute/path
-```
+Use raw FUSE paths for:
 
-R2 and S3 are represented in configuration, but are not implemented yet.
+- editing source files
+- reading focused files
+- local search over source directories
+- AI agent file inspection and patches
+- editor temp-write and rename workflows
 
-## Commands
+Prefer `mobfs run` or `mobfs git` for:
 
-```bash
-# No-local-code primary path
-mobfs mount host:/absolute/path --name app
-mobfs add host:/absolute/path --name app
-mobfs mountfs host:/absolute/path /Volumes/app
+- Git status, diff, add, commit, checkout, and branch operations
+- builds and tests
+- package-manager commands
+- language-server or tool commands that scan large dependency trees
+- commands that should see remote secrets, architecture, or installed toolchains
 
-# Durable mirror path
-mobfs mirror host:/absolute/path --name app
-mobfs init host:/absolute/path
-mobfs start host:/absolute/path --name app
-mobfs pull
-mobfs push
-mobfs push --dry-run
-mobfs sync
-mobfs sync --dry-run
-mobfs status
-mobfs watch
+Mount mode does not create `.mobfs.toml`, `.mobfs/token`, snapshots, or a project mirror under the mountpoint. It records active mounts in the user cache directory so `mobfs run` and `mobfs git` can resolve the remote workspace without writing config into source.
 
-# Remote commands
-mobfs run <command> [args...]
-mobfs git <args...>
-mobfs build --on builder@example.com -- cargo build --release
-mobfs build --on builder@example.com --artifact target/release/app --out ./app -- cargo build --release
-mobfs build --here --artifact build/App.app --remote-artifact artifacts/App.app -- brisk build
+## Performance
 
-# Daemon, setup, security, and FUSE UX
-mobfs token
-mobfs setup /srv/projects --host example.com
-mobfs remote start nico@example.com --root ~/code
-mobfs remote status nico@example.com
-mobfs remote restart nico@example.com --root ~/code
-mobfs daemon --bind 127.0.0.1:7727 --allow-root /srv/projects --token "$MOBFS_TOKEN"
-mobfs doctor
-mobfs mount-doctor /Volumes/app
-mobfs unmount /Volumes/app
-mobfs rm /Volumes/app
-mobfs security
-mobfs bench --iterations 5 --mib 64
-mobfs bench --scale-files 50000 --iterations 3
-```
+Local proof testing on a real Rust workspace shows source reads, `rg`, editor atomic saves, symlinks, deletes, daemon restart recovery, 32 MiB writes, ignored-directory traversal, temporary branch checkout, and remote `cargo check` working through the mount.
 
-Useful aliases: `start` as `up`, `pull` as `get`, `push` as `put`, `sync` as `s`, `status` as `st`, `run` as `r`, `git` as `g`, and `open` as `o`.
+Remote Raspberry Pi testing over an SSH tunnel shows the important distinction:
 
-`mobfs build --on <builder>` is for the case where the code-owning machine is not the fast machine. The builder connects back to the configured MobFS daemon, mounts the workspace into a temporary directory, runs the build command there, and cleans up afterward. Add `--mirror` to use an ephemeral mirror on the builder when a build tool needs native local filesystem behavior. Add `--artifact <path> --out <path>` to copy a build output back after the command succeeds.
+- raw FUSE reads and writes are usable for normal editing
+- small-file prefetch makes source search and Git metadata reads much faster than the initial baseline
+- large streaming writes are much improved but still slower than local TCP
+- raw metadata-heavy Git over FUSE is slower than remote-native `mobfs git`
 
-`mobfs build --here` is for the common laptop-builder case: stage the remote workspace into a native local cache directory, run a local command on the fast machine, then publish only a selected artifact back to the remote. This is the recommended path for macOS app builds, Xcode/Brisk workflows, and other metadata-heavy build systems that should not write intermediates through FUSE. Use `--workdir <path>` for a persistent local staging directory, `--keep` to inspect the generated staging directory, `--artifact <path>` to publish a file or directory, and `--remote-artifact <path>` when the remote artifact path should differ.
+Use these defaults unless you are measuring a specific behavior:
 
-## No-Local-Code Semantics
+- use `--cache-ttl-secs 1` for normal editing, agent work, search, and Git workflows
+- use `--cache-ttl-secs 0` only when remote-side edits made outside MobFS must appear immediately
+- use `mobfs git ...` and `mobfs run ...` from inside the mount for command latency
+- avoid broad raw-FUSE scans of unignored build/cache directories
 
-`mobfs mount` does not create `.mobfs.toml`, `.mobfs/token`, snapshots, or a project mirror under the mountpoint. Reads are fetched from the daemon on demand. Writes are sent to the daemon immediately. FUSE mode uses a small operation journal in the system temp directory so interrupted metadata and namespace operations can be replayed after reconnect. It also records active mounts in the user cache directory so `mobfs run` and `mobfs git` can resolve the remote workspace from inside a mount without writing config into source.
+See `benchmarks.md` and `testing.md` for current measured results.
 
-## Recovery and Conflict UX
+## Architecture
 
-Run `mobfs status` from inside a mount or mirror to see connection state and pending journal operations. If the daemon restarts or the network drops, normal metadata operations and buffered writes retry; any pending mount journal entries replay on the next successful reconnect or remount. If a hard failure happens mid-stream during a large write, MobFS is designed to fail quickly instead of hanging forever. After that kind of failure, run `mobfs status`, restart the remote daemon if needed, and remount if existing file handles keep returning `EIO`.
-
-Mirror-mode conflicts stop the sync before clobbering either side. MobFS writes sibling conflict files named `.mobfs-conflict-local` and `.mobfs-conflict-remote`; choose one or merge them, replace the original file with the resolved content, delete the conflict copies, then run `mobfs sync` again.
-
-## Safe Usage Model
-
-Treat MobFS as a remote workspace mount, not as a backup system. Keep authoritative code in Git on the remote machine, commit before risky bulk edits, and prefer `mobfs git ...` and `mobfs run ...` for repository operations. Use raw FUSE paths for editors, agents, search, and focused file edits. Avoid running broad tools across unignored build/cache directories; keep `target`, `node_modules`, and similar generated trees ignored. For first dogfooding, use non-critical repositories until your sleep/wake, network, and editor workflows have passed.
-
-Metadata lookups and directory entries use a short kernel cache TTL. The default is 1 second and can be changed with `mobfs mount --cache-ttl-secs <seconds>`. Use `0` while dogfooding remote-side edits from another shell, and use a small nonzero value for normal editor, agent, git, search, and traversal workflows. With a nonzero TTL, MobFS serves known metadata and directory entries from the initial snapshot and local mutation cache where safe. Direct reads go to the daemon first and only fall back to the last successful chunk if the daemon is temporarily unavailable.
-
-Ignore entries match full path segments by default. Entries ending in `*` are treated as segment prefixes, so the default `._*` blocks macOS AppleDouble sidecar files from being created or listed through the mount.
-
-This means local tools may still create their own caches outside the mount, and operating systems may keep normal kernel/page-cache data while the mount is active. MobFS does not intentionally mirror project source into a durable local workspace in mount mode.
-
-## Performance Guidance
-
-Current local proof testing on a real Rust repo shows the mount path is ready for controlled dogfooding: targeted source reads, `rg`, editor atomic-save patterns, symlinks, deletes, daemon restart recovery, 32 MiB writes, ignored-directory `find`, `du`, temporary branch checkout, and remote `cargo check` all complete successfully. It is still not a native local filesystem replacement for arbitrary metadata-heavy scans.
-
-Use these rules of thumb:
-
-- use default `--cache-ttl-secs 1` for normal editing, agent work, search, and git workflows
-- use `--cache-ttl-secs 0` only when you need immediate visibility of remote-side edits made outside MobFS
-- use `mobfs git ...` and `mobfs run ...` from inside the mount for remote-native command latency
-- avoid broad raw-FUSE scans of unignored build/cache directories; keep heavy directories such as `target` and `node_modules` ignored
-
-See `benchmarks.md` and `testing.md` for current measured proof results.
+- `cli.rs`: Command definitions and argument parsing
+- `config.rs`: Workspace configuration, remote target parsing, and defaults
+- `crypto.rs`: Authenticated encrypted client/server stream setup
+- `daemon.rs`: Remote filesystem server and root access policy
+- `protocol.rs`: Wire protocol requests, responses, binary write streams, and command output
+- `remote.rs`: Daemon client, retry handling, SSH tunneling, resumable transfers, and remote operations
+- `storage.rs`: Backend abstraction for daemon and folder-backed remotes
+- `snapshot.rs`: File metadata snapshots, planning, drift detection, and conflict logic
+- `local.rs`: Local tree scanning, ignore handling, and snapshot persistence for mirror mode
+- `journal.rs`: Local operation journal for mirror transfers
+- `sync.rs`: User-facing workflows for mount, mirror, pull, push, sync, watch, run, build, and doctor
+- `mountfs.rs`: No-local-code FUSE filesystem implementation
+- `ui.rs`: Minimal terminal status output
 
 ## Development
 
@@ -252,49 +218,23 @@ cargo test --no-default-features
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-Recommended benchmark fixtures:
+Recommended dogfooding checks:
 
 - `scripts/chaos.sh /Volumes/app`
 - `mobfs bench --scale-files 50000 --iterations 3`
-- `mobfs bench --scale-files 300000 --files-per-dir 1000 --iterations 3`
-- a Linux-kernel-sized many-file tree
-- a medium JavaScript app with `node_modules` ignored in mirror mode
-- a Rust repo with `target` ignored in mirror mode
 - editor atomic-save workloads
-- git status/add/diff/commit workloads over FUSE
-- IDE indexing, `rg`, language server startup, and `git status` over FUSE
+- Git status, diff, checkout, add, and commit workloads over FUSE
+- IDE indexing, `rg`, language-server startup, and remote `mobfs run` workflows
 
-## Architecture
+## Security
 
-- `cli.rs`: Command definitions and argument parsing
-- `config.rs`: Workspace configuration, remote target parsing, and defaults
-- `crypto.rs`: Authenticated encrypted client/server stream setup
-- `daemon.rs`: Remote filesystem server and root access policy
-- `protocol.rs`: Wire protocol requests, responses, and streaming command output
-- `remote.rs`: Daemon client, retry handling, user-aware SSH tunneling, resumable transfers, and remote operations
-- `storage.rs`: Backend abstraction for daemon and folder-backed remotes
-- `snapshot.rs`: File metadata snapshots, planning, drift detection, and conflict logic
-- `local.rs`: Local tree scanning, ignore handling, and snapshot persistence for mirror mode
-- `journal.rs`: Local operation journal for mirror transfers
-- `sync.rs`: User-facing workflows for mount, mirror, pull, push, sync, watch, run, and doctor
-- `mountfs.rs`: No-local-code FUSE filesystem implementation
-- `ui.rs`: Minimal terminal status output
+Run `mobfs security` for the operational checklist.
 
-## Security Hardening
-
-Run `mobfs security` for the short operational checklist.
-
-- Bind `mobfsd` to `127.0.0.1` and connect with `--ssh-tunnel` unless the daemon is on a trusted private network.
-- Rotate tokens with `mobfs token`, restart the daemon with the new token, and update clients through `MOBFS_TOKEN` or the workspace token file.
-- Prefer one token and one `--allow-root` per workspace or team boundary.
-- Do not use `--allow-any-root` outside local tests.
-- The daemon rejects absolute paths, `..`, and other non-normal relative path components before joining client paths to allowed roots.
-
-## Crash Recovery Dogfooding
-
-Abuse-test the FUSE path before release by killing the client and daemon during large writes, atomic editor saves, renames, `git add`, and `git status`. After restart, verify checksums for large files, verify no `.mobfs-upload-*` temp file replaced a final path, and run the project test suite remotely with `mobfs run`.
-
-Current local and Raspberry Pi remote chaos testing confirms daemon restart recovery on an existing mount for normal buffered writes. Mount-mode writes are journaled before remote flush and replayed after reconnect. Hard mid-write daemon death should keep failing quickly instead of hanging, but still needs broader flaky-network and sleep/wake testing before MobFS can honestly claim full mosh-style seamlessness.
+- Bind `mobfsd` to `127.0.0.1` and connect with `--ssh-tunnel` unless the daemon is on a trusted private network
+- Rotate tokens with `mobfs token`, restart the daemon with the new token, and update clients through `MOBFS_TOKEN` or the workspace token file
+- Prefer one token and one `--allow-root` per workspace or team boundary
+- Do not use `--allow-any-root` outside local tests
+- Keep authoritative source in Git and treat MobFS recovery as operational resilience, not backup
 
 ## License
 
