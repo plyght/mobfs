@@ -23,7 +23,8 @@ It is not a generic SSHFS replacement. SSHFS is the better tool for a simple rem
 - **Large-File Streaming**: Streams only the byte ranges an app asks for over parallel connections, with sequential read-ahead and seek-aware prefetch, so video scrubbing and huge assets open without downloading
 - **Zero-Disk Cache**: Keeps a bounded in-memory block cache (`--cache-mib`); nothing from the remote is written to local disk
 - **Live Collaboration**: A change feed from `mobfsd` pushes edits from other mounts and from the server itself into every connected mount within milliseconds, including files that are still being written
-- **Finder-Ready on macOS**: Named Finder volume, real free-space reporting, extended attributes, no AppleDouble clutter, background (`--detach`) mounts, clean unmount on Ctrl-C, and optional macFUSE FSKit backend
+- **Nothing to Install on macOS**: Mounts through a built-in local NFS server that macOS attaches natively. No macFUSE, no kernel extension, no Reduced Security
+- **Finder-Ready on macOS**: Shows up as a drive in Finder, keeps Finder's `._*` and `.DS_Store` metadata in memory instead of on the server, supports background (`--detach`) mounts and clean unmount on Ctrl-C or eject, and can optionally use macFUSE instead
 - **Instant Search**: `mobfs search` matches file names across the whole remote tree on the server and prints local paths
 
 ## Install
@@ -35,20 +36,23 @@ cd mobfs
 cargo build --release
 sudo cp target/release/mobfs /usr/local/bin/
 
-# Mirror-only build for systems without FUSE libraries
+# macOS without macFUSE (what the release binaries use)
+cargo build --release --no-default-features --features nfs
+
+# Mirror-only build for systems without FUSE or NFS mounting
 cargo build --release --no-default-features
-```
-
-The default build enables FUSE support. On macOS, install macFUSE before using `mobfs mount`, approve the system extension if prompted, and run a mount doctor before first dogfooding:
-
-```bash
-brew install --cask macfuse
-mobfs mount-doctor /Volumes/app
 ```
 
 Install the same `mobfs` version on your Mac and on the remote host; the client and daemon must speak the same protocol version.
 
-On Apple silicon, the macFUSE kernel extension needs Reduced Security enabled in Startup Security Utility. On macOS 15.4 or newer you can skip that by passing `--fskit` to `mount` or `connect`, which uses macFUSE's FSKit backend (macFUSE 5+). FSKit volumes must be mounted under `/Volumes`, which is the default mountpoint on macOS.
+### How the drive is attached
+
+`--backend auto` (the default) picks the built-in NFS backend on macOS and FUSE on Linux.
+
+- **`--backend nfs`**: MobFS runs a small NFSv3 server on `127.0.0.1` and asks macOS to mount it with its own `mount_nfs`. Nothing extra is installed. Drives mount under `~/MobFSMounts/<name>` and appear in Finder. If macOS insists on administrator rights for the mount, MobFS asks `sudo` once when run from a terminal. Remote edits reach the Mac within about a second, because the NFS client re-checks file attributes every second. On Linux this backend needs root and `nfs-common`.
+- **`--backend fuse`**: uses macFUSE on macOS or the kernel's FUSE on Linux. Remote edits appear instantly and Finder gets a custom volume name. On macOS, build with the `fuse` feature, install macFUSE (`brew install --cask macfuse`), and approve its system extension. On Apple silicon the kernel extension needs Reduced Security; on macOS 15.4+ `--fskit` uses macFUSE's FSKit backend instead. FUSE drives mount under `/Volumes/<name>` on macOS.
+
+Run `mobfs mount-doctor <mountpoint>` to check a mount.
 
 ## Usage
 
@@ -56,7 +60,7 @@ Start the remote daemon and mount the workspace with one command:
 
 ```bash
 mobfs connect plyght@example.com:/srv/projects/app --name app
-cd /Volumes/app
+cd ~/MobFSMounts/app
 ```
 
 Use the mounted path for editors, search, agents, and focused file edits:
@@ -81,7 +85,7 @@ Running `git` directly through the FUSE mount works for normal cases, but metada
 Mount a media library in the background so it appears as a drive in Finder:
 
 ```bash
-mobfs connect editor@studio.example.com:/srv/media --name Media --detach --volname "Studio Media"
+mobfs connect editor@studio.example.com:/srv/media --name Media --detach
 ```
 
 Apps such as DaVinci Resolve, Premiere, Photoshop, and Blender read the drive directly. MobFS fetches 1 MiB blocks on demand. While playback is sequential it reads ahead in 8 MiB batches over parallel connections, and when you scrub it restarts at the new position. Writes are buffered in 8 MiB chunks and uploaded in the background over several connections, so saving and exporting don't wait on each round trip. `close` and `fsync` still wait until the data is on the server.
@@ -92,12 +96,12 @@ The defaults (4 foreground connections, 8 upload connections, 8 read-ahead conne
 mobfs mount host:/srv/media --prefetch-connections 12 --readahead-mib 256 --cache-mib 2048
 ```
 
-Every mount subscribes to the daemon's change feed. Saves, renames, and deletes made from another Mac, or directly on the server, show up in the other mounts right away. Large files being written elsewhere become readable as the data arrives, every 8 MiB.
+Every mount subscribes to the daemon's change feed. Saves, renames, and deletes made from another Mac, or directly on the server, show up in the other mounts right away with the FUSE backend, and within about a second with the NFS backend. Large files being written elsewhere become readable as the data arrives, every 8 MiB.
 
 Search the whole remote tree without walking it over the network:
 
 ```bash
-cd /Volumes/Media
+cd ~/MobFSMounts/Media
 mobfs search interview final
 mobfs search "b-roll" --open
 ```
@@ -120,8 +124,8 @@ mobfs connect user@host:/absolute/path --name app
 mobfs mount host:/absolute/path --name app
 mobfs mount user@host:/absolute/path --local ~/mnt/app --ssh-tunnel
 mobfs mount host:/absolute/path --detach --volname "Projects"
-mobfs unmount /Volumes/app
-mobfs search <words...> [--mount /Volumes/app] [--open]
+mobfs unmount ~/MobFSMounts/app
+mobfs search <words...> [--mount ~/MobFSMounts/app] [--open]
 
 # Remote commands
 mobfs run <command> [args...]
@@ -246,7 +250,9 @@ See `benchmarks.md` and `testing.md` for current measured results.
 - `local.rs`: Local tree scanning, ignore handling, and snapshot persistence for mirror mode
 - `journal.rs`: Local operation journal for mirror transfers
 - `sync.rs`: User-facing workflows for mount, mirror, pull, push, sync, watch, run, build, and doctor
-- `mountfs.rs`: No-local-code FUSE filesystem with stable inodes, block cache, read-ahead, connection pools, and change-feed invalidation
+- `vfs.rs`: Shared mount core with stable inodes, block cache, read-ahead, background uploads, connection pools, and change-feed invalidation
+- `mountfs.rs`: FUSE front end (macFUSE on macOS, kernel FUSE on Linux)
+- `nfsmount.rs`: Built-in NFSv3 front end that macOS and Linux mount natively
 - `changes.rs`: Daemon-side change feed that records MobFS writes and watches the remote tree for outside edits
 - `ui.rs`: Minimal terminal status output
 

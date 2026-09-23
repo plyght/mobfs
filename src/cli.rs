@@ -85,10 +85,43 @@ pub enum Command {
     )]
     #[command(visible_alias = "f")]
     Search(SearchArgs),
+    #[command(about = "Serve a remote workspace as a local NFSv3 export without mounting it")]
+    #[command(hide = true)]
+    NfsServe(NfsServeArgs),
+}
+
+#[derive(Args)]
+pub struct NfsServeArgs {
+    #[arg(help = "Remote root like host:/absolute/path")]
+    pub remote: String,
+    #[arg(
+        long,
+        default_value = "127.0.0.1:0",
+        help = "Address for the NFS server"
+    )]
+    pub listen: String,
+    #[arg(long, default_value_t = 7727, help = "mobfsd port")]
+    pub port: u16,
+    #[arg(long, env = "MOBFS_TOKEN", help = "Shared mobfsd token")]
+    pub token: Option<String>,
+    #[arg(long, help = "Connect to mobfsd through ssh -L using the remote host")]
+    pub ssh_tunnel: bool,
+    #[command(flatten)]
+    pub tuning: MountTuning,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BackendChoice {
+    #[default]
+    Auto,
+    Fuse,
+    Nfs,
 }
 
 #[derive(Args, Clone, Debug)]
 pub struct MountTuning {
+    #[arg(long, value_enum, default_value_t = BackendChoice::Auto, help = "How the drive is attached: auto (NFS on macOS, FUSE on Linux), fuse (macFUSE/FUSE), or nfs (built-in, no extra install)")]
+    pub backend: BackendChoice,
     #[arg(
         long,
         default_value_t = 4,
@@ -130,6 +163,7 @@ pub struct MountTuning {
 impl Default for MountTuning {
     fn default() -> Self {
         Self {
+            backend: BackendChoice::Auto,
             connections: 4,
             prefetch_connections: 8,
             cache_mib: 512,

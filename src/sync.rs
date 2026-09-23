@@ -102,7 +102,7 @@ pub fn connect(args: ConnectArgs) -> Result<()> {
 }
 
 pub fn mountfs(args: MountFsArgs) -> Result<()> {
-    #[cfg(feature = "fuse")]
+    #[cfg(any(feature = "fuse", feature = "nfs"))]
     {
         let (remote, mountpoint) = match args.paths.as_slice() {
             [mountpoint] => (None, std::path::PathBuf::from(mountpoint)),
@@ -114,7 +114,7 @@ pub fn mountfs(args: MountFsArgs) -> Result<()> {
             }
         };
         let config = match remote {
-            Some(remote) => crate::mountfs::config_from_remote(
+            Some(remote) => crate::vfs::config_from_remote(
                 remote,
                 &mountpoint,
                 args.port,
@@ -123,27 +123,31 @@ pub fn mountfs(args: MountFsArgs) -> Result<()> {
             )?,
             None => AppConfig::load()?,
         };
-        crate::mountfs::prepare_mountpoint(&mountpoint)?;
-        crate::mountfs::mount(config, mountpoint, mount_options(&args.tuning, false))
+        crate::vfs::prepare_mountpoint(&mountpoint)?;
+        crate::vfs::mount(config, mountpoint, mount_options(&args.tuning, false))
     }
-    #[cfg(not(feature = "fuse"))]
+    #[cfg(not(any(feature = "fuse", feature = "nfs")))]
     {
         let _ = args;
         Err(MobfsError::Config(
-            "mobfs mountfs requires building with --features fuse".to_string(),
+            "mobfs mountfs requires building with the fuse or nfs feature".to_string(),
         ))
     }
 }
 
 pub fn mount(args: MountArgs) -> Result<()> {
-    #[cfg(feature = "fuse")]
+    #[cfg(any(feature = "fuse", feature = "nfs"))]
     {
         let target = parse_remote(&args.remote)?;
+        let backend = resolve_backend(args.tuning.backend);
         let root = match args.local.clone() {
             Some(path) => path,
-            None => {
-                default_no_local_code_mountpoint(args.name.as_deref(), &target.host, &target.path)?
-            }
+            None => default_no_local_code_mountpoint(
+                args.name.as_deref(),
+                &target.host,
+                &target.path,
+                backend,
+            )?,
         };
         let mut config = new_config(
             target,
@@ -153,7 +157,7 @@ pub fn mount(args: MountArgs) -> Result<()> {
             args.ssh_tunnel,
         );
         config.sync.cache_ttl_secs = args.cache_ttl_secs;
-        crate::mountfs::prepare_mountpoint(&root)?;
+        crate::vfs::prepare_mountpoint(&root)?;
         save_mount_registry_entry(&config)?;
         if args.tuning.detach && std::env::var_os("MOBFS_DETACHED").is_none() {
             return spawn_detached_mount(&args, &config, &root);
@@ -163,6 +167,7 @@ pub fn mount(args: MountArgs) -> Result<()> {
             root.display().to_string(),
         );
         ui::info("cache ttl", format!("{}s", config.sync.cache_ttl_secs));
+        ui::info("backend", format!("{backend:?}").to_lowercase());
         ui::info(
             "streaming",
             format!(
@@ -171,20 +176,30 @@ pub fn mount(args: MountArgs) -> Result<()> {
             ),
         );
         let open = !args.no_open && std::env::var_os("MOBFS_DETACHED").is_none();
-        crate::mountfs::mount(config, root, mount_options(&args.tuning, open))
+        crate::vfs::mount(config, root, mount_options(&args.tuning, open))
     }
-    #[cfg(not(feature = "fuse"))]
+    #[cfg(not(any(feature = "fuse", feature = "nfs")))]
     {
         let _ = args;
         Err(MobfsError::Config(
-            "mobfs mount is no-local-code FUSE-first and requires building with --features fuse; use `mobfs mirror` for a durable local mirror".to_string(),
+            "mobfs mount requires building with the fuse or nfs feature; use `mobfs mirror` for a durable local mirror".to_string(),
         ))
     }
 }
 
-#[cfg(feature = "fuse")]
-fn mount_options(tuning: &MountTuning, open_when_ready: bool) -> crate::mountfs::MountOptions {
-    crate::mountfs::MountOptions {
+#[cfg(any(feature = "fuse", feature = "nfs"))]
+fn resolve_backend(choice: crate::cli::BackendChoice) -> crate::vfs::Backend {
+    match choice {
+        crate::cli::BackendChoice::Auto => crate::vfs::default_backend(),
+        crate::cli::BackendChoice::Fuse => crate::vfs::Backend::Fuse,
+        crate::cli::BackendChoice::Nfs => crate::vfs::Backend::Nfs,
+    }
+}
+
+#[cfg(any(feature = "fuse", feature = "nfs"))]
+fn mount_options(tuning: &MountTuning, open_when_ready: bool) -> crate::vfs::MountOptions {
+    crate::vfs::MountOptions {
+        backend: resolve_backend(tuning.backend),
         connections: tuning.connections.clamp(1, 64),
         prefetch_connections: tuning.prefetch_connections.clamp(1, 64),
         cache_mib: tuning.cache_mib,
@@ -195,7 +210,7 @@ fn mount_options(tuning: &MountTuning, open_when_ready: bool) -> crate::mountfs:
     }
 }
 
-#[cfg(feature = "fuse")]
+#[cfg(any(feature = "fuse", feature = "nfs"))]
 fn spawn_detached_mount(args: &MountArgs, config: &AppConfig, root: &Path) -> Result<()> {
     use std::os::unix::process::CommandExt;
     let log_dir = dirs::cache_dir()
@@ -232,6 +247,11 @@ fn spawn_detached_mount(args: &MountArgs, config: &AppConfig, root: &Path) -> Re
         .arg("--readahead-mib")
         .arg(tuning.readahead_mib.to_string())
         .arg("--no-open")
+        .arg("--backend")
+        .arg(match resolve_backend(tuning.backend) {
+            crate::vfs::Backend::Fuse => "fuse",
+            crate::vfs::Backend::Nfs => "nfs",
+        })
         .env("MOBFS_DETACHED", "1")
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)
@@ -258,7 +278,7 @@ fn spawn_detached_mount(args: &MountArgs, config: &AppConfig, root: &Path) -> Re
     let spinner = ui::spinner("mounting in background");
     let deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < deadline {
-        if crate::mountfs::is_mounted(root) {
+        if crate::vfs::is_mounted(root) {
             spinner.finish_and_clear();
             ui::ok(format!("mounted {} (pid {})", root.display(), child.id()));
             ui::info("log", log_path.display().to_string());
@@ -282,6 +302,28 @@ fn spawn_detached_mount(args: &MountArgs, config: &AppConfig, root: &Path) -> Re
         root.display(),
         log_path.display()
     )))
+}
+
+pub fn nfs_serve(args: crate::cli::NfsServeArgs) -> Result<()> {
+    #[cfg(feature = "nfs")]
+    {
+        let placeholder = std::env::temp_dir().join("mobfs-nfs-serve");
+        let config = crate::vfs::config_from_remote(
+            args.remote,
+            &placeholder,
+            args.port,
+            args.token,
+            args.ssh_tunnel,
+        )?;
+        crate::nfsmount::serve(config, &args.listen, mount_options(&args.tuning, false))
+    }
+    #[cfg(not(feature = "nfs"))]
+    {
+        let _ = args;
+        Err(MobfsError::Config(
+            "mobfs nfs-serve requires building with the nfs feature".to_string(),
+        ))
+    }
 }
 
 pub fn search(args: SearchArgs) -> Result<()> {
@@ -433,11 +475,11 @@ fn pending_write_count(config: &AppConfig, mirror_workspace: bool) -> usize {
     } else {
         0
     };
-    #[cfg(feature = "fuse")]
+    #[cfg(any(feature = "fuse", feature = "nfs"))]
     {
-        mirror_pending + crate::mountfs::pending_journal_ops(config).unwrap_or(0)
+        mirror_pending + crate::vfs::pending_journal_ops(config).unwrap_or(0)
     }
-    #[cfg(not(feature = "fuse"))]
+    #[cfg(not(any(feature = "fuse", feature = "nfs")))]
     {
         mirror_pending
     }
@@ -1047,12 +1089,14 @@ pub fn mount_doctor(args: MountDoctorArgs) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         if std::path::Path::new("/Library/Filesystems/macfuse.fs").exists() {
-            ui::ok("macFUSE installed");
+            ui::ok("macFUSE installed (available with --backend fuse)");
         } else {
-            ui::warn(
-                "macFUSE missing; install it and approve the system extension before mounting",
+            ui::info(
+                "backend",
+                "macFUSE not installed; mounts use the built-in NFS backend, nothing to install",
             );
         }
+        check_tool("mount_nfs");
         if Command::new("mount")
             .output()
             .map(|output| {
@@ -1076,8 +1120,8 @@ pub fn mount_doctor(args: MountDoctorArgs) -> Result<()> {
             "On Apple silicon, the macFUSE kernel extension needs Reduced Security in Startup Security Utility; on macOS 15.4+ `--fskit` avoids the kernel extension entirely.",
         );
     }
-    #[cfg(feature = "fuse")]
-    if crate::mountfs::is_mounted(&args.mountpoint) {
+    #[cfg(any(feature = "fuse", feature = "nfs"))]
+    if crate::vfs::is_mounted(&args.mountpoint) {
         ui::ok("mountpoint is an active mount");
     }
     #[cfg(not(target_os = "macos"))]
@@ -1368,10 +1412,11 @@ pub fn doctor() -> Result<()> {
         ui::warn("remote compute unavailable for provider-backed workspaces");
     }
     check_tool("git");
-    #[cfg(target_os = "macos")]
-    if !std::path::Path::new("/Library/Filesystems/macfuse.fs").exists() {
-        ui::warn("macFUSE not found; mountfs will be unavailable until macFUSE is installed");
-    }
+    #[cfg(feature = "nfs")]
+    ui::info(
+        "default mount backend",
+        format!("{:?}", crate::vfs::default_backend()).to_lowercase(),
+    );
     let spinner = ui::spinner("checking storage");
     let mut client = StorageClient::connect(config.clone())?;
     spinner.set_message("scanning remote");
@@ -1598,14 +1643,15 @@ fn apply_plan(
     Ok(())
 }
 
-#[cfg_attr(not(feature = "fuse"), allow(dead_code))]
+#[cfg(any(feature = "fuse", feature = "nfs"))]
 fn default_no_local_code_mountpoint(
     name: Option<&str>,
     host: &str,
     remote_path: &str,
+    backend: crate::vfs::Backend,
 ) -> Result<std::path::PathBuf> {
     let workspace = default_workspace_name(name, host, remote_path);
-    if cfg!(target_os = "macos") {
+    if cfg!(target_os = "macos") && backend == crate::vfs::Backend::Fuse {
         Ok(std::path::PathBuf::from("/Volumes").join(workspace))
     } else {
         let home = dirs::home_dir()

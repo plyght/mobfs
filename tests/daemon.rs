@@ -1083,3 +1083,77 @@ fn mountfs_streams_large_files_with_random_access() {
         .unwrap();
     assert!(out.status.success());
 }
+
+#[test]
+fn nfs_server_round_trips_files_when_libnfs_tools_exist() {
+    let has_tools = ["nfs-ls", "nfs-cp"].iter().all(|tool| {
+        Command::new(tool)
+            .arg("--help")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok()
+    });
+    if !has_tools {
+        return;
+    }
+    let temp = TempDir::new().unwrap();
+    let remote = temp.path().join("remote");
+    fs::create_dir_all(remote.join("media")).unwrap();
+    let clip = (0..3_000_000_u32)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    fs::write(remote.join("media").join("clip.mov"), &clip).unwrap();
+    let daemon = start_daemon(&remote);
+    let mut server = Command::new(bin())
+        .arg("nfs-serve")
+        .arg(format!("127.0.0.1:{}", remote.display()))
+        .arg("--port")
+        .arg(daemon.port.to_string())
+        .arg("--token")
+        .arg(TOKEN)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let nfs_port = std::io::BufRead::lines(std::io::BufReader::new(server.stdout.take().unwrap()))
+        .map_while(std::result::Result::ok)
+        .find_map(|line| line.trim().parse::<u16>().ok())
+        .unwrap();
+    let query = format!("?version=3&nfsport={nfs_port}&mountport={nfs_port}");
+    let listing = Command::new("nfs-ls")
+        .arg(format!("nfs://127.0.0.1/{query}"))
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&listing.stdout).contains("media"));
+    let downloaded = temp.path().join("down.mov");
+    let status = Command::new("nfs-cp")
+        .arg(format!("nfs://127.0.0.1/media/clip.mov{query}"))
+        .arg(&downloaded)
+        .stdout(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(fs::read(&downloaded).unwrap() == clip);
+    let upload = temp.path().join("render.mov");
+    let render = (0..5_000_000_u32)
+        .map(|index| (index % 239) as u8)
+        .collect::<Vec<_>>();
+    fs::write(&upload, &render).unwrap();
+    let status = Command::new("nfs-cp")
+        .arg(&upload)
+        .arg(format!("nfs://127.0.0.1/media/render.mov{query}"))
+        .stdout(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let target = remote.join("media").join("render.mov");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && fs::read(&target).map(|data| data != render).unwrap_or(true)
+    {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(fs::read(&target).unwrap() == render);
+    let _ = server.kill();
+    let _ = server.wait();
+}

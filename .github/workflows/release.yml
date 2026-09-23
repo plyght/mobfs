@@ -194,6 +194,7 @@ jobs:
             target: x86_64-apple-darwin
             binary_name: mobfs
             asset_name: mobfs-macos-x64
+            cargo_flags: --no-default-features --features nfs
 
           - os: macos-latest
             platform: macos
@@ -201,6 +202,7 @@ jobs:
             target: aarch64-apple-darwin
             binary_name: mobfs
             asset_name: mobfs-macos-arm64
+            cargo_flags: --no-default-features --features nfs
 
     steps:
       - name: Checkout code
@@ -210,12 +212,6 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-
-      - name: Install macFUSE build dependency
-        if: runner.os == 'macOS'
-        run: |
-          brew install --cask macfuse
-          echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
 
       - name: Install cross-compilation tools (Linux ARM64)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
@@ -231,7 +227,7 @@ jobs:
           echo 'linker = "aarch64-linux-gnu-gcc"' >> .cargo/config.toml
 
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} ${{ matrix.cargo_flags }}
 
       - name: Prepare binary
         run: |

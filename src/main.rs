@@ -8,12 +8,16 @@ mod journal;
 mod local;
 #[cfg(feature = "fuse")]
 mod mountfs;
+#[cfg(feature = "nfs")]
+mod nfsmount;
 mod protocol;
 mod remote;
 mod snapshot;
 mod storage;
 mod sync;
 mod ui;
+#[cfg(any(feature = "fuse", feature = "nfs"))]
+mod vfs;
 
 use clap::Parser;
 use cli::{Cli, Command};
@@ -59,5 +63,6 @@ fn main() -> Result<()> {
         Command::Doctor => sync::doctor(),
         Command::Bench(args) => sync::bench(args),
         Command::Search(args) => sync::search(args),
+        Command::NfsServe(args) => sync::nfs_serve(args),
     }
 }
