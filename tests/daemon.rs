@@ -921,3 +921,165 @@ fn reconnects_after_daemon_restart_for_later_operations() {
     );
     drop(daemon);
 }
+
+fn fuse_tests_enabled() -> bool {
+    std::env::var("MOBFS_RUN_FUSE_TESTS").ok().as_deref() == Some("1")
+        || (cfg!(target_os = "macos")
+            && std::env::var("MOBFS_AUTO_RUN_MACFUSE_TESTS")
+                .ok()
+                .as_deref()
+                == Some("1")
+            && Path::new("/Library/Filesystems/macfuse.fs").exists())
+}
+
+struct Mounted {
+    child: Child,
+    mountpoint: std::path::PathBuf,
+}
+
+impl Drop for Mounted {
+    fn drop(&mut self) {
+        let _ = if cfg!(target_os = "macos") {
+            Command::new("diskutil")
+                .arg("unmount")
+                .arg(&self.mountpoint)
+                .status()
+        } else {
+            Command::new("fusermount")
+                .arg("-u")
+                .arg(&self.mountpoint)
+                .status()
+        };
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn mount_remote(remote: &Path, mountpoint: &Path, port: u16) -> Mounted {
+    let child = Command::new(bin())
+        .arg("mountfs")
+        .arg(format!("127.0.0.1:{}", remote.display()))
+        .arg(mountpoint)
+        .arg("--token")
+        .arg(TOKEN)
+        .arg("--port")
+        .arg(port.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mounted = Mounted {
+        child,
+        mountpoint: mountpoint.to_path_buf(),
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && !mountpoint.join("seed.txt").exists() {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        mountpoint.join("seed.txt").exists(),
+        "mount did not come up"
+    );
+    mounted
+}
+
+fn eventually(mut check: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if check() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
+#[test]
+fn mountfs_two_mounts_share_changes_live() {
+    if !fuse_tests_enabled() {
+        return;
+    }
+    let temp = TempDir::new().unwrap();
+    let remote = temp.path().join("remote");
+    fs::create_dir_all(&remote).unwrap();
+    fs::write(remote.join("seed.txt"), "seed").unwrap();
+    let daemon = start_daemon(&remote);
+    let a = mount_remote(&remote, &temp.path().join("a"), daemon.port);
+    let b = mount_remote(&remote, &temp.path().join("b"), daemon.port);
+    assert_eq!(
+        fs::read_to_string(b.mountpoint.join("seed.txt")).unwrap(),
+        "seed"
+    );
+    for round in 0..3 {
+        let body = format!("round {round}");
+        fs::write(a.mountpoint.join("seed.txt"), &body).unwrap();
+        assert_eq!(fs::read_to_string(remote.join("seed.txt")).unwrap(), body);
+        assert!(eventually(|| fs::read_to_string(
+            b.mountpoint.join("seed.txt")
+        )
+        .map(|text| text == body)
+        .unwrap_or(false)));
+        fs::write(a.mountpoint.join(".save.tmp"), &body).unwrap();
+        fs::rename(
+            a.mountpoint.join(".save.tmp"),
+            a.mountpoint.join("saved.txt"),
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(remote.join("saved.txt")).unwrap(), body);
+    }
+    fs::write(a.mountpoint.join("new.txt"), "fresh").unwrap();
+    assert!(eventually(|| b.mountpoint.join("new.txt").exists()));
+    fs::remove_file(a.mountpoint.join("new.txt")).unwrap();
+    assert!(eventually(|| !b.mountpoint.join("new.txt").exists()));
+    fs::write(remote.join("server.txt"), "from server").unwrap();
+    assert!(eventually(|| fs::read_to_string(
+        a.mountpoint.join("server.txt")
+    )
+    .map(|text| text == "from server")
+    .unwrap_or(false)));
+    fs::create_dir_all(a.mountpoint.join("dir")).unwrap();
+    fs::write(a.mountpoint.join("dir").join("keep.txt"), "keep").unwrap();
+    assert!(fs::remove_dir(a.mountpoint.join("dir")).is_err());
+    assert!(remote.join("dir").join("keep.txt").exists());
+}
+
+#[test]
+fn mountfs_streams_large_files_with_random_access() {
+    if !fuse_tests_enabled() {
+        return;
+    }
+    use std::io::{Read, Seek, SeekFrom};
+    let temp = TempDir::new().unwrap();
+    let remote = temp.path().join("remote");
+    fs::create_dir_all(&remote).unwrap();
+    fs::write(remote.join("seed.txt"), "seed").unwrap();
+    let data = (0..24 * 1024 * 1024_u32)
+        .map(|index| (index.wrapping_mul(2654435761) >> 13) as u8)
+        .collect::<Vec<_>>();
+    fs::write(remote.join("clip.mov"), &data).unwrap();
+    let daemon = start_daemon(&remote);
+    let mount = mount_remote(&remote, &temp.path().join("mnt"), daemon.port);
+    let mut file = fs::File::open(mount.mountpoint.join("clip.mov")).unwrap();
+    assert_eq!(file.metadata().unwrap().len(), data.len() as u64);
+    let mut buffer = vec![0_u8; 70_000];
+    for step in 0..64_u64 {
+        let offset = (step * 7_919_993) % (data.len() as u64 - buffer.len() as u64);
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.read_exact(&mut buffer).unwrap();
+        assert_eq!(
+            &buffer[..],
+            &data[offset as usize..offset as usize + buffer.len()]
+        );
+    }
+    let mut all = Vec::new();
+    fs::File::open(mount.mountpoint.join("clip.mov"))
+        .unwrap()
+        .read_to_end(&mut all)
+        .unwrap();
+    assert!(all == data);
+    let out = std::process::Command::new("df")
+        .arg(&mount.mountpoint)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+}

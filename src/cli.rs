@@ -80,6 +80,80 @@ pub enum Command {
     Doctor,
     #[command(about = "Benchmark snapshot and daemon transfer performance")]
     Bench(BenchArgs),
+    #[command(
+        about = "Instantly search file names across a mounted workspace on the remote  [alias: f]"
+    )]
+    #[command(visible_alias = "f")]
+    Search(SearchArgs),
+}
+
+#[derive(Args, Clone, Debug)]
+pub struct MountTuning {
+    #[arg(
+        long,
+        default_value_t = 4,
+        help = "Parallel daemon connections for foreground reads and writes"
+    )]
+    pub connections: usize,
+    #[arg(
+        long,
+        default_value_t = 3,
+        help = "Parallel daemon connections reserved for read-ahead"
+    )]
+    pub prefetch_connections: usize,
+    #[arg(
+        long,
+        default_value_t = 512,
+        help = "In-memory block cache size in MiB (nothing is written to disk)"
+    )]
+    pub cache_mib: u64,
+    #[arg(
+        long,
+        default_value_t = 32,
+        help = "Maximum sequential read-ahead window in MiB (0 disables)"
+    )]
+    pub readahead_mib: u64,
+    #[arg(long, help = "Volume name shown in Finder (macOS)")]
+    pub volname: Option<String>,
+    #[arg(
+        long,
+        help = "Use the macFUSE FSKit backend instead of the kernel extension (macOS 15.4+)"
+    )]
+    pub fskit: bool,
+    #[arg(
+        long,
+        help = "Mount in the background and return once the drive is ready"
+    )]
+    pub detach: bool,
+}
+
+impl Default for MountTuning {
+    fn default() -> Self {
+        Self {
+            connections: 4,
+            prefetch_connections: 3,
+            cache_mib: 512,
+            readahead_mib: 32,
+            volname: None,
+            fskit: false,
+            detach: false,
+        }
+    }
+}
+
+#[derive(Args)]
+pub struct SearchArgs {
+    #[arg(help = "Words to match against file paths", num_args = 1.., required = true)]
+    pub query: Vec<String>,
+    #[arg(long, default_value_t = 50, help = "Maximum results")]
+    pub limit: u64,
+    #[arg(
+        long,
+        help = "Mountpoint to search; defaults to the mount containing the current directory"
+    )]
+    pub mount: Option<PathBuf>,
+    #[arg(long, help = "Open the best match with its default app")]
+    pub open: bool,
 }
 
 #[derive(Args)]
@@ -149,6 +223,8 @@ pub struct ConnectArgs {
     pub no_open: bool,
     #[arg(long, help = "Stop any running ~/.mobfsd daemon before starting")]
     pub restart: bool,
+    #[command(flatten)]
+    pub tuning: MountTuning,
 }
 
 #[derive(Args)]
@@ -176,6 +252,8 @@ pub struct MountArgs {
     pub cache_ttl_secs: u64,
     #[arg(long, help = "Do not open Finder after mounting")]
     pub no_open: bool,
+    #[command(flatten)]
+    pub tuning: MountTuning,
 }
 
 #[derive(Args)]
@@ -188,6 +266,8 @@ pub struct MountFsArgs {
     pub token: Option<String>,
     #[arg(long, help = "Connect to mobfsd through ssh -L using the remote host")]
     pub ssh_tunnel: bool,
+    #[command(flatten)]
+    pub tuning: MountTuning,
 }
 
 #[derive(Args)]

@@ -1,11 +1,12 @@
+use crate::changes;
 use crate::crypto::SecureStream;
 use crate::error::{MobfsError, Result};
 use crate::local;
-use crate::protocol::{self, PROTOCOL_VERSION, Request, Response, RunStream};
+use crate::protocol::{self, ChangeKind, FsStats, PROTOCOL_VERSION, Request, Response, RunStream};
 use crate::snapshot::{EntryKind, EntryMeta, Snapshot};
 use filetime::{FileTime, set_file_mtime};
 use sha2::Digest;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -88,6 +89,7 @@ impl RootPolicy {
 fn handle_client(stream: TcpStream, token: &str, policy: &RootPolicy) -> Result<()> {
     let raw_stream = stream.try_clone()?;
     let mut stream = SecureStream::server(stream, token)?;
+    let mut client_id = 0_u64;
     loop {
         let request = match protocol::read_frame::<Request>(&mut stream) {
             Ok(request) => request,
@@ -99,6 +101,40 @@ fn handle_client(stream: TcpStream, token: &str, policy: &RootPolicy) -> Result<
         if should_drop_request(&request) {
             let _ = raw_stream.shutdown(Shutdown::Both);
             return Ok(());
+        }
+        if let Request::SetClientId { id } = request {
+            client_id = id;
+            protocol::write_frame(&mut stream, &Response::Ok)?;
+            continue;
+        }
+        if let Request::ReadRange {
+            root,
+            rel,
+            offset,
+            len,
+        } = request
+        {
+            match read_range(&root, &rel, offset, len, policy) {
+                Ok((data, eof)) => {
+                    protocol::write_frame(
+                        &mut stream,
+                        &Response::RangeHeader {
+                            len: data.len() as u64,
+                            eof,
+                        },
+                    )?;
+                    for chunk in data.chunks(RANGE_FRAME_BYTES) {
+                        stream.write_encrypted(chunk)?;
+                    }
+                }
+                Err(error) => protocol::write_frame(
+                    &mut stream,
+                    &Response::Error {
+                        message: error.to_string(),
+                    },
+                )?,
+            }
+            continue;
         }
         if let Request::Run { root, command } = request {
             if let Err(error) = handle_run(root, command, policy, &mut stream) {
@@ -144,18 +180,27 @@ fn handle_client(stream: TcpStream, token: &str, policy: &RootPolicy) -> Result<
             op_id,
         } = request
         {
-            let response =
-                handle_write_file_at_stream(root, rel, offset, len, op_id, policy, &mut stream)
-                    .map(|()| Response::Ok)
-                    .unwrap_or_else(|error| Response::Error {
-                        message: error.to_string(),
-                    });
+            let response = handle_write_file_at_stream(
+                root,
+                rel,
+                offset,
+                len,
+                op_id,
+                policy,
+                &mut stream,
+                client_id,
+            )
+            .map(|()| Response::Ok)
+            .unwrap_or_else(|error| Response::Error {
+                message: error.to_string(),
+            });
             protocol::write_frame(&mut stream, &response)?;
             continue;
         }
-        let response = handle_request(request, policy).unwrap_or_else(|error| Response::Error {
-            message: error.to_string(),
-        });
+        let response =
+            handle_request(request, policy, client_id).unwrap_or_else(|error| Response::Error {
+                message: error.to_string(),
+            });
         protocol::write_frame(&mut stream, &response)?;
     }
 }
@@ -196,10 +241,22 @@ fn request_label(request: &Request) -> &'static str {
         Request::Mkdir { .. } => "Mkdir",
         Request::Remove { .. } => "Remove",
         Request::Run { .. } => "Run",
+        Request::SetClientId { .. } => "SetClientId",
+        Request::ReadRange { .. } => "ReadRange",
+        Request::SnapshotMeta { .. } => "SnapshotMeta",
+        Request::WatchChanges { .. } => "WatchChanges",
+        Request::StatFs { .. } => "StatFs",
+        Request::Search { .. } => "Search",
     }
 }
 
-fn handle_request(request: Request, policy: &RootPolicy) -> Result<Response> {
+const OP_MARKER_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const STREAM_ANNOUNCE_BYTES: u64 = 4 * 1024 * 1024;
+const RANGE_FRAME_BYTES: usize = 1024 * 1024;
+const MAX_RANGE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_WATCH_TIMEOUT_MS: u64 = 25_000;
+
+fn handle_request(request: Request, policy: &RootPolicy, origin: u64) -> Result<Response> {
     match request {
         Request::Hello => Ok(Response::Hello {
             version: PROTOCOL_VERSION,
@@ -294,6 +351,7 @@ fn handle_request(request: Request, policy: &RootPolicy) -> Result<Response> {
             fs::File::create(&temp)?.write_all(&data)?;
             set_mode(&temp, mode)?;
             fs::rename(temp, path)?;
+            changes::record(&root, origin, &rel, ChangeKind::Replaced);
             Ok(Response::Ok)
         }
         Request::WriteFileStart {
@@ -356,6 +414,15 @@ fn handle_request(request: Request, policy: &RootPolicy) -> Result<Response> {
                 .open(path)?;
             file.seek(SeekFrom::Start(offset))?;
             file.write_all(&data)?;
+            changes::record(
+                &root,
+                origin,
+                &rel,
+                ChangeKind::Write {
+                    offset,
+                    len: data.len() as u64,
+                },
+            );
             Ok(Response::Ok)
         }
         Request::WriteFileAtBinary { .. } | Request::WriteFileAtStream { .. } => Err(
@@ -378,6 +445,7 @@ fn handle_request(request: Request, policy: &RootPolicy) -> Result<Response> {
                 .truncate(false)
                 .open(path)?;
             file.set_len(size)?;
+            changes::record(&root, origin, &rel, ChangeKind::Replaced);
             Ok(Response::Ok)
         }),
         Request::Fsync { root, rel } => {
@@ -395,14 +463,16 @@ fn handle_request(request: Request, policy: &RootPolicy) -> Result<Response> {
             op_id,
         } => once(policy, &root, op_id.as_deref(), || {
             let root = policy.check(&root)?;
-            let from = safe_join(&root, &from)?;
-            let to = safe_join(&root, &to)?;
-            if let Some(parent) = to.parent() {
+            let from_path = safe_join(&root, &from)?;
+            let to_path = safe_join(&root, &to)?;
+            if let Some(parent) = to_path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            if from.exists() {
-                fs::rename(from, to)?;
+            if fs::symlink_metadata(&from_path).is_ok() {
+                fs::rename(from_path, to_path)?;
             }
+            changes::record(&root, origin, &from, ChangeKind::Replaced);
+            changes::record(&root, origin, &to, ChangeKind::Replaced);
             Ok(Response::Ok)
         }),
         Request::WriteFileFinish {
@@ -422,6 +492,7 @@ fn handle_request(request: Request, policy: &RootPolicy) -> Result<Response> {
             }
             set_mode(&temp, mode)?;
             fs::rename(temp, path)?;
+            changes::record(&root, origin, &rel, ChangeKind::Replaced);
             Ok(Response::Ok)
         }
         Request::Symlink {
@@ -442,6 +513,7 @@ fn handle_request(request: Request, policy: &RootPolicy) -> Result<Response> {
             return Err(MobfsError::Remote(
                 "symlinks are not supported on this platform".to_string(),
             ));
+            changes::record(&root, origin, &rel, ChangeKind::Replaced);
             Ok(Response::Ok)
         }),
         Request::SetMetadata {
@@ -459,11 +531,13 @@ fn handle_request(request: Request, policy: &RootPolicy) -> Result<Response> {
             if let Some(modified) = modified {
                 set_mtime(&path, modified)?;
             }
+            changes::record(&root, origin, &rel, ChangeKind::Metadata);
             Ok(Response::Ok)
         }),
         Request::Mkdir { root, rel, op_id } => once(policy, &root, op_id.as_deref(), || {
             let root = policy.check(&root)?;
             fs::create_dir_all(safe_join(&root, &rel)?)?;
+            changes::record(&root, origin, &rel, ChangeKind::Replaced);
             Ok(Response::Ok)
         }),
         Request::Remove {
@@ -474,14 +548,69 @@ fn handle_request(request: Request, policy: &RootPolicy) -> Result<Response> {
         } => once(policy, &root, op_id.as_deref(), || {
             let root = policy.check(&root)?;
             let path = safe_join(&root, &rel)?;
-            if dir && path.exists() {
-                fs::remove_dir_all(path)?;
-            } else if path.exists() {
-                fs::remove_file(path)?;
+            let existing = fs::symlink_metadata(&path).ok();
+            match existing {
+                Some(meta) if dir && meta.is_dir() => fs::remove_dir_all(path)?,
+                Some(_) => fs::remove_file(path)?,
+                None => {}
             }
+            changes::record(&root, origin, &rel, ChangeKind::Replaced);
             Ok(Response::Ok)
         }),
         Request::Run { .. } => Err(MobfsError::Remote("run requests are streamed".to_string())),
+        Request::SetClientId { .. } | Request::ReadRange { .. } => Err(MobfsError::Remote(
+            "connection-scoped requests are handled by the client loop".to_string(),
+        )),
+        Request::SnapshotMeta {
+            root,
+            ignore,
+            max_entries,
+        } => {
+            let root = policy.check(&root)?;
+            let (snapshot, complete_dirs) = snapshot_meta(&root, &ignore, max_entries)?;
+            Ok(Response::SnapshotMeta {
+                snapshot,
+                complete_dirs,
+            })
+        }
+        Request::WatchChanges {
+            root,
+            ignore,
+            epoch,
+            since,
+            timeout_ms,
+        } => {
+            let root = policy.check(&root)?;
+            let result = changes::feed(&root).wait(
+                origin,
+                epoch,
+                since,
+                &ignore,
+                Duration::from_millis(timeout_ms.min(MAX_WATCH_TIMEOUT_MS)),
+            );
+            Ok(Response::Changes {
+                epoch: result.epoch,
+                cursor: result.cursor,
+                events: result.events,
+                reset: result.reset,
+                live: result.live,
+            })
+        }
+        Request::StatFs { root } => {
+            let root = policy.check(&root)?;
+            Ok(Response::StatFs(fs_stats(&root)?))
+        }
+        Request::Search {
+            root,
+            query,
+            ignore,
+            limit,
+        } => {
+            let root = policy.check(&root)?;
+            Ok(Response::SearchResults(search(
+                &root, &query, &ignore, limit,
+            )?))
+        }
     }
 }
 
@@ -507,6 +636,7 @@ fn handle_write_file_at_bytes(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_write_file_at_stream(
     root: String,
     rel: String,
@@ -515,6 +645,7 @@ fn handle_write_file_at_stream(
     op_id: Option<String>,
     policy: &RootPolicy,
     stream: &mut SecureStream,
+    origin: u64,
 ) -> Result<()> {
     if let Some(op_id) = op_id.as_deref()
         && op_done(policy, &root, op_id)?
@@ -534,6 +665,7 @@ fn handle_write_file_at_stream(
         .open(path)?;
     file.seek(SeekFrom::Start(offset))?;
     let mut written = 0_u64;
+    let mut announced = 0_u64;
     while written < len {
         let data = stream.read_encrypted()?;
         written = written.saturating_add(data.len() as u64);
@@ -543,6 +675,29 @@ fn handle_write_file_at_stream(
             ));
         }
         file.write_all(&data)?;
+        if written - announced >= STREAM_ANNOUNCE_BYTES {
+            changes::record(
+                &root_path,
+                origin,
+                &rel,
+                ChangeKind::Write {
+                    offset: offset + announced,
+                    len: written - announced,
+                },
+            );
+            announced = written;
+        }
+    }
+    if written > announced || len == 0 {
+        changes::record(
+            &root_path,
+            origin,
+            &rel,
+            ChangeKind::Write {
+                offset: offset + announced,
+                len: written - announced,
+            },
+        );
     }
     if let Some(op_id) = op_id.as_deref() {
         mark_op_done(policy, &root, op_id)?;
@@ -587,12 +742,33 @@ fn op_done(policy: &RootPolicy, root: &str, op_id: &str) -> Result<bool> {
 }
 
 fn mark_op_done(policy: &RootPolicy, root: &str, op_id: &str) -> Result<()> {
+    static MARKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let marker = op_marker_path(policy, root, op_id)?;
     if let Some(parent) = marker.parent() {
         fs::create_dir_all(parent)?;
+        if MARKS.fetch_add(1, Ordering::Relaxed).is_multiple_of(1024) {
+            prune_op_markers(parent);
+        }
     }
     fs::write(marker, b"done")?;
     Ok(())
+}
+
+fn prune_op_markers(dir: &Path) {
+    let Ok(items) = fs::read_dir(dir) else {
+        return;
+    };
+    for item in items.flatten() {
+        let stale = item
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > OP_MARKER_TTL);
+        if stale {
+            let _ = fs::remove_file(item.path());
+        }
+    }
 }
 
 fn op_marker_path(policy: &RootPolicy, root: &str, op_id: &str) -> Result<PathBuf> {
@@ -790,7 +966,7 @@ fn entry_meta_fast(path: &Path) -> Result<Option<EntryMeta>> {
         Ok(Some(EntryMeta {
             kind: EntryKind::Dir,
             size: 0,
-            modified: 0,
+            modified: modified_secs(&metadata),
             sha256: None,
             mode: mode(&metadata),
             link_target: None,
@@ -807,6 +983,177 @@ fn entry_meta_fast(path: &Path) -> Result<Option<EntryMeta>> {
     } else {
         Ok(None)
     }
+}
+
+fn read_range(
+    root: &str,
+    rel: &str,
+    offset: u64,
+    len: u64,
+    policy: &RootPolicy,
+) -> Result<(Vec<u8>, bool)> {
+    let root = policy.check(root)?;
+    let mut file = fs::File::open(safe_join(&root, rel)?)?;
+    let file_len = file.metadata()?.len();
+    let want = len
+        .min(MAX_RANGE_BYTES)
+        .min(file_len.saturating_sub(offset));
+    let mut data = vec![0_u8; usize::try_from(want).unwrap_or(0)];
+    file.seek(SeekFrom::Start(offset))?;
+    let mut filled = 0;
+    while filled < data.len() {
+        match file.read(&mut data[filled..])? {
+            0 => break,
+            read => filled += read,
+        }
+    }
+    data.truncate(filled);
+    let eof = offset.saturating_add(filled as u64) >= file_len;
+    Ok((data, eof))
+}
+
+fn snapshot_meta(
+    root: &Path,
+    ignore: &[String],
+    max_entries: u64,
+) -> Result<(Snapshot, Vec<String>)> {
+    let mut entries = BTreeMap::new();
+    let mut complete_dirs = Vec::new();
+    let mut queue = VecDeque::from([String::new()]);
+    while let Some(rel) = queue.pop_front() {
+        let Ok(items) = fs::read_dir(safe_join(root, &rel)?) else {
+            continue;
+        };
+        let mut batch = Vec::new();
+        for item in items.flatten() {
+            let Some(name) = item.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if crate::local::should_ignore_part(&name, ignore) {
+                continue;
+            }
+            let child = if rel.is_empty() {
+                name
+            } else {
+                format!("{rel}/{name}")
+            };
+            if let Ok(Some(meta)) = entry_meta_fast(&item.path()) {
+                batch.push((child, meta));
+            }
+        }
+        if (entries.len() + batch.len()) as u64 > max_entries {
+            break;
+        }
+        for (child, meta) in batch {
+            if meta.kind == EntryKind::Dir {
+                queue.push_back(child.clone());
+            }
+            entries.insert(child, meta);
+        }
+        complete_dirs.push(rel);
+    }
+    Ok((Snapshot { entries }, complete_dirs))
+}
+
+#[cfg(unix)]
+fn fs_stats(path: &Path) -> Result<FsStats> {
+    use std::os::unix::ffi::OsStrExt;
+    let raw = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| MobfsError::InvalidPath(path.display().to_string()))?;
+    let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(raw.as_ptr(), &mut stats) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    #[allow(clippy::unnecessary_cast)]
+    let block = if stats.f_frsize > 0 {
+        stats.f_frsize as u64
+    } else {
+        stats.f_bsize as u64
+    };
+    #[allow(clippy::unnecessary_cast)]
+    Ok(FsStats {
+        total_bytes: (stats.f_blocks as u64).saturating_mul(block),
+        free_bytes: (stats.f_bfree as u64).saturating_mul(block),
+        avail_bytes: (stats.f_bavail as u64).saturating_mul(block),
+        files: stats.f_files as u64,
+        free_files: stats.f_ffree as u64,
+    })
+}
+
+#[cfg(not(unix))]
+fn fs_stats(_path: &Path) -> Result<FsStats> {
+    Err(MobfsError::Remote(
+        "statfs is not supported on this platform".to_string(),
+    ))
+}
+
+const SEARCH_SCAN_LIMIT: usize = 5_000_000;
+
+fn search(
+    root: &Path,
+    query: &str,
+    ignore: &[String],
+    limit: u64,
+) -> Result<Vec<(String, EntryMeta)>> {
+    let query = query.trim().to_lowercase();
+    let terms = query.split_whitespace().collect::<Vec<_>>();
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    let limit = usize::try_from(limit.clamp(1, 10_000)).unwrap_or(100);
+    let walker = WalkDir::new(root).into_iter().filter_entry(|entry| {
+        entry.path() == root
+            || entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| !crate::local::should_ignore_part(name, ignore))
+    });
+    let mut hits = Vec::new();
+    for (scanned, item) in walker.enumerate() {
+        if scanned >= SEARCH_SCAN_LIMIT {
+            break;
+        }
+        let Ok(item) = item else {
+            continue;
+        };
+        if item.path() == root {
+            continue;
+        }
+        let Ok(rel) = relative_path(root, item.path()) else {
+            continue;
+        };
+        let score = search_score(&rel, &query, &terms);
+        if score == 0 {
+            continue;
+        }
+        if let Ok(Some(meta)) = entry_meta_fast(item.path()) {
+            hits.push((score, rel, meta));
+        }
+    }
+    hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    hits.truncate(limit);
+    Ok(hits.into_iter().map(|(_, rel, meta)| (rel, meta)).collect())
+}
+
+fn search_score(rel: &str, query: &str, terms: &[&str]) -> i64 {
+    let lower = rel.to_lowercase();
+    if !terms.iter().all(|term| lower.contains(term)) {
+        return 0;
+    }
+    let name = lower.rsplit('/').next().unwrap_or(&lower);
+    let mut score = 1_000;
+    if name == query {
+        score += 500;
+    }
+    if terms.iter().all(|term| name.contains(term)) {
+        score += 300;
+    }
+    if name.starts_with(terms[0]) {
+        score += 150;
+    }
+    score -= 10 * lower.matches('/').count() as i64;
+    score -= (lower.len() / 8) as i64;
+    score.max(1)
 }
 
 fn upload_temp_path(path: &Path, upload_id: &str) -> Result<PathBuf> {
@@ -908,6 +1255,34 @@ pub fn set_mtime(path: &Path, modified: i64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_prefers_file_name_matches() {
+        let terms = ["final", "cut"];
+        let deep = search_score("projects/final/cut/notes.txt", "final cut", &terms);
+        let named = search_score("projects/final cut.mov", "final cut", &terms);
+        assert!(named > deep);
+        assert_eq!(search_score("projects/other.mov", "final cut", &terms), 0);
+    }
+
+    #[test]
+    fn range_reads_report_eof() {
+        let temp = std::env::temp_dir().join(format!("mobfs-range-{}", std::process::id()));
+        fs::create_dir_all(&temp).unwrap();
+        fs::write(temp.join("clip.bin"), b"0123456789").unwrap();
+        let policy = RootPolicy::new(vec![temp.clone()], false).unwrap();
+        let root = temp.to_string_lossy().to_string();
+        let (data, eof) = read_range(&root, "clip.bin", 2, 4, &policy).unwrap();
+        assert_eq!(data, b"2345");
+        assert!(!eof);
+        let (data, eof) = read_range(&root, "clip.bin", 8, 100, &policy).unwrap();
+        assert_eq!(data, b"89");
+        assert!(eof);
+        let (data, eof) = read_range(&root, "clip.bin", 50, 10, &policy).unwrap();
+        assert!(data.is_empty());
+        assert!(eof);
+        let _ = fs::remove_dir_all(temp);
+    }
 
     #[test]
     fn safe_join_rejects_path_traversal() {

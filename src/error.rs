@@ -31,6 +31,9 @@ pub enum MobfsError {
 
     #[error("remote error: {0}")]
     Remote(String),
+
+    #[error("remote error: {0}")]
+    Server(String),
 }
 
 pub type Result<T> = std::result::Result<T, MobfsError>;

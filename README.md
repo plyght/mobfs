@@ -20,6 +20,11 @@ It is not a generic SSHFS replacement. SSHFS is the better tool for a simple rem
 - **SSH Tunnel Mode**: Connects through `ssh -L` so `mobfsd` can stay bound to localhost on the remote host
 - **Mirror Mode**: Provides explicit `pull`, `push`, and `sync` workflows when a durable local copy is actually wanted
 - **Operational Guardrails**: Requires allowed daemon roots, blocks unsafe relative paths, stores mirror tokens with `0600` permissions, and includes doctor/security checks
+- **Large-File Streaming**: Streams only the byte ranges an app asks for over parallel connections, with sequential read-ahead and seek-aware prefetch, so video scrubbing and huge assets open without downloading
+- **Zero-Disk Cache**: Keeps a bounded in-memory block cache (`--cache-mib`); nothing from the remote is written to local disk
+- **Live Collaboration**: A change feed from `mobfsd` pushes edits from other mounts and from the server itself into every connected mount within milliseconds, including files that are still being written
+- **Finder-Ready on macOS**: Named Finder volume, real free-space reporting, extended attributes, no AppleDouble clutter, background (`--detach`) mounts, clean unmount on Ctrl-C, and optional macFUSE FSKit backend
+- **Instant Search**: `mobfs search` matches file names across the whole remote tree on the server and prints local paths
 
 ## Install
 
@@ -37,8 +42,13 @@ cargo build --release --no-default-features
 The default build enables FUSE support. On macOS, install macFUSE before using `mobfs mount`, approve the system extension if prompted, and run a mount doctor before first dogfooding:
 
 ```bash
+brew install --cask macfuse
 mobfs mount-doctor /Volumes/app
 ```
+
+Install the same `mobfs` version on your Mac and on the remote host; the client and daemon must speak the same protocol version.
+
+On Apple silicon, the macFUSE kernel extension needs Reduced Security enabled in Startup Security Utility. On macOS 15.4 or newer you can skip that by passing `--fskit` to `mount` or `connect`, which uses macFUSE's FSKit backend (macFUSE 5+). FSKit volumes must be mounted under `/Volumes`, which is the default mountpoint on macOS.
 
 ## Usage
 
@@ -66,6 +76,30 @@ mobfs run cargo test
 
 Running `git` directly through the FUSE mount works for normal cases, but metadata-heavy commands are faster and more reliable when executed with `mobfs git` on the remote host.
 
+### Media, large files, and collaboration
+
+Mount a media library in the background so it appears as a drive in Finder:
+
+```bash
+mobfs connect editor@studio.example.com:/srv/media --name Media --detach --volname "Studio Media"
+```
+
+Apps such as DaVinci Resolve, Premiere, Photoshop, and Blender read the drive directly. MobFS fetches 1 MiB blocks on demand, grows a read-ahead window while playback is sequential, and restarts it at the new position when you scrub. Tune the stream for your link:
+
+```bash
+mobfs mount host:/srv/media --connections 8 --prefetch-connections 4 --readahead-mib 64 --cache-mib 2048
+```
+
+Every mount subscribes to the daemon's change feed. Saves, renames, and deletes made from another Mac, or directly on the server, show up in the other mounts right away. Large files being written elsewhere become readable as the data arrives, every 8 MiB.
+
+Search the whole remote tree without walking it over the network:
+
+```bash
+cd /Volumes/Media
+mobfs search interview final
+mobfs search "b-roll" --open
+```
+
 Use mirror mode only when you intentionally want a durable local working tree:
 
 ```bash
@@ -83,7 +117,9 @@ mobfs sync
 mobfs connect user@host:/absolute/path --name app
 mobfs mount host:/absolute/path --name app
 mobfs mount user@host:/absolute/path --local ~/mnt/app --ssh-tunnel
+mobfs mount host:/absolute/path --detach --volname "Projects"
 mobfs unmount /Volumes/app
+mobfs search <words...> [--mount /Volumes/app] [--open]
 
 # Remote commands
 mobfs run <command> [args...]
@@ -208,7 +244,8 @@ See `benchmarks.md` and `testing.md` for current measured results.
 - `local.rs`: Local tree scanning, ignore handling, and snapshot persistence for mirror mode
 - `journal.rs`: Local operation journal for mirror transfers
 - `sync.rs`: User-facing workflows for mount, mirror, pull, push, sync, watch, run, build, and doctor
-- `mountfs.rs`: No-local-code FUSE filesystem implementation
+- `mountfs.rs`: No-local-code FUSE filesystem with stable inodes, block cache, read-ahead, connection pools, and change-feed invalidation
+- `changes.rs`: Daemon-side change feed that records MobFS writes and watches the remote tree for outside edits
 - `ui.rs`: Minimal terminal status output
 
 ## Development

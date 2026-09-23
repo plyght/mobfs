@@ -2,7 +2,7 @@ use crate::config::{AppConfig, StorageBackend};
 use crate::crypto::SecureStream;
 use crate::daemon;
 use crate::error::{MobfsError, Result};
-use crate::protocol::{self, PROTOCOL_VERSION, Request, Response, RunStream};
+use crate::protocol::{self, FsStats, PROTOCOL_VERSION, Request, Response, RunStream};
 use crate::snapshot::{EntryKind, EntryMeta, Snapshot};
 use sha2::Digest;
 use std::fs::{self, File};
@@ -21,6 +21,20 @@ pub struct RemoteClient {
     config: AppConfig,
     stream: SecureStream,
     tunnel: Option<Child>,
+    client_id: u64,
+    shared_endpoint: Option<(String, u16)>,
+    endpoint: (String, u16),
+    op_nonce: u64,
+    op_counter: u64,
+}
+
+#[cfg_attr(not(feature = "fuse"), allow(dead_code))]
+pub struct ChangeBatch {
+    pub epoch: u64,
+    pub cursor: u64,
+    pub events: Vec<crate::protocol::ChangeEvent>,
+    pub reset: bool,
+    pub live: bool,
 }
 
 impl Drop for RemoteClient {
@@ -34,12 +48,30 @@ impl Drop for RemoteClient {
 
 impl RemoteClient {
     pub fn connect(config: AppConfig) -> Result<Self> {
+        Self::connect_with(config, 0, None)
+    }
+
+    #[cfg_attr(not(feature = "fuse"), allow(dead_code))]
+    pub fn connect_with(
+        config: AppConfig,
+        client_id: u64,
+        shared_endpoint: Option<(String, u16)>,
+    ) -> Result<Self> {
         with_backoff(config.sync.connect_retries, || {
-            Self::try_connect(config.clone())
+            Self::try_connect(config.clone(), client_id, shared_endpoint.clone())
         })
     }
 
-    fn try_connect(config: AppConfig) -> Result<Self> {
+    #[cfg_attr(not(feature = "fuse"), allow(dead_code))]
+    pub fn endpoint(&self) -> (String, u16) {
+        self.endpoint.clone()
+    }
+
+    fn try_connect(
+        config: AppConfig,
+        client_id: u64,
+        shared_endpoint: Option<(String, u16)>,
+    ) -> Result<Self> {
         if config.remote.backend != StorageBackend::Daemon {
             return Err(MobfsError::Config(format!(
                 "backend {:?} is configured but this command needs a live mobfs daemon",
@@ -47,12 +79,23 @@ impl RemoteClient {
             )));
         }
         let port = config.remote.port;
-        let (host, port, tunnel) = if config.remote.ssh_tunnel {
-            start_ssh_tunnel(&config.remote.host, &config.remote.user, port)?
-        } else {
-            (config.remote.host.clone(), port, None)
+        let shared = shared_endpoint.as_ref().and_then(|(host, port)| {
+            TcpStream::connect((host.as_str(), *port))
+                .ok()
+                .map(|stream| (host.clone(), *port, stream))
+        });
+        let (host, port, tunnel, stream) = match shared {
+            Some((host, port, stream)) => (host, port, None, stream),
+            None => {
+                let (host, port, tunnel) = if config.remote.ssh_tunnel {
+                    start_ssh_tunnel(&config.remote.host, &config.remote.user, port)?
+                } else {
+                    (config.remote.host.clone(), port, None)
+                };
+                let stream = TcpStream::connect((host.as_str(), port))?;
+                (host, port, tunnel, stream)
+            }
         };
-        let stream = TcpStream::connect((host.as_str(), port))?;
         stream.set_read_timeout(Some(Duration::from_secs(15)))?;
         stream.set_write_timeout(Some(Duration::from_secs(15)))?;
         let token = config
@@ -67,13 +110,23 @@ impl RemoteClient {
             })?;
         let mut stream = SecureStream::client(stream, &token)?;
         match protocol::send(&mut stream, &Request::Hello)? {
-            Response::Hello { version } if version == PROTOCOL_VERSION => Ok(Self {
-                config,
-                stream,
-                tunnel,
-            }),
+            Response::Hello { version } if version == PROTOCOL_VERSION => {
+                if client_id != 0 {
+                    protocol::send(&mut stream, &Request::SetClientId { id: client_id })?;
+                }
+                Ok(Self {
+                    config,
+                    stream,
+                    tunnel,
+                    client_id,
+                    shared_endpoint,
+                    endpoint: (host, port),
+                    op_nonce: rand_core::RngCore::next_u64(&mut rand_core::OsRng),
+                    op_counter: 0,
+                })
+            }
             Response::Hello { version } => Err(MobfsError::Remote(format!(
-                "protocol version mismatch: client {PROTOCOL_VERSION}, server {version}"
+                "protocol version mismatch: client {PROTOCOL_VERSION}, server {version}; install the same mobfs version on both machines, then restart the remote daemon with `mobfs connect ... --restart`"
             ))),
             _ => Err(MobfsError::Remote("invalid hello response".to_string())),
         }
@@ -225,6 +278,7 @@ impl RemoteClient {
     pub fn write_file_at(&mut self, rel: &str, offset: u64, data: Vec<u8>) -> Result<()> {
         let root = self.config.remote.path.clone();
         let rel = rel.to_string();
+        let op_id = self.next_op_id("write-at");
         self.op(|stream, _| {
             protocol::send_with_byte_stream(
                 stream,
@@ -233,7 +287,7 @@ impl RemoteClient {
                     rel: rel.clone(),
                     offset,
                     len: data.len() as u64,
-                    op_id: Some(op_id_for_bytes("write-at", &root, &rel, offset, &data)),
+                    op_id: Some(op_id.clone()),
                 },
                 &data,
                 STREAM_WRITE_CHUNK_SIZE,
@@ -246,6 +300,7 @@ impl RemoteClient {
     pub fn truncate(&mut self, rel: &str, size: u64) -> Result<()> {
         let root = self.config.remote.path.clone();
         let rel = rel.to_string();
+        let op_id = self.next_op_id("truncate");
         self.op(|stream, _| {
             protocol::send(
                 stream,
@@ -253,7 +308,7 @@ impl RemoteClient {
                     root: root.clone(),
                     rel: rel.clone(),
                     size,
-                    op_id: Some(op_id_for("truncate", &[&root, &rel, &size.to_string()])),
+                    op_id: Some(op_id.clone()),
                 },
             )
         })?;
@@ -281,6 +336,7 @@ impl RemoteClient {
         let root = self.config.remote.path.clone();
         let from = from.to_string();
         let to = to.to_string();
+        let op_id = self.next_op_id("rename");
         self.op(|stream, _| {
             protocol::send(
                 stream,
@@ -288,7 +344,7 @@ impl RemoteClient {
                     root: root.clone(),
                     from: from.clone(),
                     to: to.clone(),
-                    op_id: Some(op_id_for("rename", &[&root, &from, &to])),
+                    op_id: Some(op_id.clone()),
                 },
             )
         })?;
@@ -305,6 +361,7 @@ impl RemoteClient {
                 .to_str()
                 .ok_or_else(|| MobfsError::InvalidPath(local.display().to_string()))?
                 .to_string();
+            let op_id = self.next_op_id("symlink");
             self.op(|stream, _| {
                 protocol::send(
                     stream,
@@ -312,7 +369,7 @@ impl RemoteClient {
                         root: root.clone(),
                         rel: rel.clone(),
                         target: target.clone(),
-                        op_id: Some(op_id_for("symlink", &[&root, &rel, &target])),
+                        op_id: Some(op_id.clone()),
                     },
                 )
             })?;
@@ -411,13 +468,14 @@ impl RemoteClient {
             .unwrap_or(path)
             .trim_start_matches('/')
             .to_string();
+        let op_id = self.next_op_id("mkdir");
         self.op(|stream, _| {
             protocol::send(
                 stream,
                 &Request::Mkdir {
                     root: root.clone(),
                     rel: rel.clone(),
-                    op_id: Some(op_id_for("mkdir", &[&root, &rel])),
+                    op_id: Some(op_id.clone()),
                 },
             )
         })?;
@@ -429,6 +487,7 @@ impl RemoteClient {
         let root = self.config.remote.path.clone();
         let rel = rel.to_string();
         let target = target.to_string();
+        let op_id = self.next_op_id("symlink");
         self.op(|stream, _| {
             protocol::send(
                 stream,
@@ -436,7 +495,7 @@ impl RemoteClient {
                     root: root.clone(),
                     rel: rel.clone(),
                     target: target.clone(),
-                    op_id: Some(op_id_for("symlink", &[&root, &rel, &target])),
+                    op_id: Some(op_id.clone()),
                 },
             )
         })?;
@@ -452,6 +511,7 @@ impl RemoteClient {
     ) -> Result<()> {
         let root = self.config.remote.path.clone();
         let rel = rel.to_string();
+        let op_id = self.next_op_id("metadata");
         self.op(|stream, _| {
             protocol::send(
                 stream,
@@ -460,10 +520,7 @@ impl RemoteClient {
                     rel: rel.clone(),
                     mode,
                     modified,
-                    op_id: Some(op_id_for(
-                        "metadata",
-                        &[&root, &rel, &format!("{mode:?}"), &format!("{modified:?}")],
-                    )),
+                    op_id: Some(op_id.clone()),
                 },
             )
         })?;
@@ -474,6 +531,7 @@ impl RemoteClient {
         let root = self.config.remote.path.clone();
         let rel = rel.to_string();
         let dir = meta.kind == EntryKind::Dir;
+        let op_id = self.next_op_id("remove");
         self.op(|stream, _| {
             protocol::send(
                 stream,
@@ -481,7 +539,7 @@ impl RemoteClient {
                     root: root.clone(),
                     rel: rel.clone(),
                     dir,
-                    op_id: Some(op_id_for("remove", &[&root, &rel, &dir.to_string()])),
+                    op_id: Some(op_id.clone()),
                 },
             )
         })?;
@@ -521,10 +579,136 @@ impl RemoteClient {
     }
 
     pub fn reconnect(&mut self) -> Result<()> {
-        let mut next = Self::connect(self.config.clone())?;
+        let mut next = Self::connect_with(
+            self.config.clone(),
+            self.client_id,
+            self.shared_endpoint.clone(),
+        )?;
         std::mem::swap(&mut self.stream, &mut next.stream);
         std::mem::swap(&mut self.tunnel, &mut next.tunnel);
+        std::mem::swap(&mut self.endpoint, &mut next.endpoint);
         Ok(())
+    }
+
+    #[cfg_attr(not(feature = "fuse"), allow(dead_code))]
+    pub fn read_range(&mut self, rel: &str, offset: u64, len: u64) -> Result<(Vec<u8>, bool)> {
+        let root = self.config.remote.path.clone();
+        let rel = rel.to_string();
+        self.op(|stream, _| {
+            protocol::send_expecting_bytes(
+                stream,
+                &Request::ReadRange {
+                    root: root.clone(),
+                    rel: rel.clone(),
+                    offset,
+                    len,
+                },
+            )
+        })
+    }
+
+    #[cfg_attr(not(feature = "fuse"), allow(dead_code))]
+    pub fn snapshot_meta(&mut self, max_entries: u64) -> Result<(Snapshot, Vec<String>)> {
+        let root = self.config.remote.path.clone();
+        let ignore = self.config.sync.ignore.clone();
+        match self.op(|stream, _| {
+            protocol::send(
+                stream,
+                &Request::SnapshotMeta {
+                    root: root.clone(),
+                    ignore: ignore.clone(),
+                    max_entries,
+                },
+            )
+        })? {
+            Response::SnapshotMeta {
+                snapshot,
+                complete_dirs,
+            } => Ok((snapshot, complete_dirs)),
+            _ => Err(MobfsError::Remote("invalid snapshot response".to_string())),
+        }
+    }
+
+    #[cfg_attr(not(feature = "fuse"), allow(dead_code))]
+    pub fn watch_changes(
+        &mut self,
+        epoch: u64,
+        since: Option<u64>,
+        timeout: Duration,
+    ) -> Result<ChangeBatch> {
+        let root = self.config.remote.path.clone();
+        let ignore = self.config.sync.ignore.clone();
+        let wait = timeout.min(Duration::from_secs(20));
+        self.stream
+            .set_read_timeout(Some(wait + Duration::from_secs(15)))?;
+        let result = protocol::send(
+            &mut self.stream,
+            &Request::WatchChanges {
+                root,
+                ignore,
+                epoch,
+                since,
+                timeout_ms: wait.as_millis() as u64,
+            },
+        );
+        let _ = self.stream.set_read_timeout(Some(Duration::from_secs(15)));
+        match result? {
+            Response::Changes {
+                epoch,
+                cursor,
+                events,
+                reset,
+                live,
+            } => Ok(ChangeBatch {
+                epoch,
+                cursor,
+                events,
+                reset,
+                live,
+            }),
+            _ => Err(MobfsError::Remote(
+                "invalid change feed response".to_string(),
+            )),
+        }
+    }
+
+    #[cfg_attr(not(feature = "fuse"), allow(dead_code))]
+    pub fn statfs(&mut self) -> Result<FsStats> {
+        let root = self.config.remote.path.clone();
+        match self
+            .op(|stream, _| protocol::send(stream, &Request::StatFs { root: root.clone() }))?
+        {
+            Response::StatFs(stats) => Ok(stats),
+            _ => Err(MobfsError::Remote("invalid statfs response".to_string())),
+        }
+    }
+
+    pub fn search(&mut self, query: &str, limit: u64) -> Result<Vec<(String, EntryMeta)>> {
+        let root = self.config.remote.path.clone();
+        let ignore = self.config.sync.ignore.clone();
+        let query = query.to_string();
+        match self.op(|stream, _| {
+            protocol::send(
+                stream,
+                &Request::Search {
+                    root: root.clone(),
+                    query: query.clone(),
+                    ignore: ignore.clone(),
+                    limit,
+                },
+            )
+        })? {
+            Response::SearchResults(results) => Ok(results),
+            _ => Err(MobfsError::Remote("invalid search response".to_string())),
+        }
+    }
+
+    fn next_op_id(&mut self, kind: &str) -> String {
+        self.op_counter += 1;
+        op_id_for(
+            kind,
+            &[&self.op_nonce.to_string(), &self.op_counter.to_string()],
+        )
     }
 
     fn op<T>(
@@ -535,6 +719,7 @@ impl RemoteClient {
         loop {
             match action(&mut self.stream, &self.config) {
                 Ok(value) => return Ok(value),
+                Err(error @ MobfsError::Server(_)) => return Err(error),
                 Err(error) if attempt < self.config.sync.operation_retries => {
                     attempt += 1;
                     crate::ui::warn(format!(
@@ -613,20 +798,6 @@ fn op_id_for(kind: &str, parts: &[&str]) -> String {
         hasher.update([0]);
         hasher.update(part.as_bytes());
     }
-    hex::encode(hasher.finalize())
-}
-
-fn op_id_for_bytes(kind: &str, root: &str, rel: &str, offset: u64, data: &[u8]) -> String {
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(kind.as_bytes());
-    hasher.update([0]);
-    hasher.update(root.as_bytes());
-    hasher.update([0]);
-    hasher.update(rel.as_bytes());
-    hasher.update([0]);
-    hasher.update(offset.to_le_bytes());
-    hasher.update([0]);
-    hasher.update(data);
     hex::encode(hasher.finalize())
 }
 

@@ -15,7 +15,7 @@ hex = "0.4.3"
 hkdf = "0.12.4"
 hmac = "0.12.1"
 indicatif = "0.18.3"
-libc = { version = "0.2.186", optional = true }
+libc = "0.2.186"
 notify = "8.2.0"
 rand_core = { version = "0.6.4", features = ["getrandom"] }
 serde = { version = "1.0.228", features = ["derive"] }
@@ -29,7 +29,7 @@ x25519-dalek = "2.0.1"
 
 [features]
 default = ["fuse"]
-fuse = ["dep:fuser", "dep:libc"]
+fuse = ["dep:fuser"]
 
 [dev-dependencies]
 tempfile = "3.23.0"

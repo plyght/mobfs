@@ -1,46 +1,170 @@
 use crate::config::{AppConfig, LocalConfig, RemoteConfig, SyncConfig, parse_remote};
 use crate::error::Result;
+use crate::protocol::{ChangeEvent, ChangeKind, FsStats};
 use crate::remote::RemoteClient;
-use crate::snapshot::{EntryKind, EntryMeta, Snapshot};
+use crate::snapshot::{EntryKind, EntryMeta};
 use fuser::{
-    Config, Errno, FileAttr, FileType, Filesystem, FopenFlags, INodeNo, MountOption, ReplyAttr,
-    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLock, ReplyOpen,
-    ReplyWrite, ReplyXattr, Request, TimeOrNow,
+    Config, Errno, FileAttr, FileType, Filesystem, FopenFlags, INodeNo, KernelConfig, MountOption,
+    Notifier, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLock,
+    ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow,
 };
+use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub fn mount(config: AppConfig, mountpoint: PathBuf) -> Result<()> {
+const BLOCK_SIZE: u64 = 1024 * 1024;
+const WRITE_BUFFER_LIMIT: usize = 8 * 1024 * 1024;
+const PREFETCH_MAX_FILE_BYTES: u64 = 64 * 1024;
+const PREFETCH_MAX_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
+const SNAPSHOT_MAX_ENTRIES: u64 = 250_000;
+const STATFS_TTL: Duration = Duration::from_secs(10);
+const STATFS_BLOCK: u64 = 4096;
+const FEED_POLL: Duration = Duration::from_secs(10);
+const FOREGROUND_WORKERS: usize = 16;
+
+#[derive(Debug, Clone)]
+pub struct MountOptions {
+    pub connections: usize,
+    pub prefetch_connections: usize,
+    pub cache_mib: u64,
+    pub readahead_mib: u64,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub volname: Option<String>,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fskit: bool,
+    pub open_when_ready: bool,
+}
+
+impl Default for MountOptions {
+    fn default() -> Self {
+        Self {
+            connections: 4,
+            prefetch_connections: 3,
+            cache_mib: 512,
+            readahead_mib: 32,
+            volname: None,
+            fskit: false,
+            open_when_ready: false,
+        }
+    }
+}
+
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn request_shutdown(_signal: libc::c_int) {
+    SHUTDOWN.store(true, Ordering::SeqCst);
+}
+
+pub fn mount(config: AppConfig, mountpoint: PathBuf, options: MountOptions) -> Result<()> {
     prepare_mountpoint(&mountpoint)?;
     let ttl = Duration::from_secs(config.sync.cache_ttl_secs.min(60));
-    let fs = MobfsFuse::new(config, ttl)?;
-    let mut config = Config::default();
-    config.mount_options = vec![
+    let (fs, feed) = MobfsFuse::new(config, ttl, &options)?;
+    let shared = fs.shared.clone();
+    let mut fuse_config = Config::default();
+    fuse_config.mount_options = mount_options(&options, &mountpoint);
+    let session = fuser::spawn_mount2(fs, &mountpoint, &fuse_config).map_err(|error| {
+        crate::error::MobfsError::Remote(format!(
+            "failed to mount FUSE filesystem: {error}. On macOS, install macFUSE and allow its system extension in System Settings if prompted"
+        ))
+    })?;
+    *lock(&shared.notifier) = Some(session.notifier());
+    if let Some((client, epoch, cursor)) = feed {
+        let shared = shared.clone();
+        std::thread::Builder::new()
+            .name("mobfs-feed".to_string())
+            .spawn(move || run_change_feed(shared, client, epoch, cursor))?;
+    }
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            request_shutdown as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGTERM,
+            request_shutdown as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGHUP,
+            request_shutdown as *const () as libc::sighandler_t,
+        );
+    }
+    crate::ui::ok(format!("mounted {}", mountpoint.display()));
+    if options.open_when_ready {
+        let path = mountpoint.clone();
+        std::thread::spawn(move || {
+            let _ = crate::sync::open_path(&path);
+        });
+    }
+    loop {
+        if session.guard.is_finished() {
+            break;
+        }
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            crate::ui::info("unmounting", mountpoint.display().to_string());
+            shared.flush_all_buffers();
+            shared.stop.store(true, Ordering::SeqCst);
+            return session.umount_and_join().map_err(Into::into);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    shared.stop.store(true, Ordering::SeqCst);
+    session.join()?;
+    Ok(())
+}
+
+fn mount_options(options: &MountOptions, mountpoint: &Path) -> Vec<MountOption> {
+    #[allow(unused_mut)]
+    let mut mount_options = vec![
         MountOption::RW,
         MountOption::FSName("mobfs".to_string()),
         MountOption::Subtype("mobfs".to_string()),
         MountOption::DefaultPermissions,
     ];
-    fuser::mount2(fs, mountpoint, &config).map_err(|error| {
-        crate::error::MobfsError::Remote(format!(
-            "failed to mount FUSE filesystem: {error}. On macOS, install macFUSE and allow its system extension in System Settings if prompted"
-        ))
-    })?;
-    Ok(())
+    #[cfg(target_os = "macos")]
+    {
+        let volname = options
+            .volname
+            .clone()
+            .or_else(|| {
+                mountpoint
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+            })
+            .unwrap_or_else(|| "MobFS".to_string())
+            .replace([',', '='], " ");
+        mount_options.push(MountOption::CUSTOM(format!("volname={volname}")));
+        mount_options.push(MountOption::CUSTOM("noappledouble".to_string()));
+        mount_options.push(MountOption::CUSTOM(format!("iosize={BLOCK_SIZE}")));
+        mount_options.push(MountOption::CUSTOM("daemon_timeout=600".to_string()));
+        if options.fskit {
+            mount_options.push(MountOption::CUSTOM("backend=fskit".to_string()));
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (options, mountpoint);
+    mount_options
 }
 
 pub fn prepare_mountpoint(mountpoint: &Path) -> Result<()> {
     #[cfg(target_os = "macos")]
     if !Path::new("/Library/Filesystems/macfuse.fs").exists() {
         return Err(crate::error::MobfsError::Config(
-            "macFUSE is not installed; install macFUSE, approve its system extension, then retry `mobfs mount`".to_string(),
+            "macFUSE is not installed; install macFUSE (brew install --cask macfuse), approve its system extension, then retry `mobfs mount`".to_string(),
         ));
+    }
+    if is_stale_mount(mountpoint) {
+        crate::ui::warn(format!(
+            "cleaning up stale mount at {}",
+            mountpoint.display()
+        ));
+        force_unmount(mountpoint);
     }
     if mountpoint.exists() && !mountpoint.is_dir() {
         return Err(crate::error::MobfsError::Config(format!(
@@ -48,7 +172,15 @@ pub fn prepare_mountpoint(mountpoint: &Path) -> Result<()> {
             mountpoint.display()
         )));
     }
-    std::fs::create_dir_all(mountpoint)?;
+    if let Err(error) = std::fs::create_dir_all(mountpoint) {
+        if cfg!(target_os = "macos")
+            && error.kind() == std::io::ErrorKind::PermissionDenied
+            && mountpoint.starts_with("/Volumes")
+        {
+            return Ok(());
+        }
+        return Err(error.into());
+    }
     let mut unexpected = Vec::new();
     for item in std::fs::read_dir(mountpoint)? {
         let item = item?;
@@ -65,6 +197,60 @@ pub fn prepare_mountpoint(mountpoint: &Path) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn is_stale_mount(mountpoint: &Path) -> bool {
+    match std::fs::read_dir(mountpoint) {
+        Ok(_) => false,
+        Err(error) => matches!(
+            error.raw_os_error(),
+            Some(libc::ENOTCONN) | Some(libc::ENXIO) | Some(libc::EIO)
+        ),
+    }
+}
+
+pub fn force_unmount(mountpoint: &Path) {
+    let commands: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
+        &[("diskutil", &["unmount", "force"]), ("umount", &["-f"])]
+    } else {
+        &[
+            ("fusermount3", &["-uz"]),
+            ("fusermount", &["-uz"]),
+            ("umount", &["-l"]),
+        ]
+    };
+    for (program, args) in commands {
+        let ok = std::process::Command::new(program)
+            .args(*args)
+            .arg(mountpoint)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if ok {
+            return;
+        }
+    }
+}
+
+pub fn is_mounted(mountpoint: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Some(parent) = mountpoint.parent() else {
+            return false;
+        };
+        match (std::fs::metadata(mountpoint), std::fs::metadata(parent)) {
+            (Ok(mount), Ok(parent)) => mount.dev() != parent.dev(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = mountpoint;
+        false
+    }
 }
 
 pub fn config_from_remote(
@@ -110,32 +296,430 @@ pub fn config_from_remote(
     })
 }
 
-type DirEntries = Vec<(String, EntryMeta)>;
-type DirCache = BTreeMap<String, (Instant, DirEntries)>;
-const WRITE_BUFFER_LIMIT: usize = 32 * 1024 * 1024;
-const PREFETCH_MAX_FILE_BYTES: u64 = 64 * 1024;
-const PREFETCH_MAX_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|error| error.into_inner())
+}
+
+type Job = Box<dyn FnOnce() + Send + 'static>;
+
+struct WorkerPool {
+    sender: mpsc::Sender<Job>,
+}
+
+impl WorkerPool {
+    fn new(name: &str, threads: usize) -> Self {
+        let (sender, receiver) = mpsc::channel::<Job>();
+        let receiver = Arc::new(Mutex::new(receiver));
+        for index in 0..threads.max(1) {
+            let receiver = receiver.clone();
+            let _ = std::thread::Builder::new()
+                .name(format!("{name}-{index}"))
+                .spawn(move || {
+                    loop {
+                        let job = lock(&receiver).recv();
+                        match job {
+                            Ok(job) => job(),
+                            Err(_) => break,
+                        }
+                    }
+                });
+        }
+        Self { sender }
+    }
+
+    fn run(&self, job: impl FnOnce() + Send + 'static) {
+        let _ = self.sender.send(Box::new(job));
+    }
+}
+
+struct ClientPool {
+    slots: Vec<Mutex<Option<RemoteClient>>>,
+    next: AtomicUsize,
+    config: AppConfig,
+    client_id: u64,
+    endpoint: Option<(String, u16)>,
+}
+
+impl ClientPool {
+    fn new(
+        config: AppConfig,
+        client_id: u64,
+        endpoint: Option<(String, u16)>,
+        size: usize,
+        first: Option<RemoteClient>,
+    ) -> Self {
+        let mut slots = Vec::with_capacity(size.max(1));
+        slots.push(Mutex::new(first));
+        while slots.len() < size.max(1) {
+            slots.push(Mutex::new(None));
+        }
+        Self {
+            slots,
+            next: AtomicUsize::new(0),
+            config,
+            client_id,
+            endpoint,
+        }
+    }
+
+    fn with<T>(&self, action: impl FnOnce(&mut RemoteClient) -> Result<T>) -> Result<T> {
+        for slot in &self.slots {
+            match slot.try_lock() {
+                Ok(mut guard) => return self.use_slot(&mut guard, action),
+                Err(TryLockError::Poisoned(error)) => {
+                    return self.use_slot(&mut error.into_inner(), action);
+                }
+                Err(TryLockError::WouldBlock) => {}
+            }
+        }
+        let index = self.next.fetch_add(1, Ordering::Relaxed) % self.slots.len();
+        self.use_slot(&mut lock(&self.slots[index]), action)
+    }
+
+    fn use_slot<T>(
+        &self,
+        slot: &mut Option<RemoteClient>,
+        action: impl FnOnce(&mut RemoteClient) -> Result<T>,
+    ) -> Result<T> {
+        if slot.is_none() {
+            *slot = Some(RemoteClient::connect_with(
+                self.config.clone(),
+                self.client_id,
+                self.endpoint.clone(),
+            )?);
+        }
+        match slot.as_mut() {
+            Some(client) => action(client),
+            None => Err(crate::error::MobfsError::Remote(
+                "connection unavailable".to_string(),
+            )),
+        }
+    }
+}
+
+struct Inodes {
+    by_path: BTreeMap<String, u64>,
+    by_ino: HashMap<u64, String>,
+    next: u64,
+}
+
+impl Inodes {
+    fn new() -> Self {
+        let mut by_path = BTreeMap::new();
+        let mut by_ino = HashMap::new();
+        by_path.insert(String::new(), 1);
+        by_ino.insert(1, String::new());
+        Self {
+            by_path,
+            by_ino,
+            next: 2,
+        }
+    }
+
+    fn ino(&mut self, path: &str) -> u64 {
+        if let Some(ino) = self.by_path.get(path) {
+            return *ino;
+        }
+        let ino = self.next;
+        self.next += 1;
+        self.by_path.insert(path.to_string(), ino);
+        self.by_ino.insert(ino, path.to_string());
+        ino
+    }
+
+    fn get(&self, path: &str) -> Option<u64> {
+        self.by_path.get(path).copied()
+    }
+
+    fn path(&self, ino: u64) -> Option<String> {
+        self.by_ino.get(&ino).cloned()
+    }
+
+    fn remove_tree(&mut self, path: &str) {
+        for key in subtree_keys(&self.by_path, path) {
+            if let Some(ino) = self.by_path.remove(&key) {
+                self.by_ino.remove(&ino);
+            }
+        }
+    }
+
+    fn rename(&mut self, from: &str, to: &str) {
+        self.remove_tree(to);
+        for key in subtree_keys(&self.by_path, from) {
+            if let Some(ino) = self.by_path.remove(&key) {
+                let moved = format!("{to}{}", &key[from.len()..]);
+                self.by_path.insert(moved.clone(), ino);
+                self.by_ino.insert(ino, moved);
+            }
+        }
+    }
+}
+
+fn subtree_keys<V>(map: &BTreeMap<String, V>, path: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    if map.contains_key(path) {
+        keys.push(path.to_string());
+    }
+    let prefix = format!("{path}/");
+    keys.extend(
+        map.range(prefix.clone()..)
+            .take_while(|(key, _)| key.starts_with(&prefix))
+            .map(|(key, _)| key.clone()),
+    );
+    keys
+}
+
+type BlockKey = (String, u64);
+
+struct Inflight {
+    done: Mutex<bool>,
+    ready: Condvar,
+}
+
+impl Inflight {
+    fn wait(&self) {
+        let mut done = lock(&self.done);
+        while !*done {
+            done = self
+                .ready
+                .wait(done)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+
+    fn finish(&self) {
+        *lock(&self.done) = true;
+        self.ready.notify_all();
+    }
+}
+
+struct BlockStore {
+    blocks: HashMap<BlockKey, (Arc<Vec<u8>>, u64)>,
+    lru: BTreeMap<u64, BlockKey>,
+    generations: HashMap<String, u64>,
+    tick: u64,
+    bytes: u64,
+    capacity: u64,
+}
+
+struct BlockCache {
+    store: Mutex<BlockStore>,
+    inflight: Mutex<HashMap<BlockKey, Arc<Inflight>>>,
+}
+
+impl BlockCache {
+    fn new(capacity: u64) -> Self {
+        Self {
+            store: Mutex::new(BlockStore {
+                blocks: HashMap::new(),
+                lru: BTreeMap::new(),
+                generations: HashMap::new(),
+                tick: 0,
+                bytes: 0,
+                capacity: capacity.max(BLOCK_SIZE * 4),
+            }),
+            inflight: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn get(&self, path: &str, index: u64) -> Option<Arc<Vec<u8>>> {
+        let mut store = lock(&self.store);
+        let key = (path.to_string(), index);
+        let old_tick = store.blocks.get(&key)?.1;
+        store.tick += 1;
+        let tick = store.tick;
+        store.lru.remove(&old_tick);
+        store.lru.insert(tick, key.clone());
+        let entry = store.blocks.get_mut(&key)?;
+        entry.1 = tick;
+        Some(entry.0.clone())
+    }
+
+    fn contains(&self, path: &str, index: u64) -> bool {
+        let key = (path.to_string(), index);
+        lock(&self.store).blocks.contains_key(&key) || lock(&self.inflight).contains_key(&key)
+    }
+
+    fn generation(&self, path: &str) -> u64 {
+        lock(&self.store)
+            .generations
+            .get(path)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn insert(&self, path: &str, index: u64, data: Arc<Vec<u8>>, generation: u64) {
+        let mut store = lock(&self.store);
+        if store.generations.get(path).copied().unwrap_or(0) != generation {
+            return;
+        }
+        let key = (path.to_string(), index);
+        if let Some((old, tick)) = store.blocks.remove(&key) {
+            store.bytes = store.bytes.saturating_sub(old.len() as u64);
+            store.lru.remove(&tick);
+        }
+        store.tick += 1;
+        let tick = store.tick;
+        store.bytes += data.len() as u64;
+        store.lru.insert(tick, key.clone());
+        store.blocks.insert(key, (data, tick));
+        while store.bytes > store.capacity {
+            let Some((_, oldest)) = store.lru.pop_first() else {
+                break;
+            };
+            if let Some((old, _)) = store.blocks.remove(&oldest) {
+                store.bytes = store.bytes.saturating_sub(old.len() as u64);
+            }
+        }
+    }
+
+    fn invalidate_where(&self, paths: &HashSet<String>, keep: impl Fn(&BlockKey) -> bool) {
+        let mut store = lock(&self.store);
+        for path in paths {
+            *store.generations.entry(path.clone()).or_insert(0) += 1;
+        }
+        let doomed = store
+            .blocks
+            .keys()
+            .filter(|key| paths.contains(&key.0) && !keep(key))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in doomed {
+            if let Some((old, tick)) = store.blocks.remove(&key) {
+                store.bytes = store.bytes.saturating_sub(old.len() as u64);
+                store.lru.remove(&tick);
+            }
+        }
+    }
+
+    fn invalidate_path(&self, path: &str) {
+        self.invalidate_where(&HashSet::from([path.to_string()]), |_| false);
+    }
+
+    fn invalidate_range(&self, path: &str, offset: u64, len: u64) {
+        let first = offset / BLOCK_SIZE;
+        let last = offset.saturating_add(len.max(1)).saturating_sub(1) / BLOCK_SIZE;
+        self.invalidate_where(&HashSet::from([path.to_string()]), |key| {
+            key.1 < first || key.1 > last
+        });
+    }
+
+    fn invalidate_tree(&self, path: &str) {
+        let prefix = format!("{path}/");
+        let paths = lock(&self.store)
+            .blocks
+            .keys()
+            .map(|key| key.0.clone())
+            .filter(|cached| cached == path || cached.starts_with(&prefix))
+            .chain(std::iter::once(path.to_string()))
+            .collect::<HashSet<_>>();
+        self.invalidate_where(&paths, |_| false);
+    }
+
+    fn clear(&self) {
+        let mut store = lock(&self.store);
+        let paths = store
+            .blocks
+            .keys()
+            .map(|key| key.0.clone())
+            .collect::<HashSet<_>>();
+        for path in paths {
+            *store.generations.entry(path).or_insert(0) += 1;
+        }
+        store.blocks.clear();
+        store.lru.clear();
+        store.bytes = 0;
+    }
+
+    fn fetch(&self, path: &str, index: u64, pool: &ClientPool) -> Result<Arc<Vec<u8>>> {
+        if let Some(data) = self.get(path, index) {
+            return Ok(data);
+        }
+        let key = (path.to_string(), index);
+        let (flight, leader) = {
+            let mut inflight = lock(&self.inflight);
+            match inflight.get(&key) {
+                Some(flight) => (flight.clone(), false),
+                None => {
+                    let flight = Arc::new(Inflight {
+                        done: Mutex::new(false),
+                        ready: Condvar::new(),
+                    });
+                    inflight.insert(key.clone(), flight.clone());
+                    (flight, true)
+                }
+            }
+        };
+        if !leader {
+            flight.wait();
+            if let Some(data) = self.get(path, index) {
+                return Ok(data);
+            }
+            let (data, _) =
+                pool.with(|client| client.read_range(path, index * BLOCK_SIZE, BLOCK_SIZE))?;
+            return Ok(Arc::new(data));
+        }
+        let generation = self.generation(path);
+        let result = pool.with(|client| client.read_range(path, index * BLOCK_SIZE, BLOCK_SIZE));
+        let result = result.map(|(data, _)| {
+            let data = Arc::new(data);
+            self.insert(path, index, data.clone(), generation);
+            data
+        });
+        lock(&self.inflight).remove(&key);
+        flight.finish();
+        result
+    }
+}
 
 struct PendingWrite {
+    ino: u64,
     path: String,
     offset: u64,
     data: Vec<u8>,
 }
 
-struct MobfsFuse {
-    client: Mutex<RemoteClient>,
-    snapshot: Mutex<Snapshot>,
-    path_to_ino: Mutex<BTreeMap<String, u64>>,
-    ino_to_path: Mutex<BTreeMap<u64, String>>,
-    read_cache: Mutex<BTreeMap<(String, u64, u32), Vec<u8>>>,
-    file_cache: Mutex<BTreeMap<String, Vec<u8>>>,
-    dir_cache: Mutex<DirCache>,
-    handle_to_path: Mutex<BTreeMap<u64, String>>,
+struct ReadAhead {
+    next_offset: u64,
+    window: u64,
+    epoch: u64,
+}
+
+type DirEntries = Vec<(String, EntryMeta)>;
+type DirListing = Arc<Vec<(u64, FileType, String)>>;
+
+struct Shared {
+    pool: ClientPool,
+    prefetch_pool: ClientPool,
+    inodes: Mutex<Inodes>,
+    metas: Mutex<BTreeMap<String, EntryMeta>>,
+    dirs: Mutex<BTreeMap<String, (Instant, DirEntries)>>,
+    blocks: BlockCache,
+    next_fh: AtomicU64,
+    dir_handles: Mutex<HashMap<u64, DirListing>>,
     write_buffers: Mutex<BTreeMap<u64, PendingWrite>>,
+    read_ahead: Mutex<HashMap<u64, ReadAhead>>,
+    prefetch_queued: Mutex<HashSet<BlockKey>>,
+    versions: Mutex<HashMap<u64, (u64, u64)>>,
+    xattrs: Mutex<HashMap<String, BTreeMap<String, Vec<u8>>>>,
+    statfs: Mutex<Option<(Instant, FsStats)>>,
+    feed_live: AtomicBool,
+    notifier: Mutex<Option<Notifier>>,
+    stop: AtomicBool,
     journal: PathBuf,
+    root_meta: EntryMeta,
     ttl: Duration,
     ignore: Vec<String>,
+    readahead_blocks: u64,
+    workers: WorkerPool,
+    prefetchers: WorkerPool,
 }
+
+struct MobfsFuse {
+    shared: Arc<Shared>,
+}
+
+type FeedStart = Option<(RemoteClient, u64, u64)>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum JournalOp {
@@ -168,35 +752,51 @@ enum JournalOp {
         offset: u64,
         data: Vec<u8>,
     },
+    WriteBlob {
+        path: String,
+        offset: u64,
+        blob: String,
+    },
 }
 
 impl MobfsFuse {
-    fn new(config: AppConfig, ttl: Duration) -> Result<Self> {
+    fn new(config: AppConfig, ttl: Duration, options: &MountOptions) -> Result<(Self, FeedStart)> {
         let journal = mountfs_journal_path(&config);
         let ignore = config.sync.ignore.clone();
-        let mut client = RemoteClient::connect(config)?;
+        let client_id = OsRng.next_u64() | 1;
+        let mut client = RemoteClient::connect_with(config.clone(), client_id, None)?;
         replay_journal(&journal, &mut client)?;
-        let snapshot = client.snapshot()?;
-        let mut path_to_ino = BTreeMap::new();
-        let mut ino_to_path = BTreeMap::new();
-        path_to_ino.insert(String::new(), 1);
-        ino_to_path.insert(1, String::new());
-        for path in snapshot.entries.keys() {
-            let ino = inode_for(path);
-            path_to_ino.insert(path.clone(), ino);
-            ino_to_path.insert(ino, path.clone());
+        let endpoint = Some(client.endpoint());
+        let feed = RemoteClient::connect_with(config.clone(), client_id, endpoint.clone())
+            .and_then(|mut feed| {
+                let batch = feed.watch_changes(0, None, Duration::ZERO)?;
+                Ok((feed, batch.epoch, batch.cursor))
+            })
+            .map_err(|error| {
+                crate::ui::warn(format!(
+                    "live change feed unavailable ({error}); falling back to cache TTLs"
+                ))
+            })
+            .ok();
+        let (snapshot, complete_dirs) = client.snapshot_meta(SNAPSHOT_MAX_ENTRIES)?;
+        let now = Instant::now();
+        let mut dirs: BTreeMap<String, (Instant, DirEntries)> = complete_dirs
+            .into_iter()
+            .map(|dir| (dir, (now, Vec::new())))
+            .collect();
+        for (path, meta) in &snapshot.entries {
+            let (parent, name) = split_parent(path);
+            if let Some((_, entries)) = dirs.get_mut(parent) {
+                entries.push((name.to_string(), meta.clone()));
+            }
         }
-        let dir_cache = dir_cache_from_snapshot(&snapshot);
         let small_files = snapshot
             .entries
             .iter()
-            .filter_map(|(path, meta)| {
-                if meta.kind == EntryKind::File && meta.size <= PREFETCH_MAX_FILE_BYTES {
-                    Some(path.clone())
-                } else {
-                    None
-                }
+            .filter(|(_, meta)| {
+                meta.kind == EntryKind::File && meta.size <= PREFETCH_MAX_FILE_BYTES
             })
+            .map(|(path, _)| path.clone())
             .collect::<Vec<_>>();
         let prefetched = client
             .read_small_files(
@@ -204,41 +804,63 @@ impl MobfsFuse {
                 PREFETCH_MAX_FILE_BYTES,
                 PREFETCH_MAX_TOTAL_BYTES,
             )
-            .unwrap_or_default()
-            .into_iter()
-            .collect::<BTreeMap<_, _>>();
-        Ok(Self {
-            ignore,
-            client: Mutex::new(client),
-            snapshot: Mutex::new(snapshot),
-            path_to_ino: Mutex::new(path_to_ino),
-            ino_to_path: Mutex::new(ino_to_path),
-            read_cache: Mutex::new(BTreeMap::new()),
-            file_cache: Mutex::new(prefetched),
-            dir_cache: Mutex::new(dir_cache),
-            handle_to_path: Mutex::new(BTreeMap::new()),
+            .unwrap_or_default();
+        let blocks = BlockCache::new(options.cache_mib.saturating_mul(1024 * 1024));
+        for (path, data) in prefetched {
+            blocks.insert(&path, 0, Arc::new(data), 0);
+        }
+        let pool = ClientPool::new(
+            config.clone(),
+            client_id,
+            endpoint.clone(),
+            options.connections,
+            Some(client),
+        );
+        let prefetch_pool = ClientPool::new(
+            config,
+            client_id,
+            endpoint,
+            options.prefetch_connections,
+            None,
+        );
+        let shared = Arc::new(Shared {
+            pool,
+            prefetch_pool,
+            inodes: Mutex::new(Inodes::new()),
+            metas: Mutex::new(snapshot.entries),
+            dirs: Mutex::new(dirs),
+            blocks,
+            next_fh: AtomicU64::new(1),
+            dir_handles: Mutex::new(HashMap::new()),
             write_buffers: Mutex::new(BTreeMap::new()),
+            read_ahead: Mutex::new(HashMap::new()),
+            prefetch_queued: Mutex::new(HashSet::new()),
+            versions: Mutex::new(HashMap::new()),
+            xattrs: Mutex::new(HashMap::new()),
+            statfs: Mutex::new(None),
+            feed_live: AtomicBool::new(false),
+            notifier: Mutex::new(None),
+            stop: AtomicBool::new(false),
             journal,
+            root_meta: EntryMeta {
+                kind: EntryKind::Dir,
+                size: 0,
+                modified: unix_now_secs(),
+                sha256: None,
+                mode: 0o755,
+                link_target: None,
+            },
             ttl,
-        })
-    }
-
-    fn invalidate_path_cache(&self, path: &str) {
-        self.read_cache
-            .lock()
-            .unwrap()
-            .retain(|(cached, _, _), _| cached != path && !cached.starts_with(&format!("{path}/")));
-        self.file_cache
-            .lock()
-            .unwrap()
-            .retain(|cached, _| cached != path && !cached.starts_with(&format!("{path}/")));
-        self.dir_cache.lock().unwrap().retain(|cached, _| {
-            cached != path
-                && !path.starts_with(&format!("{cached}/"))
-                && !cached.starts_with(&format!("{path}/"))
+            ignore,
+            readahead_blocks: options.readahead_mib,
+            workers: WorkerPool::new("mobfs-io", FOREGROUND_WORKERS),
+            prefetchers: WorkerPool::new("mobfs-prefetch", options.prefetch_connections.max(1)),
         });
+        Ok((Self { shared }, feed))
     }
+}
 
+impl Shared {
     fn record(&self, op: &JournalOp) -> std::result::Result<(), Errno> {
         append_journal(&self.journal, op).map_err(|_| Errno::EIO)
     }
@@ -247,268 +869,196 @@ impl MobfsFuse {
         clear_journal(&self.journal).map_err(|_| Errno::EIO)
     }
 
-    fn flush_write_buffer(&self, fh: u64) -> std::result::Result<(), Errno> {
-        let pending = self.write_buffers.lock().unwrap().remove(&fh);
-        if let Some(pending) = pending {
-            self.record(&JournalOp::WriteAt {
-                path: pending.path.clone(),
-                offset: pending.offset,
-                data: pending.data.clone(),
-            })?;
-            let write_result = self.client.lock().unwrap().write_file_at(
-                &pending.path,
-                pending.offset,
-                pending.data.clone(),
-            );
-            if write_result.is_err() {
-                self.recover_journal()?;
-            }
-            self.invalidate_path_cache(&pending.path);
-            self.update_file_write(&pending.path, pending.offset, pending.data.len());
-            self.clear_record()?;
-        }
-        Ok(())
-    }
-
     fn recover_journal(&self) -> std::result::Result<(), Errno> {
-        let mut last_failed = false;
         for attempt in 0..crate::config::DEFAULT_OP_RETRIES {
             if attempt > 0 {
                 std::thread::sleep(Duration::from_millis(100 * u64::from(attempt).min(20)));
             }
-            let result = {
-                let mut client = self.client.lock().unwrap();
-                client
-                    .reconnect()
-                    .and_then(|_| replay_journal(&self.journal, &mut client))
-            };
-            match result {
-                Ok(()) => return Ok(()),
-                Err(_) => last_failed = true,
+            let result = self.pool.with(|client| {
+                client.reconnect()?;
+                replay_journal(&self.journal, client)
+            });
+            if result.is_ok() {
+                return Ok(());
             }
         }
-        if last_failed { Err(Errno::EIO) } else { Ok(()) }
+        Err(Errno::EIO)
     }
 
-    fn update_entry(&self, path: &str, meta: EntryMeta) {
-        let ino = inode_for(path);
-        self.snapshot
-            .lock()
-            .unwrap()
-            .entries
-            .insert(path.to_string(), meta);
-        self.path_to_ino
-            .lock()
-            .unwrap()
-            .insert(path.to_string(), ino);
-        self.ino_to_path
-            .lock()
-            .unwrap()
-            .insert(ino, path.to_string());
+    fn mutate(
+        &self,
+        op: JournalOp,
+        action: impl Fn(&mut RemoteClient) -> Result<()>,
+    ) -> std::result::Result<(), Errno> {
+        self.record(&op)?;
+        match self.pool.with(action) {
+            Ok(()) => {}
+            Err(crate::error::MobfsError::Server(message)) => {
+                self.clear_record()?;
+                return Err(errno_for_server_error(&message));
+            }
+            Err(_) => self.recover_journal()?,
+        }
+        self.clear_record()
     }
 
-    fn fresh_meta(&self, path: &str) -> Option<EntryMeta> {
-        self.snapshot.lock().unwrap().entries.get(path).cloned()
+    fn path(&self, ino: INodeNo) -> Option<String> {
+        lock(&self.inodes).path(u64::from(ino))
     }
 
-    fn ignored_rel(&self, path: &str) -> bool {
+    fn ino(&self, path: &str) -> u64 {
+        lock(&self.inodes).ino(path)
+    }
+
+    fn meta(&self, path: &str) -> Option<EntryMeta> {
+        lock(&self.metas).get(path).cloned()
+    }
+
+    fn set_meta(&self, path: &str, meta: EntryMeta) {
+        lock(&self.metas).insert(path.to_string(), meta);
+    }
+
+    fn ignored(&self, path: &str) -> bool {
         path.split('/')
             .any(|part| crate::local::should_ignore_part(part, &self.ignore))
     }
 
-    fn update_file_write(&self, path: &str, offset: u64, len: usize) {
-        let mut snapshot = self.snapshot.lock().unwrap();
-        let entry = snapshot
-            .entries
-            .entry(path.to_string())
-            .or_insert_with(|| EntryMeta {
-                kind: EntryKind::File,
-                size: 0,
-                modified: unix_now_secs(),
-                sha256: None,
-                mode: 0o644,
-                link_target: None,
-            });
-        entry.kind = EntryKind::File;
-        entry.size = entry.size.max(offset.saturating_add(len as u64));
-        entry.modified = unix_now_secs();
-        entry.sha256 = None;
-        drop(snapshot);
-        let ino = inode_for(path);
-        self.path_to_ino
-            .lock()
-            .unwrap()
-            .insert(path.to_string(), ino);
-        self.ino_to_path
-            .lock()
-            .unwrap()
-            .insert(ino, path.to_string());
-    }
-
-    fn update_dir_entry(&self, path: &str, mode: u32) {
-        self.update_entry(
-            path,
-            EntryMeta {
-                kind: EntryKind::Dir,
-                size: 0,
-                modified: 0,
-                sha256: None,
-                mode,
-                link_target: None,
-            },
-        );
-    }
-
-    fn update_symlink_entry(&self, path: &str, target: &str) {
-        self.update_entry(
-            path,
-            EntryMeta {
-                kind: EntryKind::Symlink,
-                size: target.len() as u64,
-                modified: unix_now_secs(),
-                sha256: None,
-                mode: 0o777,
-                link_target: Some(target.to_string()),
-            },
-        );
-    }
-
-    fn update_file_size(&self, path: &str, size: u64) {
-        let mut snapshot = self.snapshot.lock().unwrap();
-        let entry = snapshot
-            .entries
-            .entry(path.to_string())
-            .or_insert_with(|| EntryMeta {
-                kind: EntryKind::File,
-                size,
-                modified: unix_now_secs(),
-                sha256: None,
-                mode: 0o644,
-                link_target: None,
-            });
-        entry.kind = EntryKind::File;
-        entry.size = size;
-        entry.modified = unix_now_secs();
-        entry.sha256 = None;
-        drop(snapshot);
-        let ino = inode_for(path);
-        self.path_to_ino
-            .lock()
-            .unwrap()
-            .insert(path.to_string(), ino);
-        self.ino_to_path
-            .lock()
-            .unwrap()
-            .insert(ino, path.to_string());
-    }
-
-    fn apply_metadata_update(&self, path: &str, mode: Option<u32>, modified: Option<i64>) {
-        if let Some(entry) = self.snapshot.lock().unwrap().entries.get_mut(path) {
-            if let Some(mode) = mode {
-                entry.mode = mode;
-            }
-            if let Some(modified) = modified {
-                entry.modified = modified;
-            }
-        }
-    }
-
-    fn cached_dir_entries(&self, dir: &str) -> Option<DirEntries> {
-        let cache = self.dir_cache.lock().unwrap();
-        let (created, entries) = cache.get(dir)?;
-        if self.ttl.is_zero() || created.elapsed() <= self.ttl {
+    fn dir_listing(&self, dir: &str) -> Option<DirEntries> {
+        let dirs = lock(&self.dirs);
+        let (created, entries) = dirs.get(dir)?;
+        if self.ttl.is_zero()
+            || self.feed_live.load(Ordering::SeqCst)
+            || created.elapsed() <= self.ttl
+        {
             Some(entries.clone())
         } else {
             None
         }
     }
 
-    fn cache_dir_entries(&self, dir: &str, entries: &[(String, EntryMeta)]) {
-        self.dir_cache
-            .lock()
-            .unwrap()
-            .insert(dir.to_string(), (Instant::now(), entries.to_vec()));
+    fn known_absent(&self, dir: &str, name: &str) -> bool {
+        self.dir_listing(dir)
+            .is_some_and(|entries| !entries.iter().any(|(entry, _)| entry == name))
     }
 
-    fn remove_entry(&self, path: &str) {
-        self.snapshot.lock().unwrap().entries.remove(path);
-        if let Some(ino) = self.path_to_ino.lock().unwrap().remove(path) {
-            self.ino_to_path.lock().unwrap().remove(&ino);
+    fn dir_upsert(&self, path: &str, meta: &EntryMeta) {
+        let (parent, name) = split_parent(path);
+        if let Some((_, entries)) = lock(&self.dirs).get_mut(parent) {
+            entries.retain(|(entry, _)| entry != name);
+            entries.push((name.to_string(), meta.clone()));
         }
     }
 
-    fn remove_tree_entries(&self, path: &str) {
+    fn dir_remove(&self, path: &str) {
+        let (parent, name) = split_parent(path);
+        let mut dirs = lock(&self.dirs);
+        if let Some((_, entries)) = dirs.get_mut(parent) {
+            entries.retain(|(entry, _)| entry != name);
+        }
+        for key in subtree_keys(&dirs, path) {
+            dirs.remove(&key);
+        }
+    }
+
+    fn has_pending_write(&self, path: &str) -> bool {
+        lock(&self.write_buffers)
+            .values()
+            .any(|pending| pending.path == path || pending.path.starts_with(&format!("{path}/")))
+    }
+
+    fn flush_fh(&self, fh: u64) -> std::result::Result<(), Errno> {
+        let pending = lock(&self.write_buffers).remove(&fh);
+        let Some(pending) = pending else {
+            return Ok(());
+        };
+        let path = lock(&self.inodes).path(pending.ino).unwrap_or(pending.path);
+        let len = pending.data.len() as u64;
+        let blob = write_blob(&self.journal, &pending.data).map_err(|_| Errno::EIO)?;
+        self.record(&JournalOp::WriteBlob {
+            path: path.clone(),
+            offset: pending.offset,
+            blob,
+        })?;
+        let data = pending.data;
+        let result = self
+            .pool
+            .with(|client| client.write_file_at(&path, pending.offset, data.clone()));
+        self.blocks.invalidate_range(&path, pending.offset, len);
+        match result {
+            Ok(()) => {}
+            Err(crate::error::MobfsError::Server(message)) => {
+                self.clear_record()?;
+                return Err(errno_for_server_error(&message));
+            }
+            Err(_) => self.recover_journal()?,
+        }
+        self.clear_record()
+    }
+
+    fn flush_matching(&self, path: &str) -> std::result::Result<(), Errno> {
         let prefix = format!("{path}/");
-        let paths = self
-            .snapshot
-            .lock()
-            .unwrap()
-            .entries
-            .keys()
-            .filter(|entry| *entry == path || entry.starts_with(&prefix))
-            .cloned()
-            .collect::<Vec<_>>();
-        for path in paths {
-            self.remove_entry(&path);
-        }
-    }
-
-    fn rename_tree_entries(&self, from: &str, to: &str) {
-        let prefix = format!("{from}/");
-        let entries = self
-            .snapshot
-            .lock()
-            .unwrap()
-            .entries
+        let fhs = lock(&self.write_buffers)
             .iter()
-            .filter(|(path, _)| *path == from || path.starts_with(&prefix))
-            .map(|(path, meta)| (path.clone(), meta.clone()))
+            .filter(|(_, pending)| pending.path == path || pending.path.starts_with(&prefix))
+            .map(|(fh, _)| *fh)
             .collect::<Vec<_>>();
-        for (old_path, meta) in entries {
-            let suffix = old_path.strip_prefix(from).unwrap_or("");
-            self.remove_entry(&old_path);
-            self.update_entry(&format!("{to}{suffix}"), meta);
+        for fh in fhs {
+            self.flush_fh(fh)?;
+        }
+        Ok(())
+    }
+
+    fn flush_all_buffers(&self) {
+        let fhs = lock(&self.write_buffers)
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        for fh in fhs {
+            let _ = self.flush_fh(fh);
         }
     }
 
-    fn path_for(&self, ino: INodeNo) -> Option<String> {
-        self.ino_to_path
-            .lock()
-            .unwrap()
-            .get(&u64::from(ino))
-            .cloned()
+    fn note_local_write(&self, path: &str, offset: u64, len: u64) {
+        let mut metas = lock(&self.metas);
+        let entry = metas
+            .entry(path.to_string())
+            .or_insert_with(|| file_meta(0, 0o644));
+        entry.kind = EntryKind::File;
+        entry.size = entry.size.max(offset.saturating_add(len));
+        entry.modified = unix_now_secs();
+        entry.sha256 = None;
     }
 
-    fn path_for_handle(&self, ino: INodeNo, fh: fuser::FileHandle) -> Option<String> {
-        self.path_for(ino).or_else(|| {
-            self.handle_to_path
-                .lock()
-                .unwrap()
-                .get(&u64::from(fh))
-                .cloned()
-        })
+    fn stat_remote(&self, path: &str) -> Result<Option<EntryMeta>> {
+        let meta = self.pool.with(|client| client.stat(path))?;
+        match &meta {
+            Some(meta) if !self.has_pending_write(path) => self.set_meta(path, meta.clone()),
+            Some(_) => {}
+            None => {
+                lock(&self.metas).remove(path);
+            }
+        }
+        Ok(meta)
     }
 
-    fn attr_for(&self, path: &str, meta: Option<&EntryMeta>) -> FileAttr {
-        let kind = meta.map(|m| &m.kind).unwrap_or(&EntryKind::Dir);
-        let size = meta.map(|m| m.size).unwrap_or(0);
-        let modified = meta.map(|m| m.modified).unwrap_or(0).max(0) as u64;
+    fn attr(&self, ino: u64, meta: Option<&EntryMeta>) -> FileAttr {
+        let meta = meta.or(Some(&self.root_meta));
+        let kind = meta.map(|meta| &meta.kind).unwrap_or(&EntryKind::Dir);
+        let size = meta.map(|meta| meta.size).unwrap_or(0);
+        let modified = meta.map(|meta| meta.modified).unwrap_or(0).max(0) as u64;
         let time = UNIX_EPOCH + Duration::from_secs(modified);
+        let mode = meta.map(|meta| meta.mode & 0o7777).unwrap_or(0);
         FileAttr {
-            ino: INodeNo(inode_for(path)),
+            ino: INodeNo(ino),
             size,
             blocks: size.div_ceil(512),
             atime: time,
             mtime: time,
             ctime: time,
             crtime: time,
-            kind: match kind {
-                EntryKind::File => FileType::RegularFile,
-                EntryKind::Dir => FileType::Directory,
-                EntryKind::Symlink => FileType::Symlink,
-            },
-            perm: if meta.map(|m| m.mode).unwrap_or(0) != 0 {
-                meta.map(|m| m.mode as u16).unwrap_or(0o755)
+            kind: file_type(kind),
+            perm: if mode != 0 {
+                mode as u16
             } else {
                 match kind {
                     EntryKind::File => 0o644,
@@ -516,60 +1066,308 @@ impl MobfsFuse {
                     EntryKind::Symlink => 0o777,
                 }
             },
-            nlink: 1,
+            nlink: if *kind == EntryKind::Dir { 2 } else { 1 },
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
             rdev: 0,
             flags: 0,
-            blksize: 512,
+            blksize: BLOCK_SIZE as u32,
+        }
+    }
+
+    fn bump_version(&self, ino: u64) {
+        lock(&self.versions).entry(ino).or_insert((0, 0)).0 += 1;
+    }
+
+    fn open_flags(&self, ino: u64) -> FopenFlags {
+        let mut versions = lock(&self.versions);
+        let entry = versions.entry(ino).or_insert((0, u64::MAX));
+        let keep = entry.0 == entry.1;
+        entry.1 = entry.0;
+        if keep {
+            FopenFlags::FOPEN_KEEP_CACHE
+        } else {
+            FopenFlags::empty()
+        }
+    }
+
+    fn fs_stats(&self) -> FsStats {
+        if let Some((fetched, stats)) = lock(&self.statfs).as_ref()
+            && fetched.elapsed() < STATFS_TTL
+        {
+            return stats.clone();
+        }
+        match self.pool.with(|client| client.statfs()) {
+            Ok(stats) => {
+                *lock(&self.statfs) = Some((Instant::now(), stats.clone()));
+                stats
+            }
+            Err(_) => lock(&self.statfs)
+                .as_ref()
+                .map(|(_, stats)| stats.clone())
+                .unwrap_or(FsStats {
+                    total_bytes: 1 << 50,
+                    free_bytes: 1 << 50,
+                    avail_bytes: 1 << 50,
+                    files: 1 << 32,
+                    free_files: 1 << 32,
+                }),
+        }
+    }
+
+    fn do_read(self: &Arc<Self>, ino: u64, path: String, offset: u64, size: u32, reply: ReplyData) {
+        let file_size = self.meta(&path).map(|meta| meta.size);
+        if file_size.is_some_and(|len| offset >= len) {
+            reply.data(&[]);
+            return;
+        }
+        self.schedule_readahead(ino, &path, offset, u64::from(size), file_size);
+        let end = offset.saturating_add(u64::from(size));
+        let mut out = Vec::with_capacity(size as usize);
+        for index in offset / BLOCK_SIZE..=end.saturating_sub(1) / BLOCK_SIZE {
+            let block = match self.blocks.fetch(&path, index, &self.pool) {
+                Ok(block) => block,
+                Err(error) if out.is_empty() => {
+                    reply.error(match error {
+                        crate::error::MobfsError::Server(message) => {
+                            errno_for_server_error(&message)
+                        }
+                        _ => Errno::EIO,
+                    });
+                    return;
+                }
+                Err(_) => break,
+            };
+            let start = index * BLOCK_SIZE;
+            let from = (offset.max(start) - start) as usize;
+            let to = ((end.min(start + BLOCK_SIZE) - start) as usize).min(block.len());
+            if from < to {
+                out.extend_from_slice(&block[from..to]);
+            }
+            if (block.len() as u64) < BLOCK_SIZE {
+                break;
+            }
+        }
+        reply.data(&out);
+    }
+
+    fn schedule_readahead(
+        self: &Arc<Self>,
+        ino: u64,
+        path: &str,
+        offset: u64,
+        size: u64,
+        file_size: Option<u64>,
+    ) {
+        if self.readahead_blocks == 0 {
+            return;
+        }
+        let (window, epoch) = {
+            let mut states = lock(&self.read_ahead);
+            let state = states.entry(ino).or_insert(ReadAhead {
+                next_offset: 0,
+                window: 0,
+                epoch: 0,
+            });
+            if offset.abs_diff(state.next_offset) <= 2 * BLOCK_SIZE {
+                state.window = (state.window * 2).clamp(2, self.readahead_blocks);
+            } else {
+                state.epoch += 1;
+                state.window = 1;
+            }
+            state.next_offset = offset.saturating_add(size);
+            (state.window, state.epoch)
+        };
+        let current = offset.saturating_add(size.saturating_sub(1)) / BLOCK_SIZE;
+        let last = file_size.map(|len| len.saturating_sub(1) / BLOCK_SIZE);
+        for index in current + 1..=current + window {
+            if last.is_some_and(|last| index > last) {
+                break;
+            }
+            let key = (path.to_string(), index);
+            if self.blocks.contains(path, index) || !lock(&self.prefetch_queued).insert(key.clone())
+            {
+                continue;
+            }
+            let shared = self.clone();
+            self.prefetchers.run(move || {
+                let current_epoch = lock(&shared.read_ahead).get(&ino).map(|state| state.epoch);
+                if current_epoch == Some(epoch) && !shared.stop.load(Ordering::SeqCst) {
+                    let _ = shared.blocks.fetch(&key.0, key.1, &shared.prefetch_pool);
+                }
+                lock(&shared.prefetch_queued).remove(&key);
+            });
+        }
+    }
+
+    fn apply_change(&self, event: &ChangeEvent) {
+        let path = event.path.as_str();
+        if path.is_empty() || self.ignored(path) || self.has_pending_write(path) {
+            return;
+        }
+        let (parent, name) = split_parent(path);
+        let (ino, parent_ino) = {
+            let inodes = lock(&self.inodes);
+            (inodes.get(path), inodes.get(parent))
+        };
+        let mut inval_inode = None;
+        let mut inval_entry = false;
+        match &event.kind {
+            ChangeKind::Write { offset, len } => {
+                self.blocks.invalidate_range(path, *offset, *len);
+                lock(&self.metas).remove(path);
+                if let Some(ino) = ino {
+                    self.bump_version(ino);
+                    inval_inode = Some((ino, *offset as i64, *len as i64));
+                }
+            }
+            ChangeKind::Metadata => {
+                lock(&self.metas).remove(path);
+                inval_inode = ino.map(|ino| (ino, -1, 0));
+            }
+            ChangeKind::Replaced => {
+                {
+                    let mut metas = lock(&self.metas);
+                    for key in subtree_keys(&metas, path) {
+                        metas.remove(&key);
+                    }
+                }
+                {
+                    let mut dirs = lock(&self.dirs);
+                    for key in subtree_keys(&dirs, path) {
+                        dirs.remove(&key);
+                    }
+                }
+                self.blocks.invalidate_tree(path);
+                let inos = {
+                    let inodes = lock(&self.inodes);
+                    subtree_keys(&inodes.by_path, path)
+                        .iter()
+                        .filter_map(|key| inodes.get(key))
+                        .collect::<Vec<_>>()
+                };
+                for ino in inos {
+                    self.bump_version(ino);
+                }
+                inval_inode = ino.map(|ino| (ino, 0, 0));
+                inval_entry = true;
+            }
+        }
+        lock(&self.dirs).remove(parent);
+        if let Some(notifier) = lock(&self.notifier).clone() {
+            if let Some((ino, offset, len)) = inval_inode {
+                let _ = notifier.inval_inode(INodeNo(ino), offset, len);
+            }
+            if inval_entry && let Some(parent_ino) = parent_ino {
+                let _ = notifier.inval_entry(INodeNo(parent_ino), OsStr::new(name));
+            }
+        }
+    }
+
+    fn invalidate_all(&self) {
+        {
+            let pending = lock(&self.write_buffers)
+                .values()
+                .map(|pending| pending.path.clone())
+                .collect::<HashSet<_>>();
+            lock(&self.metas).retain(|path, _| pending.contains(path));
+        }
+        lock(&self.dirs).clear();
+        self.blocks.clear();
+        let inos = lock(&self.inodes)
+            .by_ino
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        for ino in inos {
+            self.bump_version(ino);
+        }
+    }
+}
+
+fn run_change_feed(shared: Arc<Shared>, mut client: RemoteClient, mut epoch: u64, mut cursor: u64) {
+    let mut failures = 0_u32;
+    while !shared.stop.load(Ordering::SeqCst) {
+        match client.watch_changes(epoch, Some(cursor), FEED_POLL) {
+            Ok(batch) => {
+                failures = 0;
+                if batch.reset {
+                    shared.invalidate_all();
+                } else {
+                    for event in &batch.events {
+                        shared.apply_change(event);
+                    }
+                }
+                shared.feed_live.store(batch.live, Ordering::SeqCst);
+                epoch = batch.epoch;
+                cursor = batch.cursor;
+            }
+            Err(_) => {
+                shared.feed_live.store(false, Ordering::SeqCst);
+                failures = failures.saturating_add(1);
+                std::thread::sleep(Duration::from_millis(250 * u64::from(failures.min(20))));
+                let _ = client.reconnect();
+            }
         }
     }
 }
 
 impl Filesystem for MobfsFuse {
+    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
+        let _ = config.set_max_readahead(BLOCK_SIZE as u32);
+        let _ = config.set_max_write(BLOCK_SIZE as u32);
+        let _ = config.set_max_background(64);
+        Ok(())
+    }
+
+    fn destroy(&mut self) {
+        self.shared.flush_all_buffers();
+        self.shared.stop.store(true, Ordering::SeqCst);
+    }
+
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        let parent_path = match self.path_for(parent) {
-            Some(path) => path,
-            None => {
-                reply.error(Errno::ENOENT);
-                return;
-            }
+        let Some(parent_path) = self.shared.path(parent) else {
+            reply.error(Errno::ENOENT);
+            return;
         };
-        let name = match name.to_str() {
-            Some(name) => name,
-            None => {
-                reply.error(Errno::EINVAL);
-                return;
-            }
+        let Some(name) = name.to_str() else {
+            reply.error(Errno::EINVAL);
+            return;
         };
         let path = join_rel(&parent_path, name);
-        if self.ignored_rel(&path) {
+        if self.shared.ignored(&path) {
             reply.error(Errno::ENOENT);
             return;
         }
-        if let Some(meta) = self.fresh_meta(&path) {
+        let shared = &self.shared;
+        if let Some(meta) = shared.meta(&path) {
+            let ino = shared.ino(&path);
             reply.entry(
-                &self.ttl,
-                &self.attr_for(&path, Some(&meta)),
+                &shared.ttl,
+                &shared.attr(ino, Some(&meta)),
                 fuser::Generation(0),
             );
             return;
         }
-        match self.client.lock().unwrap().stat(&path) {
-            Ok(Some(meta)) => {
-                self.update_entry(&path, meta.clone());
-                reply.entry(
-                    &self.ttl,
-                    &self.attr_for(&path, Some(&meta)),
-                    fuser::Generation(0),
-                );
-            }
-            Ok(None) => {
-                self.remove_entry(&path);
-                reply.error(Errno::ENOENT);
-            }
-            Err(_) => reply.error(Errno::EIO),
+        if shared.known_absent(&parent_path, name) {
+            reply.error(Errno::ENOENT);
+            return;
         }
+        let shared = self.shared.clone();
+        self.shared
+            .workers
+            .run(move || match shared.stat_remote(&path) {
+                Ok(Some(meta)) => {
+                    let ino = shared.ino(&path);
+                    reply.entry(
+                        &shared.ttl,
+                        &shared.attr(ino, Some(&meta)),
+                        fuser::Generation(0),
+                    );
+                }
+                Ok(None) => reply.error(Errno::ENOENT),
+                Err(_) => reply.error(Errno::EIO),
+            });
     }
 
     fn getattr(
@@ -579,122 +1377,149 @@ impl Filesystem for MobfsFuse {
         _fh: Option<fuser::FileHandle>,
         reply: ReplyAttr,
     ) {
-        if u64::from(ino) == 1 {
-            reply.attr(&self.ttl, &self.attr_for("", None));
+        let shared = &self.shared;
+        let Some(path) = shared.path(ino) else {
+            reply.error(Errno::ENOENT);
             return;
-        }
-        let path = match self.path_for(ino) {
-            Some(path) => path,
-            None => {
-                reply.error(Errno::ENOENT);
-                return;
-            }
         };
-        if let Some(meta) = self.fresh_meta(&path) {
-            reply.attr(&self.ttl, &self.attr_for(&path, Some(&meta)));
+        if path.is_empty() {
+            reply.attr(&shared.ttl, &shared.attr(1, None));
             return;
         }
-        match self.client.lock().unwrap().stat(&path) {
-            Ok(Some(meta)) => {
-                self.update_entry(&path, meta.clone());
-                reply.attr(&self.ttl, &self.attr_for(&path, Some(&meta)));
-            }
-            Ok(None) => {
-                self.remove_entry(&path);
-                reply.error(Errno::ENOENT);
-            }
-            Err(_) => reply.error(Errno::EIO),
+        if let Some(meta) = shared.meta(&path) {
+            reply.attr(&shared.ttl, &shared.attr(u64::from(ino), Some(&meta)));
+            return;
         }
+        let shared = self.shared.clone();
+        self.shared
+            .workers
+            .run(move || match shared.stat_remote(&path) {
+                Ok(Some(meta)) => {
+                    reply.attr(&shared.ttl, &shared.attr(u64::from(ino), Some(&meta)))
+                }
+                Ok(None) => reply.error(Errno::ENOENT),
+                Err(_) => reply.error(Errno::EIO),
+            });
+    }
+
+    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: fuser::OpenFlags, reply: ReplyOpen) {
+        if self.shared.path(ino).is_none() {
+            reply.error(Errno::ENOENT);
+            return;
+        }
+        let fh = self.shared.next_fh.fetch_add(1, Ordering::SeqCst);
+        reply.opened(fuser::FileHandle(fh), FopenFlags::empty());
+    }
+
+    fn releasedir(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: fuser::FileHandle,
+        _flags: fuser::OpenFlags,
+        reply: ReplyEmpty,
+    ) {
+        lock(&self.shared.dir_handles).remove(&u64::from(fh));
+        reply.ok();
     }
 
     fn readdir(
         &self,
         _req: &Request,
         ino: INodeNo,
-        _fh: fuser::FileHandle,
+        fh: fuser::FileHandle,
         offset: u64,
-        mut reply: ReplyDirectory,
+        reply: ReplyDirectory,
     ) {
-        let dir = match self.path_for(ino) {
-            Some(path) => path,
-            None => {
-                reply.error(Errno::ENOENT);
-                return;
-            }
+        let fh = u64::from(fh);
+        if offset > 0
+            && let Some(listing) = lock(&self.shared.dir_handles).get(&fh).cloned()
+        {
+            send_listing(&listing, offset, reply);
+            return;
+        }
+        let Some(dir) = self.shared.path(ino) else {
+            reply.error(Errno::ENOENT);
+            return;
         };
-        let remote_entries = match self.cached_dir_entries(&dir) {
-            Some(entries) => entries,
-            None => match self.client.lock().unwrap().list_dir(&dir) {
-                Ok(entries) => {
-                    self.cache_dir_entries(&dir, &entries);
-                    entries
+        let parent_ino = self.shared.ino(split_parent(&dir).0);
+        let build = move |shared: &Shared, entries: DirEntries, fresh: bool| -> DirListing {
+            let mut listing = vec![
+                (u64::from(ino), FileType::Directory, ".".to_string()),
+                (parent_ino, FileType::Directory, "..".to_string()),
+            ];
+            for (name, meta) in entries {
+                let path = join_rel(&dir, &name);
+                if fresh && !shared.has_pending_write(&path) {
+                    shared.set_meta(&path, meta.clone());
                 }
+                listing.push((shared.ino(&path), file_type(&meta.kind), name));
+            }
+            Arc::new(listing)
+        };
+        let dir = self.shared.path(ino).unwrap_or_default();
+        if let Some(entries) = self.shared.dir_listing(&dir) {
+            let listing = build(&self.shared, entries, false);
+            lock(&self.shared.dir_handles).insert(fh, listing.clone());
+            send_listing(&listing, offset, reply);
+            return;
+        }
+        let shared = self.shared.clone();
+        self.shared.workers.run(
+            move || match shared.pool.with(|client| client.list_dir(&dir)) {
+                Ok(entries) => {
+                    lock(&shared.dirs).insert(dir.clone(), (Instant::now(), entries.clone()));
+                    let listing = build(&shared, entries, true);
+                    lock(&shared.dir_handles).insert(fh, listing.clone());
+                    send_listing(&listing, offset, reply);
+                }
+                Err(_) => reply.error(Errno::EIO),
+            },
+        );
+    }
+
+    fn open(&self, _req: &Request, ino: INodeNo, _flags: fuser::OpenFlags, reply: ReplyOpen) {
+        if self.shared.path(ino).is_none() {
+            reply.error(Errno::ENOENT);
+            return;
+        }
+        let fh = self.shared.next_fh.fetch_add(1, Ordering::SeqCst);
+        let flags = self.shared.open_flags(u64::from(ino));
+        reply.opened(fuser::FileHandle(fh), flags);
+    }
+
+    fn release(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: fuser::FileHandle,
+        _flags: fuser::OpenFlags,
+        _lock_owner: Option<fuser::LockOwner>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        match self.shared.flush_fh(u64::from(fh)) {
+            Ok(()) => reply.ok(),
+            Err(errno) => reply.error(errno),
+        }
+    }
+
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        let Some(path) = self.shared.path(ino).filter(|path| !path.is_empty()) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let meta = match self.shared.meta(&path) {
+            Some(meta) => Some(meta),
+            None => match self.shared.stat_remote(&path) {
+                Ok(meta) => meta,
                 Err(_) => {
                     reply.error(Errno::EIO);
                     return;
                 }
             },
         };
-        let mut entries = vec![(u64::from(ino), FileType::Directory, ".".to_string())];
-        entries.push((1, FileType::Directory, "..".to_string()));
-        for (name, meta) in remote_entries {
-            let path = join_rel(&dir, &name);
-            let kind = match meta.kind {
-                EntryKind::File => FileType::RegularFile,
-                EntryKind::Dir => FileType::Directory,
-                EntryKind::Symlink => FileType::Symlink,
-            };
-            self.update_entry(&path, meta);
-            entries.push((inode_for(&path), kind, name));
-        }
-        for (i, (ino, kind, name)) in entries.into_iter().enumerate().skip(offset as usize) {
-            if reply.add(INodeNo(ino), (i + 1) as u64, kind, name) {
-                break;
-            }
-        }
-        reply.ok();
-    }
-
-    fn open(&self, _req: &Request, ino: INodeNo, _flags: fuser::OpenFlags, reply: ReplyOpen) {
-        if let Some(path) = self.path_for(ino) {
-            self.handle_to_path
-                .lock()
-                .unwrap()
-                .insert(u64::from(ino), path);
-            reply.opened(fuser::FileHandle(u64::from(ino)), FopenFlags::empty());
-        } else {
-            reply.error(Errno::ENOENT);
-        }
-    }
-
-    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
-        let path = match self.path_for(ino) {
-            Some(path) if !path.is_empty() => path,
-            _ => {
-                reply.error(Errno::ENOENT);
-                return;
-            }
-        };
-        if self.fresh_meta(&path).is_none() {
-            match self.client.lock().unwrap().stat(&path) {
-                Ok(Some(meta)) => self.update_entry(&path, meta),
-                Ok(None) => {
-                    self.remove_entry(&path);
-                    reply.error(Errno::ENOENT);
-                    return;
-                }
-                Err(_) => {
-                    reply.error(Errno::EIO);
-                    return;
-                }
-            }
-        }
-        let snapshot = self.snapshot.lock().unwrap();
-        match snapshot
-            .entries
-            .get(&path)
-            .and_then(|meta| meta.link_target.as_ref())
-        {
+        match meta.and_then(|meta| meta.link_target) {
             Some(target) => reply.data(target.as_bytes()),
             None => reply.error(Errno::EINVAL),
         }
@@ -711,57 +1536,18 @@ impl Filesystem for MobfsFuse {
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyData,
     ) {
-        let path = match self.path_for(ino) {
-            Some(path) if !path.is_empty() => path,
-            _ => {
-                reply.error(Errno::ENOENT);
-                return;
-            }
+        let Some(path) = self.shared.path(ino).filter(|path| !path.is_empty()) else {
+            reply.error(Errno::ENOENT);
+            return;
         };
-        let key = (path.clone(), offset, size);
-        if let Some(meta) = self.fresh_meta(&path)
-            && meta.kind == EntryKind::File
-            && meta.size <= 1024 * 1024
-        {
-            if let Some(data) = self.file_cache.lock().unwrap().get(&path).cloned() {
-                reply.data(slice_read(&data, offset, size));
-                return;
-            }
-            match self
-                .client
-                .lock()
-                .unwrap()
-                .read_file_chunk(&path, 0, meta.size)
-            {
-                Ok((data, _)) => {
-                    let chunk = slice_read(&data, offset, size).to_vec();
-                    self.file_cache.lock().unwrap().insert(path.clone(), data);
-                    reply.data(&chunk);
-                    return;
-                }
-                Err(_) => {
-                    if let Some(data) = self.read_cache.lock().unwrap().get(&key) {
-                        reply.data(data);
-                        return;
-                    }
-                }
-            }
+        if let Err(errno) = self.shared.flush_matching(&path) {
+            reply.error(errno);
+            return;
         }
-        match self
-            .client
-            .lock()
-            .unwrap()
-            .read_file_chunk(&path, offset, size as u64)
-        {
-            Ok((data, _)) => {
-                self.read_cache.lock().unwrap().insert(key, data.clone());
-                reply.data(&data);
-            }
-            Err(_) => match self.read_cache.lock().unwrap().get(&key) {
-                Some(data) => reply.data(data),
-                None => reply.error(Errno::EIO),
-            },
-        }
+        let shared = self.shared.clone();
+        self.shared
+            .workers
+            .run(move || shared.do_read(u64::from(ino), path, offset, size, reply));
     }
 
     fn write(
@@ -776,29 +1562,25 @@ impl Filesystem for MobfsFuse {
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyWrite,
     ) {
-        let path = match self.path_for_handle(ino, fh) {
-            Some(path) if !path.is_empty() => path,
-            _ => {
-                reply.error(Errno::ENOENT);
-                return;
-            }
+        let shared = &self.shared;
+        let Some(path) = shared.path(ino).filter(|path| !path.is_empty()) else {
+            reply.error(Errno::ENOENT);
+            return;
         };
-        if self.ignored_rel(&path) {
+        if shared.ignored(&path) {
             reply.error(Errno::EACCES);
             return;
         }
         let fh = u64::from(fh);
-        let data = data.to_vec();
-        let data_len = data.len();
         let flush_needed = {
-            let mut buffers = self.write_buffers.lock().unwrap();
+            let mut buffers = lock(&shared.write_buffers);
             match buffers.get_mut(&fh) {
                 Some(pending)
-                    if pending.path == path
+                    if pending.ino == u64::from(ino)
                         && pending.offset.saturating_add(pending.data.len() as u64) == offset
-                        && pending.data.len().saturating_add(data_len) <= WRITE_BUFFER_LIMIT =>
+                        && pending.data.len().saturating_add(data.len()) <= WRITE_BUFFER_LIMIT =>
                 {
-                    pending.data.extend_from_slice(&data);
+                    pending.data.extend_from_slice(data);
                     false
                 }
                 Some(_) => true,
@@ -806,9 +1588,10 @@ impl Filesystem for MobfsFuse {
                     buffers.insert(
                         fh,
                         PendingWrite {
+                            ino: u64::from(ino),
                             path: path.clone(),
                             offset,
-                            data: data.clone(),
+                            data: data.to_vec(),
                         },
                     );
                     false
@@ -816,37 +1599,38 @@ impl Filesystem for MobfsFuse {
             }
         };
         if flush_needed {
-            if self.flush_write_buffer(fh).is_err() {
-                reply.error(Errno::EIO);
+            if let Err(errno) = shared.flush_fh(fh) {
+                reply.error(errno);
                 return;
             }
-            self.write_buffers.lock().unwrap().insert(
+            lock(&shared.write_buffers).insert(
                 fh,
                 PendingWrite {
+                    ino: u64::from(ino),
                     path: path.clone(),
                     offset,
-                    data,
+                    data: data.to_vec(),
                 },
             );
         }
-        self.update_file_write(&path, offset, data_len);
-        reply.written(data_len as u32);
+        shared
+            .blocks
+            .invalidate_range(&path, offset, data.len() as u64);
+        shared.note_local_write(&path, offset, data.len() as u64);
+        reply.written(data.len() as u32);
     }
 
     fn flush(
         &self,
         _req: &Request,
-        ino: INodeNo,
+        _ino: INodeNo,
         fh: fuser::FileHandle,
         _lock_owner: fuser::LockOwner,
         reply: ReplyEmpty,
     ) {
-        match self.path_for_handle(ino, fh) {
-            Some(_) => match self.flush_write_buffer(u64::from(fh)) {
-                Ok(()) => reply.ok(),
-                Err(errno) => reply.error(errno),
-            },
-            None => reply.error(Errno::ENOENT),
+        match self.shared.flush_fh(u64::from(fh)) {
+            Ok(()) => reply.ok(),
+            Err(errno) => reply.error(errno),
         }
     }
 
@@ -858,55 +1642,125 @@ impl Filesystem for MobfsFuse {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        match self.path_for_handle(ino, fh) {
-            Some(path) => {
-                if let Err(errno) = self.flush_write_buffer(u64::from(fh)) {
-                    reply.error(errno);
-                    return;
-                }
-                match self.client.lock().unwrap().fsync(&path) {
-                    Ok(()) => reply.ok(),
-                    Err(_) => reply.error(Errno::EIO),
-                }
-            }
-            None => reply.error(Errno::ENOENT),
+        let Some(path) = self.shared.path(ino) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        if let Err(errno) = self.shared.flush_fh(u64::from(fh)) {
+            reply.error(errno);
+            return;
         }
+        match self.shared.pool.with(|client| client.fsync(&path)) {
+            Ok(()) => reply.ok(),
+            Err(_) => reply.error(Errno::EIO),
+        }
+    }
+
+    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
+        let shared = self.shared.clone();
+        self.shared.workers.run(move || {
+            let stats = shared.fs_stats();
+            reply.statfs(
+                stats.total_bytes / STATFS_BLOCK,
+                stats.free_bytes / STATFS_BLOCK,
+                stats.avail_bytes / STATFS_BLOCK,
+                stats.files,
+                stats.free_files,
+                STATFS_BLOCK as u32,
+                255,
+                STATFS_BLOCK as u32,
+            );
+        });
     }
 
     fn setxattr(
         &self,
         _req: &Request,
-        _ino: INodeNo,
-        _name: &OsStr,
-        _value: &[u8],
-        _flags: i32,
-        _position: u32,
+        ino: INodeNo,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+        position: u32,
         reply: ReplyEmpty,
     ) {
-        reply.error(Errno::ENOTSUP);
-    }
-
-    fn getxattr(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        _name: &OsStr,
-        _size: u32,
-        reply: ReplyXattr,
-    ) {
-        reply.error(Errno::ENOTSUP);
-    }
-
-    fn listxattr(&self, _req: &Request, _ino: INodeNo, size: u32, reply: ReplyXattr) {
-        if size == 0 {
-            reply.size(0);
+        let Some(path) = self.shared.path(ino) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let name = name.to_string_lossy().to_string();
+        let mut xattrs = lock(&self.shared.xattrs);
+        let attrs = xattrs.entry(path).or_default();
+        let exists = attrs.contains_key(&name);
+        if flags & libc::XATTR_CREATE != 0 && exists {
+            reply.error(Errno::EEXIST);
+            return;
+        }
+        if flags & libc::XATTR_REPLACE != 0 && !exists {
+            reply.error(Errno::NO_XATTR);
+            return;
+        }
+        let stored = attrs.entry(name).or_default();
+        let position = position as usize;
+        if position == 0 {
+            *stored = value.to_vec();
         } else {
-            reply.data(&[]);
+            if stored.len() < position + value.len() {
+                stored.resize(position + value.len(), 0);
+            }
+            stored[position..position + value.len()].copy_from_slice(value);
+        }
+        reply.ok();
+    }
+
+    fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
+        let Some(path) = self.shared.path(ino) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let value = lock(&self.shared.xattrs)
+            .get(&path)
+            .and_then(|attrs| attrs.get(name.to_string_lossy().as_ref()).cloned());
+        match value {
+            None => reply.error(Errno::NO_XATTR),
+            Some(value) if size == 0 => reply.size(value.len() as u32),
+            Some(value) if value.len() > size as usize => reply.error(Errno::ERANGE),
+            Some(value) => reply.data(&value),
         }
     }
 
-    fn removexattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
-        reply.error(Errno::ENOTSUP);
+    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        let Some(path) = self.shared.path(ino) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let mut names = Vec::new();
+        if let Some(attrs) = lock(&self.shared.xattrs).get(&path) {
+            for name in attrs.keys() {
+                names.extend_from_slice(name.as_bytes());
+                names.push(0);
+            }
+        }
+        if size == 0 {
+            reply.size(names.len() as u32);
+        } else if names.len() > size as usize {
+            reply.error(Errno::ERANGE);
+        } else {
+            reply.data(&names);
+        }
+    }
+
+    fn removexattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let Some(path) = self.shared.path(ino) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let removed = lock(&self.shared.xattrs)
+            .get_mut(&path)
+            .and_then(|attrs| attrs.remove(name.to_string_lossy().as_ref()));
+        match removed {
+            Some(_) => reply.ok(),
+            None => reply.error(Errno::NO_XATTR),
+        }
     }
 
     fn getlk(
@@ -958,81 +1812,65 @@ impl Filesystem for MobfsFuse {
         _flags: Option<fuser::BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        let path = match self.path_for(ino) {
-            Some(path) if !path.is_empty() => path,
-            Some(_) => {
-                reply.attr(&self.ttl, &self.attr_for("", None));
-                return;
-            }
-            None => {
-                reply.error(Errno::ENOENT);
-                return;
-            }
+        let shared = &self.shared;
+        let Some(path) = shared.path(ino) else {
+            reply.error(Errno::ENOENT);
+            return;
         };
+        if path.is_empty() {
+            reply.attr(&shared.ttl, &shared.attr(1, None));
+            return;
+        }
+        if let Err(errno) = shared.flush_matching(&path) {
+            reply.error(errno);
+            return;
+        }
         if let Some(size) = size {
-            if self
-                .record(&JournalOp::Truncate {
-                    path: path.clone(),
-                    size,
-                })
-                .is_err()
-            {
-                reply.error(Errno::EIO);
-                return;
-            }
-            let truncate_result = { self.client.lock().unwrap().truncate(&path, size) };
-            if truncate_result.is_err() {
-                reply.error(Errno::EIO);
-                return;
-            }
-            self.invalidate_path_cache(&path);
-            self.update_file_size(&path, size);
-            if let Err(errno) = self.clear_record() {
+            let op = JournalOp::Truncate {
+                path: path.clone(),
+                size,
+            };
+            if let Err(errno) = shared.mutate(op, |client| client.truncate(&path, size)) {
                 reply.error(errno);
                 return;
             }
+            shared.blocks.invalidate_path(&path);
+            let mut metas = lock(&shared.metas);
+            let entry = metas
+                .entry(path.clone())
+                .or_insert_with(|| file_meta(size, 0o644));
+            entry.size = size;
+            entry.modified = unix_now_secs();
         }
         let modified = mtime.and_then(time_or_now_secs);
-        if (mode.is_some() || modified.is_some())
-            && self
-                .record(&JournalOp::SetMetadata {
-                    path: path.clone(),
-                    mode,
-                    modified,
-                })
-                .is_err()
-        {
-            reply.error(Errno::EIO);
-            return;
-        }
-        let metadata_result = if mode.is_some() || modified.is_some() {
-            Some(
-                self.client
-                    .lock()
-                    .unwrap()
-                    .set_metadata(&path, mode, modified),
-            )
-        } else {
-            None
-        };
-        if metadata_result
-            .as_ref()
-            .map(Result::is_err)
-            .unwrap_or(false)
-        {
-            reply.error(Errno::EIO);
-            return;
-        }
+        let mode = mode.map(|mode| mode & 0o7777);
         if mode.is_some() || modified.is_some() {
-            self.apply_metadata_update(&path, mode, modified);
-            if let Err(errno) = self.clear_record() {
+            let op = JournalOp::SetMetadata {
+                path: path.clone(),
+                mode,
+                modified,
+            };
+            if let Err(errno) =
+                shared.mutate(op, |client| client.set_metadata(&path, mode, modified))
+            {
                 reply.error(errno);
                 return;
             }
+            if let Some(entry) = lock(&shared.metas).get_mut(&path) {
+                if let Some(mode) = mode {
+                    entry.mode = mode;
+                }
+                if let Some(modified) = modified {
+                    entry.modified = modified;
+                }
+            }
         }
-        let snapshot = self.snapshot.lock().unwrap();
-        match snapshot.entries.get(&path) {
-            Some(meta) => reply.attr(&self.ttl, &self.attr_for(&path, Some(meta))),
+        let meta = match shared.meta(&path) {
+            Some(meta) => Some(meta),
+            None => shared.stat_remote(&path).ok().flatten(),
+        };
+        match meta {
+            Some(meta) => reply.attr(&shared.ttl, &shared.attr(u64::from(ino), Some(&meta))),
             None => reply.error(Errno::ENOENT),
         }
     }
@@ -1043,74 +1881,56 @@ impl Filesystem for MobfsFuse {
         parent: INodeNo,
         name: &OsStr,
         mode: u32,
-        _umask: u32,
-        _flags: i32,
+        umask: u32,
+        flags: i32,
         reply: ReplyCreate,
     ) {
-        let parent_path = match self.path_for(parent) {
-            Some(path) => path,
-            None => {
-                reply.error(Errno::ENOENT);
-                return;
-            }
+        let shared = &self.shared;
+        let Some(parent_path) = shared.path(parent) else {
+            reply.error(Errno::ENOENT);
+            return;
         };
-        let name = match name.to_str() {
-            Some(name) => name,
-            None => {
-                reply.error(Errno::EINVAL);
-                return;
-            }
+        let Some(name) = name.to_str() else {
+            reply.error(Errno::EINVAL);
+            return;
         };
         let path = join_rel(&parent_path, name);
-        if self.ignored_rel(&path) {
+        if shared.ignored(&path) {
             reply.error(Errno::EACCES);
             return;
         }
-        if self
-            .record(&JournalOp::Truncate {
-                path: path.clone(),
-                size: 0,
-            })
-            .is_err()
-        {
-            reply.error(Errno::EIO);
+        if flags & libc::O_EXCL != 0 && shared.meta(&path).is_some() {
+            reply.error(Errno::EEXIST);
             return;
         }
-        let create_result = {
-            let mut client = self.client.lock().unwrap();
-            client
-                .truncate(&path, 0)
-                .and_then(|_| client.set_metadata(&path, Some(mode), None))
+        let mode = mode & !umask & 0o7777;
+        let op = JournalOp::Truncate {
+            path: path.clone(),
+            size: 0,
         };
-        if create_result.is_err() && self.recover_journal().is_err() {
-            reply.error(Errno::EIO);
-            return;
-        }
-        self.invalidate_path_cache(&path);
-        self.update_file_size(&path, 0);
-        self.apply_metadata_update(&path, Some(mode), None);
-        if let Err(errno) = self.clear_record() {
+        let result = shared.mutate(op, |client| {
+            client.truncate(&path, 0)?;
+            client.set_metadata(&path, Some(mode), None)
+        });
+        if let Err(errno) = result {
             reply.error(errno);
             return;
         }
-        let snapshot = self.snapshot.lock().unwrap();
-        match snapshot.entries.get(&path) {
-            Some(meta) => {
-                let handle = inode_for(&path);
-                self.handle_to_path
-                    .lock()
-                    .unwrap()
-                    .insert(handle, path.clone());
-                reply.created(
-                    &self.ttl,
-                    &self.attr_for(&path, Some(meta)),
-                    fuser::Generation(0),
-                    fuser::FileHandle(handle),
-                    FopenFlags::empty(),
-                );
-            }
-            None => reply.error(Errno::EIO),
-        }
+        let meta = file_meta(0, mode);
+        shared.blocks.invalidate_path(&path);
+        shared.set_meta(&path, meta.clone());
+        shared.dir_upsert(&path, &meta);
+        let ino = shared.ino(&path);
+        shared.bump_version(ino);
+        let flags = shared.open_flags(ino);
+        let fh = shared.next_fh.fetch_add(1, Ordering::SeqCst);
+        reply.created(
+            &shared.ttl,
+            &shared.attr(ino, Some(&meta)),
+            fuser::Generation(0),
+            fuser::FileHandle(fh),
+            flags,
+        );
     }
 
     fn mkdir(
@@ -1119,60 +1939,50 @@ impl Filesystem for MobfsFuse {
         parent: INodeNo,
         name: &OsStr,
         mode: u32,
-        _umask: u32,
+        umask: u32,
         reply: ReplyEntry,
     ) {
-        let parent_path = match self.path_for(parent) {
-            Some(path) => path,
-            None => {
-                reply.error(Errno::ENOENT);
-                return;
-            }
+        let shared = &self.shared;
+        let Some(parent_path) = shared.path(parent) else {
+            reply.error(Errno::ENOENT);
+            return;
         };
-        let name = match name.to_str() {
-            Some(name) => name,
-            None => {
-                reply.error(Errno::EINVAL);
-                return;
-            }
+        let Some(name) = name.to_str() else {
+            reply.error(Errno::EINVAL);
+            return;
         };
         let path = join_rel(&parent_path, name);
-        if self.ignored_rel(&path) {
+        if shared.ignored(&path) {
             reply.error(Errno::EACCES);
             return;
         }
-        if self
-            .record(&JournalOp::Mkdir { path: path.clone() })
-            .is_err()
-        {
-            reply.error(Errno::EIO);
-            return;
-        }
-        let mkdir_result = {
-            let mut client = self.client.lock().unwrap();
-            client
-                .mkdir_p(&path)
-                .and_then(|_| client.set_metadata(&path, Some(mode), None))
-        };
-        if mkdir_result.is_err() {
-            reply.error(Errno::EIO);
-            return;
-        }
-        self.invalidate_path_cache(&path);
-        self.update_dir_entry(&path, mode);
-        if let Err(errno) = self.clear_record() {
+        let mode = mode & !umask & 0o7777;
+        let op = JournalOp::Mkdir { path: path.clone() };
+        let result = shared.mutate(op, |client| {
+            client.mkdir_p(&path)?;
+            client.set_metadata(&path, Some(mode), None)
+        });
+        if let Err(errno) = result {
             reply.error(errno);
             return;
         }
-        let snapshot = self.snapshot.lock().unwrap();
-        match snapshot.entries.get(&path) {
-            Some(meta) => reply.entry(
-                &self.ttl,
-                &self.attr_for(&path, Some(meta)),
-                fuser::Generation(0),
-            ),
-            None => reply.error(Errno::EIO),
-        }
+        let meta = EntryMeta {
+            kind: EntryKind::Dir,
+            size: 0,
+            modified: unix_now_secs(),
+            sha256: None,
+            mode,
+            link_target: None,
+        };
+        shared.set_meta(&path, meta.clone());
+        shared.dir_upsert(&path, &meta);
+        lock(&shared.dirs).insert(path.clone(), (Instant::now(), Vec::new()));
+        let ino = shared.ino(&path);
+        reply.entry(
+            &shared.ttl,
+            &shared.attr(ino, Some(&meta)),
+            fuser::Generation(0),
+        );
     }
 
     fn symlink(
@@ -1183,56 +1993,44 @@ impl Filesystem for MobfsFuse {
         target: &Path,
         reply: ReplyEntry,
     ) {
-        let parent_path = match self.path_for(parent) {
-            Some(path) => path,
-            None => {
-                reply.error(Errno::ENOENT);
-                return;
-            }
-        };
-        let Some(name) = link_name.to_str() else {
-            reply.error(Errno::EINVAL);
+        let shared = &self.shared;
+        let Some(parent_path) = shared.path(parent) else {
+            reply.error(Errno::ENOENT);
             return;
         };
-        let Some(target) = target.to_str() else {
+        let (Some(name), Some(target)) = (link_name.to_str(), target.to_str()) else {
             reply.error(Errno::EINVAL);
             return;
         };
         let path = join_rel(&parent_path, name);
-        if self.ignored_rel(&path) {
+        if shared.ignored(&path) {
             reply.error(Errno::EACCES);
             return;
         }
-        if self
-            .record(&JournalOp::Symlink {
-                path: path.clone(),
-                target: target.to_string(),
-            })
-            .is_err()
-        {
-            reply.error(Errno::EIO);
-            return;
-        }
-        let symlink_result = { self.client.lock().unwrap().create_symlink(&path, target) };
-        if symlink_result.is_err() {
-            reply.error(Errno::EIO);
-            return;
-        }
-        self.invalidate_path_cache(&path);
-        self.update_symlink_entry(&path, target);
-        if let Err(errno) = self.clear_record() {
+        let op = JournalOp::Symlink {
+            path: path.clone(),
+            target: target.to_string(),
+        };
+        if let Err(errno) = shared.mutate(op, |client| client.create_symlink(&path, target)) {
             reply.error(errno);
             return;
         }
-        let snapshot = self.snapshot.lock().unwrap();
-        match snapshot.entries.get(&path) {
-            Some(meta) => reply.entry(
-                &self.ttl,
-                &self.attr_for(&path, Some(meta)),
-                fuser::Generation(0),
-            ),
-            None => reply.error(Errno::EIO),
-        }
+        let meta = EntryMeta {
+            kind: EntryKind::Symlink,
+            size: target.len() as u64,
+            modified: unix_now_secs(),
+            sha256: None,
+            mode: 0o777,
+            link_target: Some(target.to_string()),
+        };
+        shared.set_meta(&path, meta.clone());
+        shared.dir_upsert(&path, &meta);
+        let ino = shared.ino(&path);
+        reply.entry(
+            &shared.ttl,
+            &shared.attr(ino, Some(&meta)),
+            fuser::Generation(0),
+        );
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
@@ -1250,84 +2048,130 @@ impl Filesystem for MobfsFuse {
         name: &OsStr,
         newparent: INodeNo,
         newname: &OsStr,
-        _flags: fuser::RenameFlags,
+        flags: fuser::RenameFlags,
         reply: ReplyEmpty,
     ) {
-        let from_parent = match self.path_for(parent) {
-            Some(path) => path,
-            None => {
-                reply.error(Errno::ENOENT);
-                return;
-            }
-        };
-        let to_parent = match self.path_for(newparent) {
-            Some(path) => path,
-            None => {
-                reply.error(Errno::ENOENT);
-                return;
-            }
-        };
-        let Some(name) = name.to_str() else {
-            reply.error(Errno::EINVAL);
+        let shared = &self.shared;
+        let (Some(from_parent), Some(to_parent)) = (shared.path(parent), shared.path(newparent))
+        else {
+            reply.error(Errno::ENOENT);
             return;
         };
-        let Some(newname) = newname.to_str() else {
+        let (Some(name), Some(newname)) = (name.to_str(), newname.to_str()) else {
             reply.error(Errno::EINVAL);
             return;
         };
         let from = join_rel(&from_parent, name);
         let to = join_rel(&to_parent, newname);
-        if self.ignored_rel(&to) {
+        if shared.ignored(&to) {
             reply.error(Errno::EACCES);
             return;
         }
-        if self
-            .record(&JournalOp::Rename {
-                from: from.clone(),
-                to: to.clone(),
-            })
-            .is_err()
+        let bits = flags.bits();
+        let (noreplace, exchange) = if cfg!(target_os = "linux") {
+            (bits & 1 != 0, bits & 2 != 0)
+        } else {
+            (bits & 4 != 0, bits & 2 != 0)
+        };
+        if exchange {
+            reply.error(Errno::EINVAL);
+            return;
+        }
+        if noreplace
+            && (shared.meta(&to).is_some()
+                || (!shared.known_absent(&to_parent, newname)
+                    && matches!(shared.stat_remote(&to), Ok(Some(_)))))
         {
+            reply.error(Errno::EEXIST);
+            return;
+        }
+        if shared.flush_matching(&from).is_err() || shared.flush_matching(&to).is_err() {
             reply.error(Errno::EIO);
             return;
         }
-        let rename_result = { self.client.lock().unwrap().rename(&from, &to) };
-        match rename_result {
-            Ok(()) => {
-                self.invalidate_path_cache(&from);
-                self.invalidate_path_cache(&to);
-                self.rename_tree_entries(&from, &to);
-                match self.clear_record() {
-                    Ok(()) => reply.ok(),
-                    Err(errno) => reply.error(errno),
+        let op = JournalOp::Rename {
+            from: from.clone(),
+            to: to.clone(),
+        };
+        if let Err(errno) = shared.mutate(op, |client| client.rename(&from, &to)) {
+            reply.error(errno);
+            return;
+        }
+        shared.blocks.invalidate_tree(&from);
+        shared.blocks.invalidate_tree(&to);
+        {
+            let mut metas = lock(&shared.metas);
+            for key in subtree_keys(&metas, &to) {
+                metas.remove(&key);
+            }
+            for key in subtree_keys(&metas, &from) {
+                if let Some(meta) = metas.remove(&key) {
+                    metas.insert(format!("{to}{}", &key[from.len()..]), meta);
                 }
             }
-            Err(_) => reply.error(Errno::EIO),
         }
+        {
+            let mut dirs = lock(&shared.dirs);
+            for key in subtree_keys(&dirs, &to) {
+                dirs.remove(&key);
+            }
+            for key in subtree_keys(&dirs, &from) {
+                if let Some(listing) = dirs.remove(&key) {
+                    dirs.insert(format!("{to}{}", &key[from.len()..]), listing);
+                }
+            }
+        }
+        {
+            let mut xattrs = lock(&shared.xattrs);
+            xattrs.remove(&to);
+            if let Some(attrs) = xattrs.remove(&from) {
+                xattrs.insert(to.clone(), attrs);
+            }
+        }
+        lock(&shared.inodes).rename(&from, &to);
+        shared.dir_remove(&from);
+        match shared.meta(&to) {
+            Some(meta) => shared.dir_upsert(&to, &meta),
+            None => {
+                lock(&shared.dirs).remove(&to_parent);
+            }
+        }
+        reply.ok();
     }
 }
 
 impl MobfsFuse {
     fn remove_child(&self, parent: INodeNo, name: &OsStr, dir: bool, reply: ReplyEmpty) {
-        let parent_path = match self.path_for(parent) {
-            Some(path) => path,
-            None => {
-                reply.error(Errno::ENOENT);
-                return;
-            }
+        let shared = &self.shared;
+        let Some(parent_path) = shared.path(parent) else {
+            reply.error(Errno::ENOENT);
+            return;
         };
-        let name = match name.to_str() {
-            Some(name) => name,
-            None => {
-                reply.error(Errno::EINVAL);
-                return;
-            }
+        let Some(name) = name.to_str() else {
+            reply.error(Errno::EINVAL);
+            return;
         };
         let path = join_rel(&parent_path, name);
-        if self.ignored_rel(&path) {
+        if shared.ignored(&path) {
             reply.ok();
             return;
         }
+        if dir {
+            match shared.pool.with(|client| client.list_dir(&path)) {
+                Ok(entries) if !entries.is_empty() => {
+                    reply.error(Errno::ENOTEMPTY);
+                    return;
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    reply.error(Errno::EIO);
+                    return;
+                }
+            }
+        }
+        lock(&shared.write_buffers).retain(|_, pending| {
+            pending.path != path && !pending.path.starts_with(&format!("{path}/"))
+        });
         let meta = EntryMeta {
             kind: if dir { EntryKind::Dir } else { EntryKind::File },
             size: 0,
@@ -1336,44 +2180,64 @@ impl MobfsFuse {
             mode: 0,
             link_target: None,
         };
-        if self
-            .record(&JournalOp::Remove {
-                path: path.clone(),
-                dir,
-            })
-            .is_err()
-        {
-            reply.error(Errno::EIO);
+        let op = JournalOp::Remove {
+            path: path.clone(),
+            dir,
+        };
+        if let Err(errno) = shared.mutate(op, |client| client.remove(&path, &meta)) {
+            reply.error(errno);
             return;
         }
-        let remove_result = { self.client.lock().unwrap().remove(&path, &meta) };
-        match remove_result {
-            Ok(()) => {
-                self.invalidate_path_cache(&path);
-                self.remove_tree_entries(&path);
-                match self.clear_record() {
-                    Ok(()) => reply.ok(),
-                    Err(errno) => reply.error(errno),
-                }
+        shared.blocks.invalidate_tree(&path);
+        {
+            let mut metas = lock(&shared.metas);
+            for key in subtree_keys(&metas, &path) {
+                metas.remove(&key);
             }
-            Err(_) => reply.error(Errno::EIO),
         }
+        {
+            let mut xattrs = lock(&shared.xattrs);
+            xattrs.retain(|key, _| key != &path && !key.starts_with(&format!("{path}/")));
+        }
+        shared.dir_remove(&path);
+        lock(&shared.inodes).remove_tree(&path);
+        reply.ok();
     }
 }
 
-fn dir_cache_from_snapshot(snapshot: &Snapshot) -> DirCache {
-    let now = Instant::now();
-    let mut dirs: BTreeMap<String, DirEntries> = BTreeMap::new();
-    for (path, meta) in &snapshot.entries {
-        let (parent, name) = match path.rsplit_once('/') {
-            Some((parent, name)) => (parent.to_string(), name.to_string()),
-            None => (String::new(), path.clone()),
-        };
-        dirs.entry(parent).or_default().push((name, meta.clone()));
+fn send_listing(listing: &[(u64, FileType, String)], offset: u64, mut reply: ReplyDirectory) {
+    for (index, (ino, kind, name)) in listing.iter().enumerate().skip(offset as usize) {
+        if reply.add(INodeNo(*ino), (index + 1) as u64, *kind, name) {
+            break;
+        }
     }
-    dirs.into_iter()
-        .map(|(path, entries)| (path, (now, entries)))
-        .collect()
+    reply.ok();
+}
+
+fn file_type(kind: &EntryKind) -> FileType {
+    match kind {
+        EntryKind::File => FileType::RegularFile,
+        EntryKind::Dir => FileType::Directory,
+        EntryKind::Symlink => FileType::Symlink,
+    }
+}
+
+fn file_meta(size: u64, mode: u32) -> EntryMeta {
+    EntryMeta {
+        kind: EntryKind::File,
+        size,
+        modified: unix_now_secs(),
+        sha256: None,
+        mode,
+        link_target: None,
+    }
+}
+
+fn split_parent(path: &str) -> (&str, &str) {
+    match path.rsplit_once('/') {
+        Some((parent, name)) => (parent, name),
+        None => ("", path),
+    }
 }
 
 pub fn pending_journal_ops(config: &AppConfig) -> Result<usize> {
@@ -1400,6 +2264,20 @@ fn mountfs_journal_path(config: &AppConfig) -> PathBuf {
         .join(format!("{name}.jsonl"))
 }
 
+fn blob_dir(journal: &Path) -> PathBuf {
+    journal.with_extension("blobs")
+}
+
+fn write_blob(journal: &Path, data: &[u8]) -> Result<String> {
+    let dir = blob_dir(journal);
+    std::fs::create_dir_all(&dir)?;
+    let name = format!("{}.bin", hex::encode(sha2::Sha256::digest(data)));
+    let mut file = std::fs::File::create(dir.join(&name))?;
+    file.write_all(data)?;
+    file.sync_data()?;
+    Ok(name)
+}
+
 fn append_journal(path: &Path, op: &JournalOp) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1424,6 +2302,7 @@ fn clear_journal(path: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
+    let _ = std::fs::remove_dir_all(blob_dir(path));
     Ok(())
 }
 
@@ -1434,13 +2313,45 @@ fn replay_journal(path: &Path, client: &mut RemoteClient) -> Result<()> {
         Err(error) => return Err(error.into()),
     };
     for line in data.lines().filter(|line| !line.trim().is_empty()) {
-        let op: JournalOp = serde_json::from_str(line)?;
-        apply_journal_op(client, &op)?;
+        let Ok(op) = serde_json::from_str::<JournalOp>(line) else {
+            crate::ui::warn("skipping unreadable mount journal entry");
+            continue;
+        };
+        match apply_journal_op(path, client, &op) {
+            Ok(()) => {}
+            Err(crate::error::MobfsError::Server(message)) => {
+                crate::ui::warn(format!(
+                    "dropping journaled operation rejected by mobfsd: {message}"
+                ));
+            }
+            Err(error) => return Err(error),
+        }
     }
     clear_journal(path)
 }
 
-fn apply_journal_op(client: &mut RemoteClient, op: &JournalOp) -> Result<()> {
+fn errno_for_server_error(message: &str) -> Errno {
+    let known = [
+        ("No such file or directory", Errno::ENOENT),
+        ("Permission denied", Errno::EACCES),
+        ("not allowed by mobfsd", Errno::EACCES),
+        ("File exists", Errno::EEXIST),
+        ("Directory not empty", Errno::ENOTEMPTY),
+        ("Is a directory", Errno::EISDIR),
+        ("Not a directory", Errno::ENOTDIR),
+        ("No space left", Errno::ENOSPC),
+        ("Read-only file system", Errno::EROFS),
+        ("File name too long", Errno::ENAMETOOLONG),
+        ("invalid path", Errno::EINVAL),
+    ];
+    known
+        .iter()
+        .find(|(needle, _)| message.contains(needle))
+        .map(|(_, errno)| *errno)
+        .unwrap_or(Errno::EIO)
+}
+
+fn apply_journal_op(journal: &Path, client: &mut RemoteClient, op: &JournalOp) -> Result<()> {
     match op {
         JournalOp::Truncate { path, size } => client.truncate(path, *size),
         JournalOp::SetMetadata {
@@ -1469,6 +2380,13 @@ fn apply_journal_op(client: &mut RemoteClient, op: &JournalOp) -> Result<()> {
         JournalOp::WriteAt { path, offset, data } => {
             client.write_file_at(path, *offset, data.clone())
         }
+        JournalOp::WriteBlob { path, offset, blob } => {
+            if blob.contains('/') || blob.contains("..") {
+                return Err(crate::error::MobfsError::InvalidPath(blob.clone()));
+            }
+            let data = std::fs::read(blob_dir(journal).join(blob))?;
+            client.write_file_at(path, *offset, data)
+        }
     }
 }
 
@@ -1478,12 +2396,6 @@ fn join_rel(parent: &str, name: &str) -> String {
     } else {
         format!("{parent}/{name}")
     }
-}
-
-fn slice_read(data: &[u8], offset: u64, size: u32) -> &[u8] {
-    let start = (offset as usize).min(data.len());
-    let end = start.saturating_add(size as usize).min(data.len());
-    &data[start..end]
 }
 
 fn unix_now_secs() -> i64 {
@@ -1503,14 +2415,40 @@ fn time_or_now_secs(value: TimeOrNow) -> Option<i64> {
         .map(|duration| duration.as_secs() as i64)
 }
 
-fn inode_for(path: &str) -> u64 {
-    if path.is_empty() {
-        return 1;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inodes_stay_stable_across_renames() {
+        let mut inodes = Inodes::new();
+        let dir = inodes.ino("a");
+        let file = inodes.ino("a/b.txt");
+        let lock_file = inodes.ino("a/config.lock");
+        let sibling = inodes.ino("a-b");
+        inodes.rename("a/config.lock", "a/config");
+        assert_eq!(inodes.path(lock_file).as_deref(), Some("a/config"));
+        assert_eq!(inodes.get("a/config.lock"), None);
+        assert_ne!(inodes.ino("a/config.lock"), lock_file);
+        inodes.rename("a", "z");
+        assert_eq!(inodes.path(dir).as_deref(), Some("z"));
+        assert_eq!(inodes.path(file).as_deref(), Some("z/b.txt"));
+        assert_eq!(inodes.path(sibling).as_deref(), Some("a-b"));
     }
-    let mut hash = 1469598103934665603_u64;
-    for byte in path.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(1099511628211);
+
+    #[test]
+    fn block_cache_evicts_lru_and_honors_generations() {
+        let cache = BlockCache::new(BLOCK_SIZE * 4);
+        for index in 0..6 {
+            cache.insert("clip.mov", index, Arc::new(vec![0; BLOCK_SIZE as usize]), 0);
+        }
+        assert!(cache.get("clip.mov", 0).is_none());
+        assert!(cache.get("clip.mov", 5).is_some());
+        let generation = cache.generation("clip.mov");
+        cache.invalidate_range("clip.mov", BLOCK_SIZE * 5 + 10, 1);
+        assert!(cache.get("clip.mov", 5).is_none());
+        assert!(cache.get("clip.mov", 4).is_some());
+        cache.insert("clip.mov", 5, Arc::new(vec![1]), generation);
+        assert!(cache.get("clip.mov", 5).is_none());
     }
-    hash.max(2)
 }

@@ -3,7 +3,7 @@ use crate::error::{MobfsError, Result};
 use crate::snapshot::Snapshot;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 12;
+pub const PROTOCOL_VERSION: u32 = 13;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
@@ -129,6 +129,58 @@ pub enum Request {
         root: String,
         command: Vec<String>,
     },
+    SetClientId {
+        id: u64,
+    },
+    ReadRange {
+        root: String,
+        rel: String,
+        offset: u64,
+        len: u64,
+    },
+    SnapshotMeta {
+        root: String,
+        ignore: Vec<String>,
+        max_entries: u64,
+    },
+    WatchChanges {
+        root: String,
+        ignore: Vec<String>,
+        epoch: u64,
+        since: Option<u64>,
+        timeout_ms: u64,
+    },
+    StatFs {
+        root: String,
+    },
+    Search {
+        root: String,
+        query: String,
+        ignore: Vec<String>,
+        limit: u64,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ChangeKind {
+    Write { offset: u64, len: u64 },
+    Metadata,
+    Replaced,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangeEvent {
+    pub path: String,
+    pub kind: ChangeKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsStats {
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+    pub avail_bytes: u64,
+    pub files: u64,
+    pub free_files: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -157,6 +209,23 @@ pub enum Response {
         stdout: Vec<u8>,
         stderr: Vec<u8>,
     },
+    RangeHeader {
+        len: u64,
+        eof: bool,
+    },
+    SnapshotMeta {
+        snapshot: Snapshot,
+        complete_dirs: Vec<String>,
+    },
+    Changes {
+        epoch: u64,
+        cursor: u64,
+        events: Vec<ChangeEvent>,
+        reset: bool,
+        live: bool,
+    },
+    StatFs(FsStats),
+    SearchResults(Vec<(String, crate::snapshot::EntryMeta)>),
     Ok,
     Error {
         message: String,
@@ -187,10 +256,31 @@ pub fn send_with_byte_stream(
     read_response(stream)
 }
 
+pub fn send_expecting_bytes(
+    stream: &mut SecureStream,
+    request: &Request,
+) -> Result<(Vec<u8>, bool)> {
+    write_frame(stream, request)?;
+    match read_response(stream)? {
+        Response::RangeHeader { len, eof } => {
+            let mut data = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
+            while (data.len() as u64) < len {
+                let chunk = stream.read_encrypted()?;
+                if chunk.is_empty() || data.len() as u64 + chunk.len() as u64 > len {
+                    return Err(MobfsError::Remote("range read length mismatch".to_string()));
+                }
+                data.extend_from_slice(&chunk);
+            }
+            Ok((data, eof))
+        }
+        _ => Err(MobfsError::Remote("invalid range response".to_string())),
+    }
+}
+
 fn read_response(stream: &mut SecureStream) -> Result<Response> {
     let response: Response = read_frame(stream)?;
     if let Response::Error { message } = response {
-        Err(MobfsError::Remote(message))
+        Err(MobfsError::Server(message))
     } else {
         Ok(response)
     }

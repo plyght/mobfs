@@ -1,3 +1,4 @@
+mod changes;
 mod cli;
 mod config;
 mod crypto;
@@ -41,11 +42,14 @@ fn main() -> Result<()> {
         Command::MountDoctor(args) => sync::mount_doctor(args),
         Command::Security => sync::security(),
         Command::Daemon(args) => {
-            let token = args.token.ok_or_else(|| {
-                error::MobfsError::Config(
-                    "daemon token missing; pass --token or set MOBFS_TOKEN".to_string(),
-                )
-            })?;
+            let token = args
+                .token
+                .filter(|token| !token.trim().is_empty())
+                .ok_or_else(|| {
+                    error::MobfsError::Config(
+                        "daemon token missing; pass --token or set MOBFS_TOKEN".to_string(),
+                    )
+                })?;
             daemon::serve(&args.bind, &token, args.allow_roots, args.allow_any_root)
         }
         Command::Token => sync::token(),
@@ -54,5 +58,6 @@ fn main() -> Result<()> {
         Command::SetupRemote(args) => sync::setup_remote(args),
         Command::Doctor => sync::doctor(),
         Command::Bench(args) => sync::bench(args),
+        Command::Search(args) => sync::search(args),
     }
 }

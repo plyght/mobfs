@@ -201,3 +201,17 @@ Remaining performance work:
 - improve broad traversal performance for `find`, `du`, and similar arbitrary filesystem scans
 - improve same-mount recovery after a hard mid-write daemon kill so users do not need to unmount/remount
 - test over a real remote network link, not just local TCP
+
+## Streaming and mount startup (2026-09-23)
+
+Linux container, loopback TCP to `mobfsd`, encrypted protocol, 200 MB random-content file, release builds. "Before" is the previous `main` (protocol 12). "After" adds binary range reads, the 1 MiB block cache, read-ahead, connection pools, and metadata-only mount snapshots. Each run used a fresh mount, so the random seeks start with a cold cache.
+
+| Workload | Before | After |
+| --- | --- | --- |
+| Mount ready (tree with one 200 MB file) | 1.09 s | 0.02 s |
+| 300 random 256 KiB seeks, cold | 5.65 s | 0.55 s |
+| Sequential read, 200 MB | 11.4 s | 0.27 s |
+| Write 64 MB | 4.17 s | 1.34 s |
+
+Mount startup no longer hashes every remote file, so startup time now scales with the number of entries, not the number of bytes. Over a real WAN link, absolute numbers depend on latency. Read-ahead and parallel connections exist to hide that latency during playback.
+

@@ -1,7 +1,8 @@
 use crate::cli::{
     BenchArgs, BuildArgs, ConnectArgs, GitArgs, InitArgs, MountArgs, MountDoctorArgs, MountFsArgs,
-    PullArgs, PushArgs, RemoteArgs, RemoteCommand, RemoteHostArgs, RemoteStatusArgs, RunArgs,
-    ServeArgs, SetupArgs, SetupRemoteArgs, StartArgs, SyncArgs, UnmountArgs, WatchArgs,
+    MountTuning, PullArgs, PushArgs, RemoteArgs, RemoteCommand, RemoteHostArgs, RemoteStatusArgs,
+    RunArgs, SearchArgs, ServeArgs, SetupArgs, SetupRemoteArgs, StartArgs, SyncArgs, UnmountArgs,
+    WatchArgs,
 };
 use crate::config::{
     AppConfig, DEFAULT_CONNECT_RETRIES, DEFAULT_OP_RETRIES, LocalConfig, RemoteConfig, STATE_DIR,
@@ -43,6 +44,7 @@ pub fn start(args: StartArgs) -> Result<()> {
             ssh_tunnel: args.ssh_tunnel,
             cache_ttl_secs: 1,
             no_open: args.no_open,
+            tuning: MountTuning::default(),
         })?;
     }
     serve(ServeArgs {
@@ -59,13 +61,14 @@ pub fn connect(args: ConnectArgs) -> Result<()> {
             "mobfs connect requires an SSH remote like user@host:/absolute/path".to_string(),
         ));
     }
+    let requested = args.token.clone();
     let token = args.token.unwrap_or_else(crate::config::generate_token);
     let ssh_target = if target.user.is_empty() {
         target.host.clone()
     } else {
         format!("{}@{}", target.user, target.host)
     };
-    setup_remote(SetupRemoteArgs {
+    let remote_token = setup_remote_with_token(SetupRemoteArgs {
         ssh_target,
         root: std::path::PathBuf::from(&target.path),
         port: args.port,
@@ -75,6 +78,16 @@ pub fn connect(args: ConnectArgs) -> Result<()> {
         status: false,
         name: args.name.clone(),
     })?;
+    let token = match (requested, remote_token) {
+        (Some(requested), Some(running)) if requested != running => {
+            ui::warn(
+                "remote mobfsd is already running with a different token; using the running daemon's token (pass --restart to rotate it)",
+            );
+            running
+        }
+        (_, Some(running)) => running,
+        (_, None) => token,
+    };
     mount(MountArgs {
         remote: args.remote,
         name: args.name,
@@ -84,6 +97,7 @@ pub fn connect(args: ConnectArgs) -> Result<()> {
         ssh_tunnel: true,
         cache_ttl_secs: args.cache_ttl_secs,
         no_open: args.no_open,
+        tuning: args.tuning,
     })
 }
 
@@ -110,7 +124,7 @@ pub fn mountfs(args: MountFsArgs) -> Result<()> {
             None => AppConfig::load()?,
         };
         crate::mountfs::prepare_mountpoint(&mountpoint)?;
-        crate::mountfs::mount(config, mountpoint)
+        crate::mountfs::mount(config, mountpoint, mount_options(&args.tuning, false))
     }
     #[cfg(not(feature = "fuse"))]
     {
@@ -125,22 +139,39 @@ pub fn mount(args: MountArgs) -> Result<()> {
     #[cfg(feature = "fuse")]
     {
         let target = parse_remote(&args.remote)?;
-        let root = match args.local {
+        let root = match args.local.clone() {
             Some(path) => path,
             None => {
                 default_no_local_code_mountpoint(args.name.as_deref(), &target.host, &target.path)?
             }
         };
-        let mut config = new_config(target, root.clone(), args.port, args.token, args.ssh_tunnel);
+        let mut config = new_config(
+            target,
+            root.clone(),
+            args.port,
+            args.token.clone(),
+            args.ssh_tunnel,
+        );
         config.sync.cache_ttl_secs = args.cache_ttl_secs;
         crate::mountfs::prepare_mountpoint(&root)?;
+        save_mount_registry_entry(&config)?;
+        if args.tuning.detach && std::env::var_os("MOBFS_DETACHED").is_none() {
+            return spawn_detached_mount(&args, &config, &root);
+        }
         ui::added(
             "mounting no-local-code filesystem",
             root.display().to_string(),
         );
         ui::info("cache ttl", format!("{}s", config.sync.cache_ttl_secs));
-        save_mount_registry_entry(&config)?;
-        crate::mountfs::mount(config, root)
+        ui::info(
+            "streaming",
+            format!(
+                "{} connections, {} MiB cache, {} MiB read-ahead",
+                args.tuning.connections, args.tuning.cache_mib, args.tuning.readahead_mib
+            ),
+        );
+        let open = !args.no_open && std::env::var_os("MOBFS_DETACHED").is_none();
+        crate::mountfs::mount(config, root, mount_options(&args.tuning, open))
     }
     #[cfg(not(feature = "fuse"))]
     {
@@ -148,6 +179,179 @@ pub fn mount(args: MountArgs) -> Result<()> {
         Err(MobfsError::Config(
             "mobfs mount is no-local-code FUSE-first and requires building with --features fuse; use `mobfs mirror` for a durable local mirror".to_string(),
         ))
+    }
+}
+
+#[cfg(feature = "fuse")]
+fn mount_options(tuning: &MountTuning, open_when_ready: bool) -> crate::mountfs::MountOptions {
+    crate::mountfs::MountOptions {
+        connections: tuning.connections.clamp(1, 64),
+        prefetch_connections: tuning.prefetch_connections.clamp(1, 64),
+        cache_mib: tuning.cache_mib,
+        readahead_mib: tuning.readahead_mib,
+        volname: tuning.volname.clone(),
+        fskit: tuning.fskit,
+        open_when_ready,
+    }
+}
+
+#[cfg(feature = "fuse")]
+fn spawn_detached_mount(args: &MountArgs, config: &AppConfig, root: &Path) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    let log_dir = dirs::cache_dir()
+        .ok_or_else(|| MobfsError::Config("could not determine user cache directory".to_string()))?
+        .join("mobfs")
+        .join("logs");
+    fs::create_dir_all(&log_dir)?;
+    let log_name = root
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "mount".to_string());
+    let log_path = log_dir.join(format!("{log_name}.log"));
+    let log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    let tuning = &args.tuning;
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .arg("mount")
+        .arg(&args.remote)
+        .arg("--local")
+        .arg(root)
+        .arg("--port")
+        .arg(args.port.to_string())
+        .arg("--cache-ttl-secs")
+        .arg(args.cache_ttl_secs.to_string())
+        .arg("--connections")
+        .arg(tuning.connections.to_string())
+        .arg("--prefetch-connections")
+        .arg(tuning.prefetch_connections.to_string())
+        .arg("--cache-mib")
+        .arg(tuning.cache_mib.to_string())
+        .arg("--readahead-mib")
+        .arg(tuning.readahead_mib.to_string())
+        .arg("--no-open")
+        .env("MOBFS_DETACHED", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log);
+    if let Some(token) = &config.remote.token {
+        command.env("MOBFS_TOKEN", token);
+    }
+    if args.ssh_tunnel {
+        command.arg("--ssh-tunnel");
+    }
+    if let Some(volname) = &tuning.volname {
+        command.arg("--volname").arg(volname);
+    }
+    if tuning.fskit {
+        command.arg("--fskit");
+    }
+    unsafe {
+        command.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let mut child = command.spawn()?;
+    let spinner = ui::spinner("mounting in background");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline {
+        if crate::mountfs::is_mounted(root) {
+            spinner.finish_and_clear();
+            ui::ok(format!("mounted {} (pid {})", root.display(), child.id()));
+            ui::info("log", log_path.display().to_string());
+            if !args.no_open {
+                open_path(root)?;
+            }
+            return Ok(());
+        }
+        if let Some(status) = child.try_wait()? {
+            spinner.finish_and_clear();
+            return Err(MobfsError::Remote(format!(
+                "background mount exited with {status}; see {}",
+                log_path.display()
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    spinner.finish_and_clear();
+    Err(MobfsError::Remote(format!(
+        "timed out waiting for {} to mount; see {}",
+        root.display(),
+        log_path.display()
+    )))
+}
+
+pub fn search(args: SearchArgs) -> Result<()> {
+    let config = match &args.mount {
+        Some(mount) => load_mount_registry_entry_for(mount)?.ok_or_else(|| {
+            MobfsError::Config(format!("{} is not a known mobfs mount", mount.display()))
+        })?,
+        None => match load_command_config() {
+            Ok((config, _)) => config,
+            Err(error) => {
+                let registry = read_mount_registry(&mount_registry_path()?)?;
+                let mut mounted = registry
+                    .entries
+                    .into_iter()
+                    .filter(|entry| entry.local.root.exists());
+                match (mounted.next(), mounted.next()) {
+                    (Some(entry), None) => entry,
+                    (Some(_), Some(_)) => {
+                        return Err(MobfsError::Config(
+                            "several mounts are registered; pass --mount <path> or run inside a mount".to_string(),
+                        ));
+                    }
+                    _ => return Err(error),
+                }
+            }
+        },
+    };
+    let query = args.query.join(" ");
+    let started = Instant::now();
+    let mut client = crate::remote::RemoteClient::connect(config.clone())?;
+    let results = client.search(&query, args.limit)?;
+    let elapsed = started.elapsed();
+    if results.is_empty() {
+        ui::warn(format!("no matches for \"{query}\""));
+        return Ok(());
+    }
+    for (rel, meta) in &results {
+        let marker = match meta.kind {
+            EntryKind::Dir => "/",
+            EntryKind::Symlink => "@",
+            EntryKind::File => "",
+        };
+        println!(
+            "{}{marker}\t{}",
+            config.local.root.join(rel).display(),
+            human_size(meta.size)
+        );
+    }
+    ui::info(
+        "matches",
+        format!("{} in {} ms", results.len(), elapsed.as_millis()),
+    );
+    if args.open {
+        open_path(&config.local.root.join(&results[0].0))?;
+    }
+    Ok(())
+}
+
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
     }
 }
 
@@ -719,6 +923,7 @@ fn load_command_config() -> Result<(AppConfig, bool)> {
     }
 }
 
+#[cfg_attr(not(feature = "fuse"), allow(dead_code))]
 fn save_mount_registry_entry(config: &AppConfig) -> Result<()> {
     let path = mount_registry_path()?;
     if let Some(parent) = path.parent() {
@@ -739,9 +944,12 @@ fn save_mount_registry_entry(config: &AppConfig) -> Result<()> {
 }
 
 fn load_mount_registry_entry() -> Result<Option<AppConfig>> {
-    let path = mount_registry_path()?;
-    let registry = read_mount_registry(&path)?;
-    let cwd = std::env::current_dir()?.canonicalize()?;
+    load_mount_registry_entry_for(&std::env::current_dir()?)
+}
+
+fn load_mount_registry_entry_for(path: &Path) -> Result<Option<AppConfig>> {
+    let registry = read_mount_registry(&mount_registry_path()?)?;
+    let cwd = path.canonicalize()?;
     Ok(registry
         .entries
         .into_iter()
@@ -783,17 +991,28 @@ pub fn unmount(args: UnmountArgs) -> Result<()> {
         Some(path) => path,
         None => load_command_config()?.0.local.root,
     };
-    let status = if cfg!(target_os = "macos") {
-        Command::new("diskutil")
-            .arg("unmount")
-            .arg(&mountpoint)
-            .status()
+    let attempts: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
+        &[("diskutil", &["unmount"]), ("umount", &[])]
     } else {
-        Command::new("umount").arg(&mountpoint).status()
-    }?;
-    if !status.success() {
+        &[
+            ("fusermount3", &["-u"]),
+            ("fusermount", &["-u"]),
+            ("umount", &[]),
+        ]
+    };
+    let unmounted = attempts.iter().any(|(program, extra)| {
+        Command::new(program)
+            .args(*extra)
+            .arg(&mountpoint)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    });
+    if !unmounted {
         return Err(MobfsError::Remote(format!(
-            "failed to unmount {}",
+            "failed to unmount {}; close apps using it or run `diskutil unmount force` / `fusermount -uz`",
             mountpoint.display()
         )));
     }
@@ -806,6 +1025,9 @@ pub fn unmount(args: UnmountArgs) -> Result<()> {
             "unmounted but left non-empty mountpoint {}",
             mountpoint.display()
         )),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            ui::ok(format!("unmounted {}", mountpoint.display()))
+        }
         Err(error) => return Err(error.into()),
     }
     Ok(())
@@ -845,6 +1067,18 @@ pub fn mount_doctor(args: MountDoctorArgs) -> Result<()> {
         }
         check_tool("diskutil");
         check_tool("open");
+        if std::path::Path::new("/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse")
+            .exists()
+        {
+            ui::ok("mount_macfuse helper present");
+        }
+        ui::bullet(
+            "On Apple silicon, the macFUSE kernel extension needs Reduced Security in Startup Security Utility; on macOS 15.4+ `--fskit` avoids the kernel extension entirely.",
+        );
+    }
+    #[cfg(feature = "fuse")]
+    if crate::mountfs::is_mounted(&args.mountpoint) {
+        ui::ok("mountpoint is an active mount");
     }
     #[cfg(not(target_os = "macos"))]
     ui::info("platform", "macOS-specific Finder checks skipped");
@@ -936,6 +1170,12 @@ fn remote_status_to_setup(args: RemoteStatusArgs) -> SetupRemoteArgs {
 }
 
 pub fn setup_remote(args: SetupRemoteArgs) -> Result<()> {
+    setup_remote_with_token(args).map(|_| ())
+}
+
+const REMOTE_TOKEN_MARKER: &str = "MOBFS_REMOTE_TOKEN=";
+
+fn setup_remote_with_token(args: SetupRemoteArgs) -> Result<Option<String>> {
     let token = args.token.unwrap_or_else(crate::config::generate_token);
     let root = args.root.display().to_string();
     let remote_root = shell_path_quote(&root);
@@ -948,7 +1188,8 @@ pub fn setup_remote(args: SetupRemoteArgs) -> Result<()> {
         "if [ -s ~/.mobfsd/daemon.pid ] && kill -0 \"$(cat ~/.mobfsd/daemon.pid)\" 2>/dev/null; then echo running pid=$(cat ~/.mobfsd/daemon.pid); else echo stopped; [ -f ~/.mobfsd/daemon.log ] && tail -n 20 ~/.mobfsd/daemon.log; fi".to_string()
     } else {
         format!(
-            "mkdir -p {root} ~/.mobfsd && command -v mobfs >/dev/null || {{ echo 'mobfs not found in PATH; install it on the remote first' >&2; exit 127; }}; if [ -s ~/.mobfsd/daemon.pid ] && kill -0 \"$(cat ~/.mobfsd/daemon.pid)\" 2>/dev/null; then if [ {restart} = yes ]; then kill \"$(cat ~/.mobfsd/daemon.pid)\"; sleep 1; else echo 'mobfsd already running pid='$(cat ~/.mobfsd/daemon.pid); exit 0; fi; fi; MOBFS_TOKEN={token} nohup mobfs daemon --bind 127.0.0.1:{port} --allow-root {root} --token \"$MOBFS_TOKEN\" > ~/.mobfsd/daemon.log 2>&1 < /dev/null & echo $! > ~/.mobfsd/daemon.pid; echo started pid=$(cat ~/.mobfsd/daemon.pid)",
+            "mkdir -p {root} ~/.mobfsd && chmod 700 ~/.mobfsd && command -v mobfs >/dev/null || {{ echo 'mobfs not found in PATH; install it on the remote first' >&2; exit 127; }}; if [ -s ~/.mobfsd/daemon.pid ] && kill -0 \"$(cat ~/.mobfsd/daemon.pid)\" 2>/dev/null; then if [ {restart} = yes ]; then kill \"$(cat ~/.mobfsd/daemon.pid)\"; sleep 1; else echo 'mobfsd already running pid='$(cat ~/.mobfsd/daemon.pid); [ -s ~/.mobfsd/token ] && echo {marker}$(cat ~/.mobfsd/token); exit 0; fi; fi; (umask 077; printf %s {token} > ~/.mobfsd/token); MOBFS_TOKEN={token} nohup mobfs daemon --bind 127.0.0.1:{port} --allow-root {root} > ~/.mobfsd/daemon.log 2>&1 < /dev/null & echo $! > ~/.mobfsd/daemon.pid; echo started pid=$(cat ~/.mobfsd/daemon.pid); echo {marker}$(cat ~/.mobfsd/token)",
+            marker = REMOTE_TOKEN_MARKER,
             root = remote_root,
             token = shell_quote(&token),
             port = args.port,
@@ -976,21 +1217,34 @@ pub fn setup_remote(args: SetupRemoteArgs) -> Result<()> {
                 args.root.display()
             ));
         }
-        return Ok(());
+        return Ok(None);
     }
-    let status = Command::new("ssh")
+    let output = Command::new("ssh")
         .arg(&args.ssh_target)
         .arg(remote_command)
-        .status()?;
-    if !status.success() {
+        .stdin(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .output()?;
+    let mut remote_token = None;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        match line.strip_prefix(REMOTE_TOKEN_MARKER) {
+            Some(value) if !value.trim().is_empty() => {
+                remote_token = Some(value.trim().to_string())
+            }
+            Some(_) => {}
+            None => println!("{line}"),
+        }
+    }
+    if !output.status.success() {
         return Err(MobfsError::Remote(format!(
-            "remote setup failed with {status}; ensure mobfs is installed on {} and SSH works",
-            args.ssh_target
+            "remote setup failed with {}; ensure mobfs is installed on {} and SSH works",
+            output.status, args.ssh_target
         )));
     }
     if args.status {
-        return Ok(());
+        return Ok(None);
     }
+    let token = remote_token.clone().unwrap_or(token);
     ui::ok("remote daemon ready");
     ui::info("token", token);
     ui::command(format!(
@@ -1003,7 +1257,7 @@ pub fn setup_remote(args: SetupRemoteArgs) -> Result<()> {
         args.ssh_target,
         args.root.display()
     ));
-    Ok(())
+    Ok(remote_token)
 }
 
 fn shell_quote(value: &str) -> String {
@@ -1383,7 +1637,7 @@ fn default_workspace_name(name: Option<&str>, host: &str, remote_path: &str) -> 
         .unwrap_or_else(|| format!("{host}-{}", fallback))
 }
 
-fn open_path(path: &std::path::Path) -> Result<()> {
+pub fn open_path(path: &std::path::Path) -> Result<()> {
     let status = if cfg!(target_os = "macos") {
         Command::new("open").arg(path).status()?
     } else if cfg!(target_os = "windows") {

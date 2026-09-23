@@ -127,6 +127,11 @@ impl SecureStream {
         }
     }
 
+    pub fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> Result<()> {
+        self.stream.set_read_timeout(timeout)?;
+        Ok(())
+    }
+
     pub fn read_encrypted(&mut self) -> Result<Vec<u8>> {
         let data = read_raw(&mut self.stream)?;
         let nonce = nonce(self.recv_counter);
