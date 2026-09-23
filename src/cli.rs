@@ -97,7 +97,7 @@ pub struct MountTuning {
     pub connections: usize,
     #[arg(
         long,
-        default_value_t = 3,
+        default_value_t = 8,
         help = "Parallel daemon connections reserved for read-ahead"
     )]
     pub prefetch_connections: usize,
@@ -109,7 +109,7 @@ pub struct MountTuning {
     pub cache_mib: u64,
     #[arg(
         long,
-        default_value_t = 32,
+        default_value_t = 128,
         help = "Maximum sequential read-ahead window in MiB (0 disables)"
     )]
     pub readahead_mib: u64,
@@ -131,9 +131,9 @@ impl Default for MountTuning {
     fn default() -> Self {
         Self {
             connections: 4,
-            prefetch_connections: 3,
+            prefetch_connections: 8,
             cache_mib: 512,
-            readahead_mib: 32,
+            readahead_mib: 128,
             volname: None,
             fskit: false,
             detach: false,

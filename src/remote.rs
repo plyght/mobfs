@@ -591,11 +591,11 @@ impl RemoteClient {
     }
 
     #[cfg_attr(not(feature = "fuse"), allow(dead_code))]
-    pub fn read_range(&mut self, rel: &str, offset: u64, len: u64) -> Result<(Vec<u8>, bool)> {
+    pub fn read_range(&mut self, rel: &str, offset: u64, len: u64) -> Result<(Vec<Vec<u8>>, bool)> {
         let root = self.config.remote.path.clone();
         let rel = rel.to_string();
         self.op(|stream, _| {
-            protocol::send_expecting_bytes(
+            protocol::send_expecting_frames(
                 stream,
                 &Request::ReadRange {
                     root: root.clone(),

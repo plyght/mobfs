@@ -655,6 +655,7 @@ fn handle_write_file_at_stream(
     }
     let root_path = policy.check(&root)?;
     let path = safe_join(&root_path, &rel)?;
+    let _busy = changes::begin_write(&root_path, &rel);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }

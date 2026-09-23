@@ -1,6 +1,6 @@
 use crate::error::{MobfsError, Result};
-use chacha20poly1305::aead::{Aead, KeyInit};
-use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+use chacha20poly1305::aead::{AeadInPlace, KeyInit};
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, Tag};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use rand_core::OsRng;
@@ -12,6 +12,8 @@ use subtle::ConstantTimeEq;
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
 type HmacSha256 = Hmac<Sha256>;
+
+const TAG_LEN: usize = 16;
 
 #[derive(Debug, Serialize, Deserialize)]
 enum HandshakeFrame {
@@ -133,22 +135,38 @@ impl SecureStream {
     }
 
     pub fn read_encrypted(&mut self) -> Result<Vec<u8>> {
-        let data = read_raw(&mut self.stream)?;
+        let mut data = read_raw(&mut self.stream)?;
         let nonce = nonce(self.recv_counter);
         self.recv_counter = self.recv_counter.saturating_add(1);
+        if data.len() < TAG_LEN {
+            return Err(MobfsError::Remote(
+                "encrypted frame authentication failed".to_string(),
+            ));
+        }
+        let tag_start = data.len() - TAG_LEN;
+        let tag = *Tag::from_slice(&data[tag_start..]);
+        data.truncate(tag_start);
         self.recv_cipher
-            .decrypt(&nonce, data.as_ref())
-            .map_err(|_| MobfsError::Remote("encrypted frame authentication failed".to_string()))
+            .decrypt_in_place_detached(&nonce, b"", &mut data, &tag)
+            .map_err(|_| MobfsError::Remote("encrypted frame authentication failed".to_string()))?;
+        Ok(data)
     }
 
     pub fn write_encrypted(&mut self, data: &[u8]) -> Result<()> {
         let nonce = nonce(self.send_counter);
         self.send_counter = self.send_counter.saturating_add(1);
-        let encrypted = self
+        let len = u32::try_from(data.len() + TAG_LEN)
+            .map_err(|_| MobfsError::Remote("protocol frame too large".to_string()))?;
+        let mut frame = Vec::with_capacity(4 + data.len() + TAG_LEN);
+        frame.extend_from_slice(&len.to_be_bytes());
+        frame.extend_from_slice(data);
+        let tag = self
             .send_cipher
-            .encrypt(&nonce, data)
+            .encrypt_in_place_detached(&nonce, b"", &mut frame[4..])
             .map_err(|_| MobfsError::Remote("encrypted frame failed".to_string()))?;
-        write_raw(&mut self.stream, &encrypted)
+        frame.extend_from_slice(&tag);
+        self.stream.write_all(&frame)?;
+        Ok(())
     }
 }
 
@@ -220,8 +238,11 @@ fn read_raw(stream: &mut TcpStream) -> Result<Vec<u8>> {
     if len > 128 * 1024 * 1024 {
         return Err(MobfsError::Remote("protocol frame too large".to_string()));
     }
-    let mut data = vec![0_u8; len];
-    stream.read_exact(&mut data)?;
+    let mut data = Vec::with_capacity(len);
+    (&mut *stream).take(len as u64).read_to_end(&mut data)?;
+    if data.len() != len {
+        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+    }
     Ok(data)
 }
 
@@ -233,4 +254,38 @@ fn write_raw(stream: &mut TcpStream, data: &[u8]) -> Result<()> {
     frame.extend_from_slice(data);
     stream.write_all(&frame)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod perf_probe {
+    use super::*;
+    use chacha20poly1305::aead::Aead;
+    #[test]
+    #[ignore]
+    fn secure_stream_throughput() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut secure = SecureStream::server(stream, "tok").unwrap();
+            let data = vec![7_u8; 1 << 20];
+            for _ in 0..512 {
+                secure.write_encrypted(&data).unwrap();
+            }
+        });
+        let mut client = SecureStream::client(TcpStream::connect(addr).unwrap(), "tok").unwrap();
+        let start = std::time::Instant::now();
+        for _ in 0..512 {
+            client.read_encrypted().unwrap();
+        }
+        eprintln!("512 MiB encrypted: {:?}", start.elapsed());
+        server.join().unwrap();
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&[1; 32]));
+        let data = vec![7_u8; 1 << 20];
+        let start = std::time::Instant::now();
+        for i in 0..256 {
+            let _ = cipher.encrypt(&nonce(i), data.as_slice()).unwrap();
+        }
+        eprintln!("256 MiB encrypt only: {:?}", start.elapsed());
+    }
 }

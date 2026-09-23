@@ -256,22 +256,24 @@ pub fn send_with_byte_stream(
     read_response(stream)
 }
 
-pub fn send_expecting_bytes(
+pub fn send_expecting_frames(
     stream: &mut SecureStream,
     request: &Request,
-) -> Result<(Vec<u8>, bool)> {
+) -> Result<(Vec<Vec<u8>>, bool)> {
     write_frame(stream, request)?;
     match read_response(stream)? {
         Response::RangeHeader { len, eof } => {
-            let mut data = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
-            while (data.len() as u64) < len {
+            let mut frames = Vec::new();
+            let mut received = 0_u64;
+            while received < len {
                 let chunk = stream.read_encrypted()?;
-                if chunk.is_empty() || data.len() as u64 + chunk.len() as u64 > len {
+                if chunk.is_empty() || received + chunk.len() as u64 > len {
                     return Err(MobfsError::Remote("range read length mismatch".to_string()));
                 }
-                data.extend_from_slice(&chunk);
+                received += chunk.len() as u64;
+                frames.push(chunk);
             }
-            Ok((data, eof))
+            Ok((frames, eof))
         }
         _ => Err(MobfsError::Remote("invalid range response".to_string())),
     }

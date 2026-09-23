@@ -15,7 +15,7 @@ It is not a generic SSHFS replacement. SSHFS is the better tool for a simple rem
 - **Remote-Owned Commands**: Runs `mobfs run` and `mobfs git` on the code-owning machine from inside the mount
 - **Developer-First FUSE Path**: Supports editor atomic saves, temp writes, renames, deletes, symlinks, chmod/mtime, flush, and fsync
 - **Source-Tree-Aware Caching**: Prefetches small files, reuses directory metadata, and ignores heavy generated trees such as `target` and `node_modules`
-- **Recovery-Oriented Writes**: Buffers sequential writes, streams large binary payloads, retries reconnectable operations, and journals mutating metadata operations
+- **Recovery-Oriented Writes**: Buffers sequential writes, uploads them in the background over parallel connections, retries reconnectable operations, and journals mutating metadata operations
 - **Encrypted Daemon Protocol**: Uses an authenticated encrypted TCP protocol between `mobfs` and `mobfsd`
 - **SSH Tunnel Mode**: Connects through `ssh -L` so `mobfsd` can stay bound to localhost on the remote host
 - **Mirror Mode**: Provides explicit `pull`, `push`, and `sync` workflows when a durable local copy is actually wanted
@@ -84,10 +84,12 @@ Mount a media library in the background so it appears as a drive in Finder:
 mobfs connect editor@studio.example.com:/srv/media --name Media --detach --volname "Studio Media"
 ```
 
-Apps such as DaVinci Resolve, Premiere, Photoshop, and Blender read the drive directly. MobFS fetches 1 MiB blocks on demand, grows a read-ahead window while playback is sequential, and restarts it at the new position when you scrub. Tune the stream for your link:
+Apps such as DaVinci Resolve, Premiere, Photoshop, and Blender read the drive directly. MobFS fetches 1 MiB blocks on demand. While playback is sequential it reads ahead in 8 MiB batches over parallel connections, and when you scrub it restarts at the new position. Writes are buffered in 8 MiB chunks and uploaded in the background over several connections, so saving and exporting don't wait on each round trip. `close` and `fsync` still wait until the data is on the server.
+
+The defaults (4 foreground connections, 8 upload connections, 8 read-ahead connections, a 128 MiB read-ahead window, and a 512 MiB memory cache) suit links up to about 100 ms round-trip. For slower links or very high bitrate media, raise them:
 
 ```bash
-mobfs mount host:/srv/media --connections 8 --prefetch-connections 4 --readahead-mib 64 --cache-mib 2048
+mobfs mount host:/srv/media --prefetch-connections 12 --readahead-mib 256 --cache-mib 2048
 ```
 
 Every mount subscribes to the daemon's change feed. Saves, renames, and deletes made from another Mac, or directly on the server, show up in the other mounts right away. Large files being written elsewhere become readable as the data arrives, every 8 MiB.

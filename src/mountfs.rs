@@ -21,6 +21,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const BLOCK_SIZE: u64 = 1024 * 1024;
 const WRITE_BUFFER_LIMIT: usize = 8 * 1024 * 1024;
+const MAX_INFLIGHT_UPLOAD_BYTES: u64 = 128 * 1024 * 1024;
+const PREFETCH_BATCH_BLOCKS: u64 = 8;
 const PREFETCH_MAX_FILE_BYTES: u64 = 64 * 1024;
 const PREFETCH_MAX_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
 const SNAPSHOT_MAX_ENTRIES: u64 = 250_000;
@@ -46,9 +48,9 @@ impl Default for MountOptions {
     fn default() -> Self {
         Self {
             connections: 4,
-            prefetch_connections: 3,
+            prefetch_connections: 8,
             cache_mib: 512,
-            readahead_mib: 32,
+            readahead_mib: 128,
             volname: None,
             fskit: false,
             open_when_ready: false,
@@ -631,6 +633,43 @@ impl BlockCache {
         store.bytes = 0;
     }
 
+    fn fetch_run(&self, path: &str, first: u64, count: u64, pool: &ClientPool) {
+        let mut flights = Vec::new();
+        {
+            let store = lock(&self.store);
+            let mut inflight = lock(&self.inflight);
+            for index in first..first + count {
+                let key = (path.to_string(), index);
+                if store.blocks.contains_key(&key) || inflight.contains_key(&key) {
+                    break;
+                }
+                let flight = Arc::new(Inflight {
+                    done: Mutex::new(false),
+                    ready: Condvar::new(),
+                });
+                inflight.insert(key, flight.clone());
+                flights.push(flight);
+            }
+        }
+        if flights.is_empty() {
+            return;
+        }
+        let generation = self.generation(path);
+        let blocks = flights.len() as u64;
+        if let Ok((frames, _)) =
+            pool.with(|client| client.read_range(path, first * BLOCK_SIZE, blocks * BLOCK_SIZE))
+        {
+            for (position, block) in into_blocks(frames).into_iter().enumerate() {
+                self.insert(path, first + position as u64, Arc::new(block), generation);
+            }
+        }
+        let mut inflight = lock(&self.inflight);
+        for (position, flight) in flights.iter().enumerate() {
+            inflight.remove(&(path.to_string(), first + position as u64));
+            flight.finish();
+        }
+    }
+
     fn fetch(&self, path: &str, index: u64, pool: &ClientPool) -> Result<Arc<Vec<u8>>> {
         if let Some(data) = self.get(path, index) {
             return Ok(data);
@@ -655,14 +694,14 @@ impl BlockCache {
             if let Some(data) = self.get(path, index) {
                 return Ok(data);
             }
-            let (data, _) =
+            let (frames, _) =
                 pool.with(|client| client.read_range(path, index * BLOCK_SIZE, BLOCK_SIZE))?;
-            return Ok(Arc::new(data));
+            return Ok(Arc::new(frames.concat()));
         }
         let generation = self.generation(path);
         let result = pool.with(|client| client.read_range(path, index * BLOCK_SIZE, BLOCK_SIZE));
-        let result = result.map(|(data, _)| {
-            let data = Arc::new(data);
+        let result = result.map(|(frames, _)| {
+            let data = Arc::new(into_blocks(frames).into_iter().next().unwrap_or_default());
             self.insert(path, index, data.clone(), generation);
             data
         });
@@ -713,6 +752,25 @@ struct Shared {
     readahead_blocks: u64,
     workers: WorkerPool,
     prefetchers: WorkerPool,
+    upload_pool: ClientPool,
+    uploaders: WorkerPool,
+    uploads: Mutex<Uploads>,
+    uploads_changed: Condvar,
+}
+
+struct Upload {
+    fh: u64,
+    path: String,
+    offset: u64,
+    len: u64,
+}
+
+#[derive(Default)]
+struct Uploads {
+    next: u64,
+    bytes: u64,
+    inflight: HashMap<u64, Upload>,
+    errors: HashMap<u64, Errno>,
 }
 
 struct MobfsFuse {
@@ -817,12 +875,14 @@ impl MobfsFuse {
             Some(client),
         );
         let prefetch_pool = ClientPool::new(
-            config,
+            config.clone(),
             client_id,
-            endpoint,
+            endpoint.clone(),
             options.prefetch_connections,
             None,
         );
+        let upload_connections = options.connections.saturating_mul(2).max(1);
+        let upload_pool = ClientPool::new(config, client_id, endpoint, upload_connections, None);
         let shared = Arc::new(Shared {
             pool,
             prefetch_pool,
@@ -855,6 +915,10 @@ impl MobfsFuse {
             readahead_blocks: options.readahead_mib,
             workers: WorkerPool::new("mobfs-io", FOREGROUND_WORKERS),
             prefetchers: WorkerPool::new("mobfs-prefetch", options.prefetch_connections.max(1)),
+            upload_pool,
+            uploaders: WorkerPool::new("mobfs-upload", upload_connections),
+            uploads: Mutex::new(Uploads::default()),
+            uploads_changed: Condvar::new(),
         });
         Ok((Self { shared }, feed))
     }
@@ -961,61 +1025,127 @@ impl Shared {
     }
 
     fn has_pending_write(&self, path: &str) -> bool {
+        let prefix = format!("{path}/");
         lock(&self.write_buffers)
             .values()
-            .any(|pending| pending.path == path || pending.path.starts_with(&format!("{path}/")))
+            .any(|pending| pending.path == path || pending.path.starts_with(&prefix))
+            || lock(&self.uploads)
+                .inflight
+                .values()
+                .any(|upload| upload.path == path || upload.path.starts_with(&prefix))
     }
 
-    fn flush_fh(&self, fh: u64) -> std::result::Result<(), Errno> {
+    fn take_upload_error(&self, fh: u64) -> std::result::Result<(), Errno> {
+        match lock(&self.uploads).errors.remove(&fh) {
+            Some(errno) => Err(errno),
+            None => Ok(()),
+        }
+    }
+
+    fn dispatch_fh(self: &Arc<Self>, fh: u64) {
         let pending = lock(&self.write_buffers).remove(&fh);
         let Some(pending) = pending else {
-            return Ok(());
+            return;
         };
         let path = lock(&self.inodes).path(pending.ino).unwrap_or(pending.path);
+        let offset = pending.offset;
         let len = pending.data.len() as u64;
-        let blob = write_blob(&self.journal, &pending.data).map_err(|_| Errno::EIO)?;
-        self.record(&JournalOp::WriteBlob {
-            path: path.clone(),
-            offset: pending.offset,
-            blob,
-        })?;
         let data = pending.data;
-        let result = self
-            .pool
-            .with(|client| client.write_file_at(&path, pending.offset, data.clone()));
-        self.blocks.invalidate_range(&path, pending.offset, len);
-        match result {
-            Ok(()) => {}
-            Err(crate::error::MobfsError::Server(message)) => {
-                self.clear_record()?;
-                return Err(errno_for_server_error(&message));
+        let id = {
+            let mut uploads = lock(&self.uploads);
+            loop {
+                let overlaps = uploads.inflight.values().any(|upload| {
+                    upload.path == path
+                        && upload.offset < offset + len
+                        && offset < upload.offset + upload.len
+                });
+                let room =
+                    uploads.inflight.is_empty() || uploads.bytes + len <= MAX_INFLIGHT_UPLOAD_BYTES;
+                if !overlaps && room {
+                    break;
+                }
+                uploads = self
+                    .uploads_changed
+                    .wait(uploads)
+                    .unwrap_or_else(|error| error.into_inner());
             }
-            Err(_) => self.recover_journal()?,
-        }
-        self.clear_record()
+            uploads.next += 1;
+            let id = uploads.next;
+            uploads.bytes += len;
+            uploads.inflight.insert(
+                id,
+                Upload {
+                    fh,
+                    path: path.clone(),
+                    offset,
+                    len,
+                },
+            );
+            id
+        };
+        let shared = self.clone();
+        self.uploaders.run(move || {
+            let result = shared
+                .upload_pool
+                .with(|client| client.write_file_at(&path, offset, data));
+            shared.blocks.invalidate_range(&path, offset, len);
+            let mut uploads = lock(&shared.uploads);
+            uploads.inflight.remove(&id);
+            uploads.bytes = uploads.bytes.saturating_sub(len);
+            if let Err(error) = result {
+                let errno = match error {
+                    crate::error::MobfsError::Server(message) => errno_for_server_error(&message),
+                    _ => Errno::EIO,
+                };
+                uploads.errors.insert(fh, errno);
+            }
+            shared.uploads_changed.notify_all();
+        });
     }
 
-    fn flush_matching(&self, path: &str) -> std::result::Result<(), Errno> {
+    fn wait_uploads(&self, done: impl Fn(&Upload) -> bool) {
+        let mut uploads = lock(&self.uploads);
+        while uploads.inflight.values().any(&done) {
+            uploads = self
+                .uploads_changed
+                .wait(uploads)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+
+    fn flush_fh(self: &Arc<Self>, fh: u64) -> std::result::Result<(), Errno> {
+        self.dispatch_fh(fh);
+        self.wait_uploads(|upload| upload.fh == fh);
+        self.take_upload_error(fh)
+    }
+
+    fn flush_matching(self: &Arc<Self>, path: &str) -> std::result::Result<(), Errno> {
         let prefix = format!("{path}/");
+        let matches = |candidate: &str| candidate == path || candidate.starts_with(&prefix);
         let fhs = lock(&self.write_buffers)
             .iter()
-            .filter(|(_, pending)| pending.path == path || pending.path.starts_with(&prefix))
+            .filter(|(_, pending)| matches(&pending.path))
             .map(|(fh, _)| *fh)
             .collect::<Vec<_>>();
+        for fh in &fhs {
+            self.dispatch_fh(*fh);
+        }
+        self.wait_uploads(|upload| matches(&upload.path));
         for fh in fhs {
-            self.flush_fh(fh)?;
+            self.take_upload_error(fh)?;
         }
         Ok(())
     }
 
-    fn flush_all_buffers(&self) {
+    fn flush_all_buffers(self: &Arc<Self>) {
         let fhs = lock(&self.write_buffers)
             .keys()
             .copied()
             .collect::<Vec<_>>();
         for fh in fhs {
-            let _ = self.flush_fh(fh);
+            self.dispatch_fh(fh);
         }
+        self.wait_uploads(|_| true);
     }
 
     fn note_local_write(&self, path: &str, offset: u64, len: u64) {
@@ -1123,11 +1253,26 @@ impl Shared {
         }
         self.schedule_readahead(ino, &path, offset, u64::from(size), file_size);
         let end = offset.saturating_add(u64::from(size));
-        let mut out = Vec::with_capacity(size as usize);
+        let mut out = Vec::new();
+        let mut single: Option<(Arc<Vec<u8>>, usize, usize)> = None;
+        let sequential = lock(&self.read_ahead)
+            .get(&ino)
+            .is_some_and(|state| state.window >= 2);
+        let last_block = file_size.map(|len| len.saturating_sub(1) / BLOCK_SIZE);
         for index in offset / BLOCK_SIZE..=end.saturating_sub(1) / BLOCK_SIZE {
+            if sequential && !self.blocks.contains(&path, index) {
+                let batch_end = (index / PREFETCH_BATCH_BLOCKS + 1) * PREFETCH_BATCH_BLOCKS;
+                let batch_end = last_block.map_or(batch_end, |last| batch_end.min(last + 1));
+                self.blocks.fetch_run(
+                    &path,
+                    index,
+                    batch_end.saturating_sub(index).max(1),
+                    &self.pool,
+                );
+            }
             let block = match self.blocks.fetch(&path, index, &self.pool) {
                 Ok(block) => block,
-                Err(error) if out.is_empty() => {
+                Err(error) if out.is_empty() && single.is_none() => {
                     reply.error(match error {
                         crate::error::MobfsError::Server(message) => {
                             errno_for_server_error(&message)
@@ -1141,14 +1286,26 @@ impl Shared {
             let start = index * BLOCK_SIZE;
             let from = (offset.max(start) - start) as usize;
             let to = ((end.min(start + BLOCK_SIZE) - start) as usize).min(block.len());
+            let short = (block.len() as u64) < BLOCK_SIZE;
             if from < to {
-                out.extend_from_slice(&block[from..to]);
+                match single.take() {
+                    None if out.is_empty() => single = Some((block, from, to)),
+                    previous => {
+                        if let Some((first, first_from, first_to)) = previous {
+                            out.extend_from_slice(&first[first_from..first_to]);
+                        }
+                        out.extend_from_slice(&block[from..to]);
+                    }
+                }
             }
-            if (block.len() as u64) < BLOCK_SIZE {
+            if short {
                 break;
             }
         }
-        reply.data(&out);
+        match single {
+            Some((block, from, to)) => reply.data(&block[from..to]),
+            None => reply.data(&out),
+        }
     }
 
     fn schedule_readahead(
@@ -1180,22 +1337,50 @@ impl Shared {
         };
         let current = offset.saturating_add(size.saturating_sub(1)) / BLOCK_SIZE;
         let last = file_size.map(|len| len.saturating_sub(1) / BLOCK_SIZE);
-        for index in current + 1..=current + window {
-            if last.is_some_and(|last| index > last) {
-                break;
-            }
-            let key = (path.to_string(), index);
-            if self.blocks.contains(path, index) || !lock(&self.prefetch_queued).insert(key.clone())
-            {
+        let horizon = match last {
+            Some(last) => (current + window).min(last),
+            None => current + window,
+        };
+        let mut first = current + 1;
+        while first <= horizon {
+            let batch_end = ((first / PREFETCH_BATCH_BLOCKS) + 1) * PREFETCH_BATCH_BLOCKS;
+            let end = if window >= PREFETCH_BATCH_BLOCKS {
+                batch_end
+            } else {
+                batch_end.min(horizon + 1)
+            };
+            let end = match last {
+                Some(last) => end.min(last + 1),
+                None => end,
+            };
+            let run_first = first;
+            first = end;
+            let missing = (run_first..end).any(|index| !self.blocks.contains(path, index));
+            if !missing || !lock(&self.prefetch_queued).insert((path.to_string(), run_first)) {
                 continue;
             }
             let shared = self.clone();
+            let path = path.to_string();
             self.prefetchers.run(move || {
                 let current_epoch = lock(&shared.read_ahead).get(&ino).map(|state| state.epoch);
                 if current_epoch == Some(epoch) && !shared.stop.load(Ordering::SeqCst) {
-                    let _ = shared.blocks.fetch(&key.0, key.1, &shared.prefetch_pool);
+                    let mut index = run_first;
+                    while index < end {
+                        if shared.blocks.contains(&path, index) {
+                            index += 1;
+                            continue;
+                        }
+                        let mut stop = index;
+                        while stop < end && !shared.blocks.contains(&path, stop) {
+                            stop += 1;
+                        }
+                        shared
+                            .blocks
+                            .fetch_run(&path, index, stop - index, &shared.prefetch_pool);
+                        index = stop;
+                    }
                 }
-                lock(&shared.prefetch_queued).remove(&key);
+                lock(&shared.prefetch_queued).remove(&(path.clone(), run_first));
             });
         }
     }
@@ -1572,6 +1757,10 @@ impl Filesystem for MobfsFuse {
             return;
         }
         let fh = u64::from(fh);
+        if let Err(errno) = shared.take_upload_error(fh) {
+            reply.error(errno);
+            return;
+        }
         let flush_needed = {
             let mut buffers = lock(&shared.write_buffers);
             match buffers.get_mut(&fh) {
@@ -1599,7 +1788,8 @@ impl Filesystem for MobfsFuse {
             }
         };
         if flush_needed {
-            if let Err(errno) = shared.flush_fh(fh) {
+            shared.dispatch_fh(fh);
+            if let Err(errno) = shared.take_upload_error(fh) {
                 reply.error(errno);
                 return;
             }
@@ -2205,6 +2395,25 @@ impl MobfsFuse {
     }
 }
 
+fn into_blocks(frames: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    let aligned = frames
+        .iter()
+        .rev()
+        .skip(1)
+        .all(|frame| frame.len() as u64 == BLOCK_SIZE)
+        && frames
+            .last()
+            .is_none_or(|frame| frame.len() as u64 <= BLOCK_SIZE);
+    if aligned {
+        return frames;
+    }
+    frames
+        .concat()
+        .chunks(BLOCK_SIZE as usize)
+        .map(<[u8]>::to_vec)
+        .collect()
+}
+
 fn send_listing(listing: &[(u64, FileType, String)], offset: u64, mut reply: ReplyDirectory) {
     for (index, (ino, kind, name)) in listing.iter().enumerate().skip(offset as usize) {
         if reply.add(INodeNo(*ino), (index + 1) as u64, *kind, name) {
@@ -2266,16 +2475,6 @@ fn mountfs_journal_path(config: &AppConfig) -> PathBuf {
 
 fn blob_dir(journal: &Path) -> PathBuf {
     journal.with_extension("blobs")
-}
-
-fn write_blob(journal: &Path, data: &[u8]) -> Result<String> {
-    let dir = blob_dir(journal);
-    std::fs::create_dir_all(&dir)?;
-    let name = format!("{}.bin", hex::encode(sha2::Sha256::digest(data)));
-    let mut file = std::fs::File::create(dir.join(&name))?;
-    file.write_all(data)?;
-    file.sync_data()?;
-    Ok(name)
 }
 
 fn append_journal(path: &Path, op: &JournalOp) -> Result<()> {

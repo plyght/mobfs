@@ -35,6 +35,7 @@ struct FeedState {
     next_seq: u64,
     events: VecDeque<Recorded>,
     recent: HashMap<String, (Instant, Signature)>,
+    busy: HashMap<String, usize>,
 }
 
 pub struct RootFeed {
@@ -66,6 +67,7 @@ pub fn feed(root: &Path) -> Arc<RootFeed> {
                     next_seq: 1,
                     events: VecDeque::new(),
                     recent: HashMap::new(),
+                    busy: HashMap::new(),
                 }),
                 changed: Condvar::new(),
                 live: AtomicBool::new(false),
@@ -82,6 +84,42 @@ pub fn record(root: &Path, origin: u64, path: &str, kind: ChangeKind) {
     feed(root).push(origin, path, kind, true);
 }
 
+pub struct WriteGuard {
+    feed: Arc<RootFeed>,
+    path: String,
+}
+
+impl Drop for WriteGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .feed
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(count) = state.busy.get_mut(&self.path) {
+            *count -= 1;
+            if *count == 0 {
+                state.busy.remove(&self.path);
+            }
+        }
+    }
+}
+
+pub fn begin_write(root: &Path, path: &str) -> WriteGuard {
+    let feed = feed(root);
+    *feed
+        .state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .busy
+        .entry(path.to_string())
+        .or_insert(0) += 1;
+    WriteGuard {
+        feed,
+        path: path.to_string(),
+    }
+}
+
 fn signature(path: &Path) -> Signature {
     std::fs::symlink_metadata(path)
         .ok()
@@ -90,8 +128,21 @@ fn signature(path: &Path) -> Signature {
 
 impl RootFeed {
     fn push(&self, origin: u64, path: &str, kind: ChangeKind, from_mobfs: bool) {
+        if !from_mobfs
+            && self
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .busy
+                .contains_key(path)
+        {
+            return;
+        }
         let current = signature(&self.root.join(path));
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if !from_mobfs && state.busy.contains_key(path) {
+            return;
+        }
         if from_mobfs {
             state
                 .recent
@@ -162,7 +213,12 @@ impl RootFeed {
         loop {
             let mut events = Vec::new();
             let mut cursor = state.next_seq - 1;
-            for recorded in state.events.iter().filter(|event| event.seq > since) {
+            let oldest = state
+                .events
+                .front()
+                .map_or(state.next_seq, |event| event.seq);
+            let skip = usize::try_from((since + 1).saturating_sub(oldest)).unwrap_or(usize::MAX);
+            for recorded in state.events.iter().skip(skip) {
                 if events.len() >= MAX_EVENTS_PER_REPLY {
                     cursor = recorded.seq - 1;
                     break;

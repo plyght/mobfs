@@ -215,3 +215,23 @@ Linux container, loopback TCP to `mobfsd`, encrypted protocol, 200 MB random-con
 
 Mount startup no longer hashes every remote file, so startup time now scales with the number of entries, not the number of bytes. Over a real WAN link, absolute numbers depend on latency. Read-ahead and parallel connections exist to hide that latency during playback.
 
+## Large reads and writes over latency (2026-09-23)
+
+Same container, 4 vCPU. The remote root is on tmpfs, so these numbers measure MobFS rather than the disk. Latency was added with a user-space proxy that delays each direction by half the round-trip time without limiting bandwidth. Every row uses a fresh mount with default settings. Scrubs are 60 cold random 256 KiB reads of a 1 GiB file.
+
+| Round-trip | Write 1 GiB (dd, incl. close) | Read 1 GiB, cold | Scrub median / p90 |
+| --- | --- | --- | --- |
+| 0 ms | 1.6 s | 1.5 s | 5 ms / 8 ms |
+| 10 ms | 1.9 s | 1.9 s | 15 ms / 21 ms |
+| 40 ms | 2.1 s | 2.1 s | 46 ms / 51 ms |
+| 100 ms | 2.7 s | 2.6 s | 106 ms / 114 ms |
+
+For comparison, the first version of this branch took 24.5 s to write and 16.3 s to read 1 GiB at 40 ms. A cold scrub costs one round trip plus about 5 ms, which is the floor for fetching data that isn't cached yet.
+
+What made the difference:
+
+- Background uploads over 8 parallel connections, with up to 128 MiB in flight, instead of a synchronous upload and a fsynced journal copy for every 8 MiB
+- Read-ahead issued as aligned 8 MiB range requests over 8 connections, with a 128 MiB window
+- The daemon's filesystem watcher ignores files that MobFS itself is writing, instead of turning every 1 MiB write into a "file replaced" event
+- In-place encryption and decryption, and 1 MiB network frames reused directly as cache blocks
+
